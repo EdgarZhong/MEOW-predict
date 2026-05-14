@@ -11,3 +11,4 @@ dist/
 release/
 *.egg-info/
 dask-worker-space/
+*_results*.csv

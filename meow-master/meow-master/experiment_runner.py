@@ -248,6 +248,8 @@ class ExperimentRunner(object):
         self.builder = FeatureBuilder()
         self._split_cache = {}
         self._raw_split_cache = {}
+        self._daily_feature_cache = {}
+        self._daily_raw_cache = {}
 
     def _cache_key(self, dates, max_days=None):
         return (tuple(dates), max_days)
@@ -339,13 +341,17 @@ class ExperimentRunner(object):
         x_parts = []
         y_parts = []
         for date in dates:
-            log.inf(f"Loading and featurizing {date}...")
-            raw = self.loader.loadDate(date)
-            xdf, ydf = self.builder.build(raw)
+            if date in self._daily_feature_cache:
+                xdf, ydf = self._daily_feature_cache[date]
+            else:
+                log.inf(f"Loading and featurizing {date}...")
+                raw = self.loader.loadDate(date)
+                xdf, ydf = self.builder.build(raw)
+                self._daily_feature_cache[date] = (xdf.copy(), ydf.copy())
+                del raw
+                gc.collect()
             x_parts.append(xdf)
             y_parts.append(ydf)
-            del raw
-            gc.collect()
         xdf = pd.concat(x_parts, ignore_index=True)
         ydf = pd.concat(y_parts, ignore_index=True)
         self._split_cache[cache_key] = (xdf.copy(), ydf.copy())
@@ -359,9 +365,14 @@ class ExperimentRunner(object):
             dates = dates[:max_days]
         parts = []
         for date in dates:
-            log.inf(f"Loading raw {date}...")
-            parts.append(self.loader.loadDate(date))
-            gc.collect()
+            if date in self._daily_raw_cache:
+                parts.append(self._daily_raw_cache[date])
+            else:
+                log.inf(f"Loading raw {date}...")
+                raw = self.loader.loadDate(date)
+                self._daily_raw_cache[date] = raw.copy()
+                parts.append(raw)
+                gc.collect()
         raw = pd.concat(parts, ignore_index=True)
         self._raw_split_cache[cache_key] = raw.copy()
         return raw
@@ -527,7 +538,7 @@ class ExperimentRunner(object):
                 folds.append(RollingFold(fold_id=fold_id, train_dates=train_dates, val_dates=val_dates))
                 fold_id += 1
             cursor += step
-        if not folds and len(all_dates) >= 4:
+        if not folds and len(all_dates) >= 3:
             fallback_val = max(1, min(2, len(all_dates) // 3))
             folds.append(
                 RollingFold(
@@ -1049,8 +1060,8 @@ class ExperimentRunner(object):
                 "baseline": baseline,
                 "train_pred": train_pred,
                 "val_pred": val_pred,
-                "train_metrics": self.evaluate_predictions(ytrain, train_pred),
-                "val_metrics": self.evaluate_predictions(yval, val_pred),
+                "train_metrics": self.evaluate_prediction_bundle(ytrain, train_pred),
+                "val_metrics": self.evaluate_prediction_bundle(yval, val_pred),
             })
 
         seq_scales = {
@@ -1081,8 +1092,8 @@ class ExperimentRunner(object):
                 "baseline": seq_baseline,
                 "train_pred": seq_train_pred,
                 "val_pred": seq_val_pred,
-                "train_metrics": self.evaluate_predictions(ytrain_seq, seq_train_pred),
-                "val_metrics": self.evaluate_predictions(yval_seq, seq_val_pred),
+                "train_metrics": self.evaluate_prediction_bundle(ytrain_seq, seq_train_pred),
+                "val_metrics": self.evaluate_prediction_bundle(yval_seq, seq_val_pred),
             })
 
         train_stack = np.hstack(preds_train)
@@ -1102,8 +1113,8 @@ class ExperimentRunner(object):
             "baseline": common_model,
             "pred_train": stack_train_pred,
             "pred_val": stack_val_pred,
-            "train_metrics": self.evaluate_predictions(ytrain, stack_train_pred),
-            "val_metrics": self.evaluate_predictions(yval, stack_val_pred),
+            "train_metrics": self.evaluate_prediction_bundle(ytrain, stack_train_pred),
+            "val_metrics": self.evaluate_prediction_bundle(yval, stack_val_pred),
         }
         return {
             "experts": model_rows,
@@ -1267,8 +1278,8 @@ class ExperimentRunner(object):
             meta_model.fit(train_meta, meta_ytrain["fret12"].to_numpy(dtype=np.float32))
             pred_train = np.asarray(meta_model.predict(train_meta), dtype=np.float32)
             pred_val = np.asarray(meta_model.predict(val_meta), dtype=np.float32)
-            train_metrics = self.evaluate_predictions(meta_ytrain, pred_train)
-            val_metrics = self.evaluate_predictions(meta_yval, pred_val)
+            train_metrics = self.evaluate_prediction_bundle(meta_ytrain, pred_train)
+            val_metrics = self.evaluate_prediction_bundle(meta_yval, pred_val)
             score = (val_metrics["corr"], -val_metrics["mse"], val_metrics["r2"])
             if best_metrics is None or score > (best_metrics["corr"], -best_metrics["mse"], best_metrics["r2"]):
                 best_name = name
@@ -1277,8 +1288,15 @@ class ExperimentRunner(object):
                 best_pred_val = pred_val
                 best_metrics = val_metrics
                 best_train_metrics = train_metrics
-        train_metrics = best_train_metrics
-        val_metrics = best_metrics
+        post_params, post_train_metrics = self.choose_postprocess_params(meta_ytrain, best_pred_train)
+        train_post_frame = meta_ytrain[["date", "interval", "fret12"]].copy()
+        train_post_frame["pred"] = np.asarray(best_pred_train, dtype=np.float32)
+        val_post_frame = meta_yval[["date", "interval", "fret12"]].copy()
+        val_post_frame["pred"] = np.asarray(best_pred_val, dtype=np.float32)
+        final_train_pred = np.asarray(best_pred_train, dtype=np.float32)
+        final_val_pred = np.asarray(best_pred_val, dtype=np.float32)
+        train_metrics = self.evaluate_prediction_bundle(meta_ytrain, final_train_pred)
+        val_metrics = self.evaluate_prediction_bundle(meta_yval, final_val_pred)
         log.inf(
             "Soft meta model selected: {}".format(best_name)
         )
@@ -1288,12 +1306,14 @@ class ExperimentRunner(object):
         return {
             "model": best_model,
             "feature_cols": list(train_meta.columns),
-            "pred_train": best_pred_train,
-            "pred_val": best_pred_val,
+            "pred_train": final_train_pred,
+            "pred_val": final_val_pred,
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "main_result": main_result,
             "regime_result": regime_result,
+            "postprocess_params": post_params,
+            "postprocess_train_metrics": post_train_metrics,
         }
 
     def run_val_blend_search(self, split_config, max_train_days=None, max_val_days=None, target_mode="interval_demean"):
@@ -1542,6 +1562,101 @@ class ExperimentRunner(object):
                     "notes": exp["notes"],
                 })
             return pd.DataFrame(rows)
+        elif suite_name == "v31_quick":
+            experiments = [
+                {"name": "Q00_baseline_ridge", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy"], "notes": "quick baseline"},
+                {"name": "Q01_full_tree_raw", "type": "standard", "model": "tree", "target_mode": "raw", "groups": None, "notes": "quick full tree"},
+                {"name": "Q02_common_residual", "type": "common_residual", "notes": "quick common + residual"},
+                {"name": "Q03_tree_regime", "type": "standard", "model": "tree", "target_mode": "raw", "groups": ["base", "lag", "roll", "cross", "regime"], "notes": "quick regime tree"},
+                {"name": "Q04_small_fusion", "type": "fusion_v31_quick", "notes": "quick OOF fusion"},
+                {"name": "Q05_soft_regime_ensemble", "type": "soft_regime", "notes": "quick soft gating ensemble"},
+            ]
+            rows = []
+            for exp in experiments:
+                start_ts = time.time()
+                if exp["type"] == "standard":
+                    result = self.run_with_groups(
+                        split_config=split_config,
+                        model_name=exp["model"],
+                        feature_groups=exp["groups"],
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                        target_mode=exp["target_mode"],
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_groups = result["feature_groups"]
+                    target_type = exp["target_mode"]
+                    model_type = exp["model"]
+                    postprocess_type = "none"
+                elif exp["type"] == "common_residual":
+                    result = self.run_common_residual_reconstruction(
+                        split_config=split_config,
+                        residual_model_name="tree",
+                        common_model_name="ridge",
+                        feature_groups=None,
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_groups = ["base", "lag", "roll", "cross", "common_aggregate"]
+                    target_type = "common_plus_residual"
+                    model_type = "common_residual"
+                    postprocess_type = "none"
+                elif exp["type"] == "fusion_v31_quick":
+                    result = self.run_oof_multi_expert_fusion(
+                        split_config=split_config,
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                        expert_specs=[
+                            {"name": "et_raw", "kind": "base", "model_name": "tree", "target_mode": "raw", "feature_groups": None},
+                            {"name": "ridge_raw", "kind": "base", "model_name": "ridge", "target_mode": "raw", "feature_groups": None},
+                            {"name": "common_resid", "kind": "common_residual", "residual_model": "tree", "common_model": "ridge", "feature_groups": None},
+                        ],
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_groups = ["oof_fusion_quick"]
+                    target_type = "raw"
+                    model_type = "oof_fusion"
+                    postprocess_type = json.dumps(result["postprocess_params"], ensure_ascii=False)
+                elif exp["type"] == "soft_regime":
+                    result = self.run_soft_regime_ensemble(
+                        split_config=split_config,
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                        target_mode="interval_demean",
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_groups = ["main_tree", "regime_tree", "regime_score"]
+                    target_type = "interval_demean"
+                    model_type = "tree_soft_regime"
+                    postprocess_type = "none"
+                else:
+                    raise ValueError(f"Unknown V3.1 quick protocol type: {exp['type']}")
+                runtime_sec = time.time() - start_ts
+                rows.append({
+                    "experiment_id": exp["name"],
+                    "feature_set": json.dumps(feature_groups, ensure_ascii=False),
+                    "target_type": target_type,
+                    "model_type": model_type,
+                    "postprocess_type": postprocess_type,
+                    "train_corr": train_metrics["corr"],
+                    "val_corr": val_metrics["corr"],
+                    "train_mse": train_metrics["mse"],
+                    "val_mse": val_metrics["mse"],
+                    "train_r2": train_metrics["r2"],
+                    "val_r2": val_metrics["r2"],
+                    "daily_corr_mean": val_metrics["daily_corr_mean"],
+                    "daily_corr_std": val_metrics["daily_corr_std"],
+                    "train_val_corr_gap": self._corr_gap(train_metrics, val_metrics),
+                    "runtime_sec": float(runtime_sec),
+                    "random_seed": 42,
+                    "notes": exp["notes"],
+                })
+            return pd.DataFrame(rows)
         else:
             raise ValueError(f"Unknown suite: {suite_name}")
 
@@ -1669,7 +1784,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default="ridge", choices=["ridge", "elasticnet", "tree", "gbdt", "histgb", "lgbm", "mlp"])
     parser.add_argument("--target-mode", type=str, default="raw", choices=["raw", "date_demean", "interval_demean", "interval_residual"])
     parser.add_argument("--feature-groups", nargs="*", default=None, help="Feature groups to keep, e.g. base lag roll cross")
-    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31"])
+    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31", "v31_quick"])
     parser.add_argument("--output-csv", type=str, default=None)
     parser.add_argument("--train-start", type=int, default=20230601)
     parser.add_argument("--train-end", type=int, default=20231031)
