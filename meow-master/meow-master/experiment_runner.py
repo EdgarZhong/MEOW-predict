@@ -1316,6 +1316,258 @@ class ExperimentRunner(object):
             "postprocess_train_metrics": post_train_metrics,
         }
 
+    def run_pair_blend_search(
+        self,
+        split_config,
+        first_kind="common_residual",
+        second_kind="soft_regime",
+        max_train_days=None,
+        max_val_days=None,
+    ):
+        candidates = {}
+        if first_kind == "common_residual":
+            candidates[first_kind] = self.run_common_residual_reconstruction(
+                split_config=split_config,
+                residual_model_name="tree",
+                common_model_name="ridge",
+                feature_groups=None,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+        elif first_kind == "soft_regime":
+            candidates[first_kind] = self.run_soft_regime_ensemble(
+                split_config=split_config,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                target_mode="interval_demean",
+            )
+        else:
+            raise ValueError(f"Unknown first_kind: {first_kind}")
+
+        if second_kind == "common_residual":
+            candidates[second_kind] = self.run_common_residual_reconstruction(
+                split_config=split_config,
+                residual_model_name="tree",
+                common_model_name="ridge",
+                feature_groups=None,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+        elif second_kind == "soft_regime":
+            candidates[second_kind] = self.run_soft_regime_ensemble(
+                split_config=split_config,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                target_mode="interval_demean",
+            )
+        else:
+            raise ValueError(f"Unknown second_kind: {second_kind}")
+
+        train_a = np.asarray(candidates[first_kind]["pred_train"], dtype=np.float32)
+        val_a = np.asarray(candidates[first_kind]["pred_val"], dtype=np.float32)
+        train_b = np.asarray(candidates[second_kind]["pred_train"], dtype=np.float32)
+        val_b = np.asarray(candidates[second_kind]["pred_val"], dtype=np.float32)
+        ytrain = self.load_feature_split(self.split_dates(split_config)[0], max_days=max_train_days, groups=None)[1]
+        yval = self.load_feature_split(self.split_dates(split_config)[1], max_days=max_val_days, groups=None)[1]
+
+        best = None
+        best_w = None
+        best_train = None
+        best_val = None
+        for w in np.arange(0.0, 1.0001, 0.05, dtype=np.float32):
+            train_pred = w * train_a + (1.0 - w) * train_b
+            val_pred = w * val_a + (1.0 - w) * val_b
+            val_metrics = self.evaluate_prediction_bundle(yval, val_pred)
+            score = (val_metrics["corr"], -val_metrics["mse"], val_metrics["r2"])
+            if best is None or score > best:
+                best = score
+                best_w = float(w)
+                best_train = train_pred.copy()
+                best_val = val_pred.copy()
+        train_metrics = self.evaluate_prediction_bundle(ytrain, best_train)
+        val_metrics = self.evaluate_prediction_bundle(yval, best_val)
+        return {
+            "weight_first": best_w,
+            "first_kind": first_kind,
+            "second_kind": second_kind,
+            "pred_train": best_train,
+            "pred_val": best_val,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "first_result": candidates[first_kind],
+            "second_result": candidates[second_kind],
+        }
+
+    def run_rolling_validation_suite(
+        self,
+        split_config,
+        train_window=8,
+        val_window=2,
+        step=10,
+        max_folds=4,
+        max_train_days=None,
+        max_val_days=None,
+    ):
+        train_dates, _, _ = self.split_dates(split_config)
+        folds = self.make_rolling_folds(
+            train_dates[0],
+            train_dates[-1],
+            train_window=train_window,
+            val_window=val_window,
+            step=step,
+            min_train_days=train_window,
+        )[:max_folds]
+        if not folds:
+            raise ValueError("No rolling folds available")
+
+        specs = [
+            {
+                "experiment_id": "R00_baseline_ridge",
+                "type": "standard",
+                "model": "ridge",
+                "target_mode": "raw",
+                "groups": ["legacy"],
+                "notes": "rolling baseline ridge",
+            },
+            {
+                "experiment_id": "R01_common_residual",
+                "type": "common_residual",
+                "notes": "rolling common plus residual",
+            },
+            {
+                "experiment_id": "R02_soft_regime_ensemble",
+                "type": "soft_regime",
+                "notes": "rolling soft gating ensemble",
+            },
+            {
+                "experiment_id": "R03_pair_blend",
+                "type": "pair_blend",
+                "notes": "rolling blend of common residual and soft regime",
+            },
+        ]
+
+        rows = []
+        for fold in folds:
+            fold_split = SplitConfig(
+                train_start=fold.train_dates[0],
+                train_end=fold.train_dates[-1],
+                val_start=fold.val_dates[0],
+                val_end=fold.val_dates[-1],
+                test_start=fold.val_dates[0],
+                test_end=fold.val_dates[-1],
+            )
+            log.inf(
+                f"Rolling fold {fold.fold_id}: train {fold.train_dates[0]} -> {fold.train_dates[-1]}, "
+                f"val {fold.val_dates[0]} -> {fold.val_dates[-1]}"
+            )
+            for spec in specs:
+                start_ts = time.time()
+                if spec["type"] == "standard":
+                    result = self.run_with_groups(
+                        split_config=fold_split,
+                        model_name=spec["model"],
+                        feature_groups=spec["groups"],
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                        target_mode=spec["target_mode"],
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_set = json.dumps(result["feature_groups"], ensure_ascii=False)
+                    target_type = spec["target_mode"]
+                    model_type = spec["model"]
+                    postprocess_type = "none"
+                elif spec["type"] == "common_residual":
+                    result = self.run_common_residual_reconstruction(
+                        split_config=fold_split,
+                        residual_model_name="tree",
+                        common_model_name="ridge",
+                        feature_groups=None,
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_set = json.dumps(["base", "lag", "roll", "cross", "common_aggregate"], ensure_ascii=False)
+                    target_type = "common_plus_residual"
+                    model_type = "common_residual"
+                    postprocess_type = "none"
+                elif spec["type"] == "soft_regime":
+                    result = self.run_soft_regime_ensemble(
+                        split_config=fold_split,
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                        target_mode="interval_demean",
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_set = json.dumps(["main_tree", "regime_tree", "regime_score"], ensure_ascii=False)
+                    target_type = "interval_demean"
+                    model_type = "tree_soft_regime"
+                    postprocess_type = "none"
+                elif spec["type"] == "pair_blend":
+                    result = self.run_pair_blend_search(
+                        split_config=fold_split,
+                        first_kind="common_residual",
+                        second_kind="soft_regime",
+                        max_train_days=max_train_days,
+                        max_val_days=max_val_days,
+                    )
+                    train_metrics = result["train_metrics"]
+                    val_metrics = result["val_metrics"]
+                    feature_set = json.dumps(["common_residual", "soft_regime"], ensure_ascii=False)
+                    target_type = "raw"
+                    model_type = "pair_blend"
+                    postprocess_type = json.dumps({"weight_first": result["weight_first"]}, ensure_ascii=False)
+                else:
+                    raise ValueError(f"Unknown rolling suite spec: {spec['type']}")
+
+                rows.append({
+                    "fold_id": fold.fold_id,
+                    "experiment_id": spec["experiment_id"],
+                    "feature_set": feature_set,
+                    "target_type": target_type,
+                    "model_type": model_type,
+                    "postprocess_type": postprocess_type,
+                    "train_corr": train_metrics["corr"],
+                    "val_corr": val_metrics["corr"],
+                    "train_mse": train_metrics["mse"],
+                    "val_mse": val_metrics["mse"],
+                    "train_r2": train_metrics["r2"],
+                    "val_r2": val_metrics["r2"],
+                    "daily_corr_mean": val_metrics["daily_corr_mean"],
+                    "daily_corr_std": val_metrics["daily_corr_std"],
+                    "train_val_corr_gap": self._corr_gap(train_metrics, val_metrics),
+                    "runtime_sec": float(time.time() - start_ts),
+                    "random_seed": 42,
+                    "notes": spec["notes"],
+                })
+
+        df = pd.DataFrame(rows)
+        summary_rows = []
+        for experiment_id, group in df.groupby("experiment_id", sort=False):
+            summary_rows.append({
+                "fold_id": "summary",
+                "experiment_id": experiment_id,
+                "feature_set": group["feature_set"].iloc[0],
+                "target_type": group["target_type"].iloc[0],
+                "model_type": group["model_type"].iloc[0],
+                "postprocess_type": group["postprocess_type"].iloc[0],
+                "train_corr": group["train_corr"].mean(),
+                "val_corr": group["val_corr"].mean(),
+                "train_mse": group["train_mse"].mean(),
+                "val_mse": group["val_mse"].mean(),
+                "train_r2": group["train_r2"].mean(),
+                "val_r2": group["val_r2"].mean(),
+                "daily_corr_mean": group["daily_corr_mean"].mean(),
+                "daily_corr_std": group["daily_corr_mean"].std(ddof=0) if len(group) > 1 else 0.0,
+                "train_val_corr_gap": group["train_val_corr_gap"].mean(),
+                "runtime_sec": group["runtime_sec"].sum(),
+                "random_seed": 42,
+                "notes": f"rolling summary over {len(group)} folds",
+            })
+        return pd.concat([df, pd.DataFrame(summary_rows)], ignore_index=True)
+
     def run_val_blend_search(self, split_config, max_train_days=None, max_val_days=None, target_mode="interval_demean"):
         base_specs = [
             {
@@ -1657,6 +1909,16 @@ class ExperimentRunner(object):
                     "notes": exp["notes"],
                 })
             return pd.DataFrame(rows)
+        elif suite_name == "v31_roll":
+            return self.run_rolling_validation_suite(
+                split_config=split_config,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=4,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
         else:
             raise ValueError(f"Unknown suite: {suite_name}")
 
@@ -1784,7 +2046,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default="ridge", choices=["ridge", "elasticnet", "tree", "gbdt", "histgb", "lgbm", "mlp"])
     parser.add_argument("--target-mode", type=str, default="raw", choices=["raw", "date_demean", "interval_demean", "interval_residual"])
     parser.add_argument("--feature-groups", nargs="*", default=None, help="Feature groups to keep, e.g. base lag roll cross")
-    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31", "v31_quick"])
+    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
     parser.add_argument("--output-csv", type=str, default=None)
     parser.add_argument("--train-start", type=int, default=20230601)
     parser.add_argument("--train-end", type=int, default=20231031)
