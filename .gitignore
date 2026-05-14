@@ -1,0 +1,13 @@
+archive/
+*.zip
+*.docx
+meow-master/meow-master/__pycache__/
+*.pyc
+*.log
+*.bak
+.vscode/
+build/
+dist/
+release/
+*.egg-info/
+dask-worker-space/
