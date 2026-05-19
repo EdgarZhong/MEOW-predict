@@ -1,9 +1,13 @@
 archive/
+archive/*.h5
 *.zip
 *.docx
+__pycache__/
 meow-master/meow-master/__pycache__/
 *.pyc
 *.log
+*.out
+*.err
 *.bak
 .vscode/
 build/

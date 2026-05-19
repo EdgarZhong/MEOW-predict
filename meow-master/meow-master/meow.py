@@ -64,7 +64,7 @@ def build_arg_parser():
         choices=["legacy", "suite"],
         help="legacy runs the original fit/eval flow; suite runs the experiment runner",
     )
-    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
+    parser.add_argument("--suite", type=str, default=None, choices=["stage0", "stage0_quick", "stage0_roll", "formal_backbone", "ridge_enhance", "restricted_fusion", "train_window_sensitivity", "train_window_sensitivity_quick", "ofi_audit", "trade_impact_audit", "conditional_momentum_audit", "stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
     parser.add_argument("--model", type=str, default="ridge", choices=["ridge", "elasticnet", "tree", "gbdt", "histgb", "lgbm", "mlp"])
     parser.add_argument("--target-mode", type=str, default="raw", choices=["raw", "date_demean", "interval_demean", "interval_residual"])
     parser.add_argument("--feature-groups", nargs="*", default=None)

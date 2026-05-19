@@ -61,17 +61,60 @@ class FeatureBuilder(object):
         df = df.sort_values(["date", "symbol", "interval"], kind="mergesort").reset_index(drop=True)
         base = self._add_base_features(df)
         working = pd.concat([df[self.meta_cols + [self.target_col, "midpx"]], base], axis=1)
-        lag = self._add_lag_features(working)
-        roll = self._add_roll_features(pd.concat([working, lag], axis=1))
-        cross = self._add_cross_section_features(pd.concat([working, lag, roll], axis=1))
-        regime = self._add_regime_features(pd.concat([working, lag, roll, cross], axis=1))
-        feature_frames = [working[self.meta_cols + [self.target_col]].copy(), base, lag, roll, cross, regime]
+        raw_inputs = df[[
+            "bid0",
+            "ask0",
+            "bid4",
+            "ask4",
+            "bid9",
+            "ask9",
+            "bid19",
+            "ask19",
+            "bsize0",
+            "asize0",
+            "bsize0_4",
+            "asize0_4",
+            "bsize5_9",
+            "asize5_9",
+            "bsize10_19",
+            "asize10_19",
+            "nTradeBuy",
+            "tradeBuyQty",
+            "tradeBuyTurnover",
+            "nTradeSell",
+            "tradeSellQty",
+            "tradeSellTurnover",
+            "nAddBuy",
+            "addBuyQty",
+            "nAddSell",
+            "addSellQty",
+            "nCxlBuy",
+            "cxlBuyQty",
+            "nCxlSell",
+            "cxlSellQty",
+            "buyVwad",
+            "sellVwad",
+        ]].copy()
+        helper_base = pd.concat([working, raw_inputs], axis=1)
+        lag = self._add_lag_features(helper_base)
+        roll = self._add_roll_features(pd.concat([helper_base, lag], axis=1))
+        patch = self._add_patch_summary_features(pd.concat([helper_base, lag, roll], axis=1))
+        ofi = self._add_ofi_features(pd.concat([helper_base, lag, roll, patch], axis=1))
+        trade_impact = self._add_trade_impact_features(pd.concat([helper_base, lag, roll, patch, ofi], axis=1))
+        cross = self._add_cross_section_features(pd.concat([helper_base, lag, roll, patch, ofi, trade_impact], axis=1))
+        conditional_momentum = self._add_conditional_momentum_features(pd.concat([helper_base, lag, roll, patch, ofi, trade_impact, cross], axis=1))
+        regime = self._add_regime_features(pd.concat([helper_base, lag, roll, patch, ofi, trade_impact, cross, conditional_momentum], axis=1))
+        feature_frames = [working[self.meta_cols + [self.target_col]].copy(), base, lag, roll, patch, ofi, trade_impact, cross, conditional_momentum, regime]
         out = pd.concat(feature_frames, axis=1)
         out = out.loc[:, ~out.columns.duplicated()]
         xdf = out.drop(columns=[self.target_col]).copy()
         ydf = out[self.meta_cols + [self.target_col]].copy()
         xdf = xdf.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         ydf = ydf.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        for col in xdf.columns:
+            if col not in self.meta_cols:
+                xdf[col] = pd.to_numeric(xdf[col], errors="coerce").astype(np.float32)
+        ydf[self.target_col] = pd.to_numeric(ydf[self.target_col], errors="coerce").astype(np.float32)
         return xdf, ydf
 
     def select_groups(self, xdf, groups):
@@ -106,6 +149,24 @@ class FeatureBuilder(object):
             "roll_short": [c for c in xdf.columns if any(token in c for token in ["_rm3", "_rm5", "_rs3", "_rs5"])],
             "roll_mid": [c for c in xdf.columns if any(token in c for token in ["_rm10", "_rs10"])],
             "roll_long": [c for c in xdf.columns if any(token in c for token in ["_rm20", "_rm30", "_rs20", "_rs30"])],
+            "patch": [c for c in xdf.columns if "_patch" in c],
+            "patch_summary": [c for c in xdf.columns if "_patch" in c],
+            "ofi": [c for c in xdf.columns if c.startswith("ofi_") or c.startswith("bid_ofi_") or c.startswith("ask_ofi_") or c.startswith("ofi_total")],
+            "ofi_raw": [c for c in xdf.columns if c.startswith("bid_ofi_") or c.startswith("ask_ofi_") or c in ["ofi_0", "ofi_4", "ofi_9", "ofi_19", "ofi_total"]],
+            "ofi_dynamic": [c for c in xdf.columns if any(token in c for token in ["_ema", "_sum", "_mean", "_z"]) and (c.startswith("ofi_") or c.startswith("bid_ofi_") or c.startswith("ask_ofi_"))],
+            "ofi_rank": [c for c in xdf.columns if c.startswith("ofi_") and c.endswith("_cs_rank")],
+            "ofi_safe": [c for c in xdf.columns if c.startswith("ofi_") or c.startswith("bid_ofi_") or c.startswith("ask_ofi_")],
+            "trade_impact": [c for c in xdf.columns if c.startswith("trade_pressure_") or c.startswith("trade_intensity") or c.startswith("avg_trade_") or c.startswith("signed_trade_") or c.startswith("trade_impact_")],
+            "trade_impact_dyn": [c for c in xdf.columns if any(token in c for token in ["_ema", "_sum", "_mean", "_z", "_cs_rank"]) and (c.startswith("trade_pressure_") or c.startswith("trade_intensity") or c.startswith("avg_trade_"))],
+            "trade_impact_interaction": [c for c in xdf.columns if c.startswith("trade_pressure_x_") or c.startswith("trade_intensity_x_") or c.startswith("avg_trade_x_")],
+            "trade_impact_safe": [c for c in xdf.columns if c.startswith("trade_pressure_") or c.startswith("trade_intensity") or c.startswith("avg_trade_") or c.startswith("signed_trade_") or c.startswith("trade_impact_") or c.startswith("trade_pressure_x_") or c.startswith("trade_intensity_x_") or c.startswith("avg_trade_x_")],
+            "conditional_momentum": [c for c in xdf.columns if c.startswith("lagret") or c.startswith("momentum_") or c.startswith("reversal_") or c.startswith("conditional_")],
+            "conditional_momentum_interaction": [c for c in xdf.columns if c.startswith("lagret") and ("_x_" in c or "_cond" in c or "_state" in c)],
+            "conditional_momentum_safe": [c for c in xdf.columns if c.startswith("lagret") or c.startswith("momentum_") or c.startswith("reversal_") or c.startswith("conditional_")],
+            "cross_z": [c for c in xdf.columns if c.endswith("_cs_z")],
+            "cross_rank": [c for c in xdf.columns if c.endswith("_cs_rank")],
+            "cross_rank_features": [c for c in xdf.columns if c.endswith("_cs_rank")],
+            "norm_core": [c for c in xdf.columns if c in ["spread", "mid_ret1_raw", "obi0", "obi4", "obi9", "trade_imb", "trade_turnover_imb", "add_imb", "cxl_imb", "qty_add_imb", "qty_cxl_imb", "buy_vwad_gap", "sell_vwad_gap", "trade_activity", "order_pressure"] or c.endswith("_cs_z")],
             "lag_short": [c for c in xdf.columns if any(token in c for token in ["_lag_1", "_lag_3", "_lag_5"])],
             "lag_mid": [c for c in xdf.columns if any(token in c for token in ["_lag_10"])],
             "lag_long": [c for c in xdf.columns if any(token in c for token in ["_lag_20", "_lag_30"])],
@@ -116,7 +177,7 @@ class FeatureBuilder(object):
         for group in groups:
             selected.extend(group_map[group])
         selected = [c for c in selected if c in xdf.columns]
-        return xdf[selected].copy()
+        return xdf[selected].copy(deep=False)
 
     def _safe_div(self, a, b):
         return a / (b.abs() + EPS)
@@ -186,11 +247,168 @@ class FeatureBuilder(object):
                 )
         return out
 
+    def _add_patch_summary_features(self, df):
+        out = pd.DataFrame(index=df.index)
+        group = df.groupby(["date", "symbol"], sort=False)
+        base_cols = ["mid_ret1_raw", "obi0", "trade_imb", "spread", "order_pressure"]
+        patch_windows = [6, 12, 24, 60]
+        for col in base_cols:
+            series = group[col]
+            for window in patch_windows:
+                out[f"{col}_patch{window}_mean"] = series.transform(lambda s: s.rolling(window=window, min_periods=1).mean()).fillna(0.0)
+                out[f"{col}_patch{window}_std"] = series.transform(lambda s: s.rolling(window=window, min_periods=1).std(ddof=0)).fillna(0.0)
+                out[f"{col}_patch{window}_max"] = series.transform(lambda s: s.rolling(window=window, min_periods=1).max()).fillna(0.0)
+                out[f"{col}_patch{window}_min"] = series.transform(lambda s: s.rolling(window=window, min_periods=1).min()).fillna(0.0)
+                out[f"{col}_patch{window}_range"] = (out[f"{col}_patch{window}_max"] - out[f"{col}_patch{window}_min"]).fillna(0.0)
+                out[f"{col}_patch{window}_slope"] = series.transform(
+                    lambda s: s.diff().rolling(window=window, min_periods=1).mean()
+                ).fillna(0.0)
+                out[f"{col}_patch{window}_last"] = df[col].fillna(0.0)
+        return out
+
+    def _add_ofi_features(self, df):
+        out = pd.DataFrame(index=df.index)
+        group = df.groupby(["date", "symbol"], sort=False)
+        level_specs = [
+            ("0", "bid0", "ask0", "bsize0", "asize0"),
+            ("4", "bid4", "ask4", "bsize0_4", "asize0_4"),
+            ("9", "bid9", "ask9", "bsize5_9", "asize5_9"),
+            ("19", "bid19", "ask19", "bsize10_19", "asize10_19"),
+        ]
+        ofi_cols = []
+        depth_cols = []
+        turnover = (df["tradeBuyTurnover"].fillna(0.0) + df["tradeSellTurnover"].fillna(0.0)).astype(np.float32)
+        for suffix, bid_px, ask_px, bid_sz, ask_sz in level_specs:
+            prev_bid_px = group[bid_px].shift(1)
+            prev_ask_px = group[ask_px].shift(1)
+            prev_bid_sz = group[bid_sz].shift(1)
+            prev_ask_sz = group[ask_sz].shift(1)
+            cur_bid_px = df[bid_px]
+            cur_ask_px = df[ask_px]
+            cur_bid_sz = df[bid_sz]
+            cur_ask_sz = df[ask_sz]
+            bid_ofi = np.where(
+                cur_bid_px > prev_bid_px,
+                cur_bid_sz,
+                np.where(cur_bid_px == prev_bid_px, cur_bid_sz - prev_bid_sz, -prev_bid_sz),
+            )
+            ask_ofi = np.where(
+                cur_ask_px < prev_ask_px,
+                -cur_ask_sz,
+                np.where(cur_ask_px == prev_ask_px, -(cur_ask_sz - prev_ask_sz), prev_ask_sz),
+            )
+            bid_ofi = pd.Series(bid_ofi, index=df.index).replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
+            ask_ofi = pd.Series(ask_ofi, index=df.index).replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
+            level_ofi = (bid_ofi + ask_ofi).astype(np.float32)
+            depth = (cur_bid_sz + cur_ask_sz).replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
+            out[f"bid_ofi_{suffix}"] = bid_ofi
+            out[f"ask_ofi_{suffix}"] = ask_ofi
+            out[f"ofi_{suffix}"] = level_ofi
+            out[f"ofi_{suffix}_depth"] = depth
+            out[f"ofi_{suffix}_div_depth"] = self._safe_div(level_ofi, depth)
+            out[f"ofi_{suffix}_div_turnover"] = self._safe_div(level_ofi, turnover)
+            ofi_cols.append(f"ofi_{suffix}")
+            depth_cols.append(f"ofi_{suffix}_depth")
+        out["ofi_total"] = out[ofi_cols].sum(axis=1)
+        out["ofi_total_depth"] = out[depth_cols].sum(axis=1)
+        out["ofi_abs"] = out["ofi_total"].abs()
+        out["ofi_sign"] = np.sign(out["ofi_total"]).astype(np.float32)
+        out["ofi_div_total_depth"] = self._safe_div(out["ofi_total"], out["ofi_total_depth"])
+        out["ofi_div_turnover"] = self._safe_div(out["ofi_total"], turnover)
+        symbol_group = df.groupby("symbol", sort=False)
+        ofi_group = out["ofi_total"].groupby(df["symbol"], sort=False)
+        for window in [3, 6, 12, 24]:
+            out[f"ofi_total_ema{window}"] = ofi_group.transform(
+                lambda s: s.ewm(halflife=window, adjust=False).mean()
+            ).fillna(0.0)
+            out[f"ofi_total_sum{window}"] = ofi_group.transform(
+                lambda s: s.rolling(window=window, min_periods=1).sum()
+            ).fillna(0.0)
+            out[f"ofi_total_mean{window}"] = ofi_group.transform(
+                lambda s: s.rolling(window=window, min_periods=1).mean()
+            ).fillna(0.0)
+            out[f"ofi_total_z{window}"] = ofi_group.transform(
+                lambda s: (s - s.rolling(window=window, min_periods=1).mean())
+                / (s.rolling(window=window, min_periods=1).std(ddof=0) + EPS)
+            ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return out
+
+    def _add_trade_impact_features(self, df):
+        out = pd.DataFrame(index=df.index)
+        turnover = (df["tradeBuyTurnover"].fillna(0.0) + df["tradeSellTurnover"].fillna(0.0)).astype(np.float32)
+        qty = (df["tradeBuyQty"].fillna(0.0) + df["tradeSellQty"].fillna(0.0)).astype(np.float32)
+        trades = (df["nTradeBuy"].fillna(0.0) + df["nTradeSell"].fillna(0.0)).astype(np.float32)
+        signed_qty = (df["tradeBuyQty"].fillna(0.0) - df["tradeSellQty"].fillna(0.0)).astype(np.float32)
+        signed_turnover = (df["tradeBuyTurnover"].fillna(0.0) - df["tradeSellTurnover"].fillna(0.0)).astype(np.float32)
+        out["signed_trade_qty"] = signed_qty
+        out["signed_trade_turnover"] = signed_turnover
+        out["trade_pressure_qty"] = self._safe_div(signed_qty, qty)
+        out["trade_pressure_turnover"] = self._safe_div(signed_turnover, turnover)
+        out["trade_intensity"] = trades
+        out["avg_trade_size"] = self._safe_div(qty, trades)
+        out["avg_trade_turnover"] = self._safe_div(turnover, trades)
+        out["trade_pressure_x_spread"] = out["trade_pressure_qty"] * df["spread"].fillna(0.0)
+        out["trade_pressure_x_order_pressure"] = out["trade_pressure_qty"] * df["order_pressure"].fillna(0.0)
+        out["trade_pressure_x_ofi"] = out["trade_pressure_qty"] * df.get("ofi_total", 0.0)
+        symbol_group = df.groupby("symbol", sort=False)
+        for window in [3, 6, 12, 24]:
+            for col in ["trade_pressure_qty", "trade_pressure_turnover", "trade_intensity", "avg_trade_size", "avg_trade_turnover"]:
+                col_group = out[col].groupby(df["symbol"], sort=False)
+                out[f"{col}_ema{window}"] = col_group.transform(lambda s: s.ewm(halflife=window, adjust=False).mean()).fillna(0.0)
+                out[f"{col}_sum{window}"] = col_group.transform(lambda s: s.rolling(window=window, min_periods=1).sum()).fillna(0.0)
+                out[f"{col}_mean{window}"] = col_group.transform(lambda s: s.rolling(window=window, min_periods=1).mean()).fillna(0.0)
+                out[f"{col}_z{window}"] = col_group.transform(
+                    lambda s: (s - s.rolling(window=window, min_periods=1).mean())
+                    / (s.rolling(window=window, min_periods=1).std(ddof=0) + EPS)
+                ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return out
+
+    def _add_conditional_momentum_features(self, df):
+        out = pd.DataFrame(index=df.index)
+        day_symbol = df.groupby(["date", "symbol"], sort=False)
+        intraday = df.groupby(["date"], sort=False)
+        for window in [1, 3, 6, 12, 24]:
+            raw = day_symbol["midpx"].transform(lambda s: s.pct_change(window)).fillna(0.0)
+            cx = raw.groupby(df["interval"], sort=False).transform("mean")
+            lagret = raw - cx
+            out[f"lagret{window}_raw"] = raw.astype(np.float32)
+            out[f"lagret{window}"] = lagret.astype(np.float32)
+            out[f"lagret{window}_abs"] = lagret.abs().astype(np.float32)
+            out[f"lagret{window}_sign"] = np.sign(lagret).astype(np.float32)
+            out[f"lagret{window}_x_trade_pressure"] = lagret * df.get("trade_pressure_qty", 0.0)
+            out[f"lagret{window}_x_ofi"] = lagret * df.get("ofi_total", 0.0)
+            out[f"lagret{window}_x_spread"] = lagret * df.get("spread", 0.0)
+            out[f"lagret{window}_x_vol"] = lagret * day_symbol["mid_ret1_raw"].transform(lambda s: s.rolling(window=min(10, window + 2), min_periods=1).std(ddof=0)).fillna(0.0)
+        out["momentum_state"] = (out["lagret12"] > 0).astype(np.float32) if "lagret12" in out.columns else 0.0
+        out["reversal_state"] = (out["lagret12"] < 0).astype(np.float32) if "lagret12" in out.columns else 0.0
+        out["conditional_momentum_rank"] = out["lagret12"].groupby(df["date"], sort=False).transform(lambda s: s.rank(pct=True, method="average")).fillna(0.0) if "lagret12" in out.columns else 0.0
+        return out
+
     def _add_cross_section_features(self, df):
         out = pd.DataFrame(index=df.index)
         cross_group = df.groupby(["date", "interval"], sort=False)
-        cols = ["midpx", "spread", "obi0", "obi4", "trade_imb", "order_pressure", "trade_activity"]
+        cols = [
+            "midpx",
+            "spread",
+            "obi0",
+            "obi4",
+            "trade_imb",
+            "order_pressure",
+            "trade_activity",
+            "ofi_total",
+            "ofi_0",
+            "ofi_4",
+            "ofi_9",
+            "ofi_19",
+            "trade_pressure_qty",
+            "trade_pressure_turnover",
+            "trade_intensity",
+            "avg_trade_size",
+            "avg_trade_turnover",
+        ]
         for col in cols:
+            if col not in df.columns:
+                continue
             mean = cross_group[col].transform("mean")
             std = cross_group[col].transform("std").replace(0.0, np.nan)
             out[f"{col}_cs_z"] = ((df[col] - mean) / std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -335,7 +553,7 @@ class ExperimentRunner(object):
         cache_key = self._cache_key(dates, max_days=max_days)
         if cache_key in self._split_cache:
             xdf, ydf = self._split_cache[cache_key]
-            return xdf.copy(), ydf.copy()
+            return xdf, ydf
         if max_days is not None:
             dates = dates[:max_days]
         x_parts = []
@@ -347,20 +565,20 @@ class ExperimentRunner(object):
                 log.inf(f"Loading and featurizing {date}...")
                 raw = self.loader.loadDate(date)
                 xdf, ydf = self.builder.build(raw)
-                self._daily_feature_cache[date] = (xdf.copy(), ydf.copy())
+                self._daily_feature_cache[date] = (xdf, ydf)
                 del raw
                 gc.collect()
             x_parts.append(xdf)
             y_parts.append(ydf)
         xdf = pd.concat(x_parts, ignore_index=True)
         ydf = pd.concat(y_parts, ignore_index=True)
-        self._split_cache[cache_key] = (xdf.copy(), ydf.copy())
+        self._split_cache[cache_key] = (xdf, ydf)
         return xdf, ydf
 
     def load_raw_split(self, dates, max_days=None):
         cache_key = self._cache_key(dates, max_days=max_days)
         if cache_key in self._raw_split_cache:
-            return self._raw_split_cache[cache_key].copy()
+            return self._raw_split_cache[cache_key]
         if max_days is not None:
             dates = dates[:max_days]
         parts = []
@@ -370,11 +588,11 @@ class ExperimentRunner(object):
             else:
                 log.inf(f"Loading raw {date}...")
                 raw = self.loader.loadDate(date)
-                self._daily_raw_cache[date] = raw.copy()
+                self._daily_raw_cache[date] = raw
                 parts.append(raw)
                 gc.collect()
         raw = pd.concat(parts, ignore_index=True)
-        self._raw_split_cache[cache_key] = raw.copy()
+        self._raw_split_cache[cache_key] = raw
         return raw
 
     def _build_sequence_features(self, raw_df, lags):
@@ -477,6 +695,97 @@ class ExperimentRunner(object):
         agg = xdf[["date", "interval"] + cols].groupby(["date", "interval"], sort=False)[cols].mean().reset_index()
         return agg
 
+    def _extract_linear_coefficients(self, model, feature_cols):
+        if isinstance(model, Pipeline):
+            inner = model.named_steps.get("model")
+            if hasattr(inner, "coef_"):
+                coef = np.asarray(inner.coef_, dtype=np.float32)
+            else:
+                return None
+        elif hasattr(model, "coef_"):
+            coef = np.asarray(model.coef_, dtype=np.float32)
+        else:
+            return None
+        if coef.ndim > 1:
+            coef = coef.ravel()
+        if len(coef) != len(feature_cols):
+            return None
+        return pd.DataFrame({"feature": list(feature_cols), "coef": coef, "abs_coef": np.abs(coef)})
+
+    def _fold_metric_row(self, fold_id, experiment_id, feature_set, target_type, model_type, postprocess_type, train_metrics, val_metrics, runtime_sec, notes, random_seed=42):
+        return {
+            "fold_id": fold_id,
+            "experiment_id": experiment_id,
+            "feature_set": feature_set,
+            "target_type": target_type,
+            "model_type": model_type,
+            "postprocess_type": postprocess_type,
+            "train_corr": train_metrics["corr"],
+            "val_corr": val_metrics["corr"],
+            "train_mse": train_metrics["mse"],
+            "val_mse": val_metrics["mse"],
+            "train_r2": train_metrics["r2"],
+            "val_r2": val_metrics["r2"],
+            "daily_corr_mean": val_metrics["daily_corr_mean"],
+            "daily_corr_std": val_metrics["daily_corr_std"],
+            "rolling_corr_mean": np.nan,
+            "rolling_corr_std": np.nan,
+            "rolling_corr_min": np.nan,
+            "rolling_mse_mean": np.nan,
+            "rolling_r2_mean": np.nan,
+            "stability_score": np.nan,
+            "train_val_corr_gap": self._corr_gap(train_metrics, val_metrics),
+            "runtime_sec": float(runtime_sec),
+            "random_seed": random_seed,
+            "notes": notes,
+        }
+
+    def _summarize_rolling_rows(self, rows, fold_count):
+        df = pd.DataFrame(rows)
+        summary_rows = []
+        for experiment_id, group in df.groupby("experiment_id", sort=False):
+            val_corrs = group.sort_values("fold_id")["val_corr"].tolist()
+            val_mses = group.sort_values("fold_id")["val_mse"].tolist()
+            val_r2s = group.sort_values("fold_id")["val_r2"].tolist()
+            row = {
+                "experiment_name": experiment_id,
+                "model_type": group["model_type"].iloc[0],
+                "feature_set": group["feature_set"].iloc[0],
+                "target_type": group["target_type"].iloc[0],
+            }
+            for idx in range(fold_count):
+                row[f"fold{idx + 1}_corr"] = val_corrs[idx] if idx < len(val_corrs) else np.nan
+            row["rolling_corr_mean"] = float(np.mean(val_corrs)) if val_corrs else np.nan
+            row["rolling_corr_std"] = float(np.std(val_corrs, ddof=0)) if len(val_corrs) > 0 else np.nan
+            row["rolling_corr_min"] = float(np.min(val_corrs)) if val_corrs else np.nan
+            row["rolling_mse_mean"] = float(np.mean(val_mses)) if val_mses else np.nan
+            row["rolling_r2_mean"] = float(np.mean(val_r2s)) if val_r2s else np.nan
+            row["daily_corr_mean"] = float(group["daily_corr_mean"].mean())
+            row["daily_corr_std"] = float(group["daily_corr_std"].mean())
+            row["stability_score"] = row["rolling_corr_mean"] - 0.7 * row["rolling_corr_std"]
+            row["是否进入下一阶段"] = "是"
+            row["原因"] = "作为正式 rolling 候选保留"
+            summary_rows.append(row)
+        out = pd.DataFrame(summary_rows)
+        ordered_cols = [
+            "experiment_name",
+            "model_type",
+            "feature_set",
+            "target_type",
+        ] + [f"fold{i}_corr" for i in range(1, fold_count + 1)] + [
+            "rolling_corr_mean",
+            "rolling_corr_std",
+            "rolling_corr_min",
+            "stability_score",
+            "rolling_mse_mean",
+            "rolling_r2_mean",
+            "daily_corr_mean",
+            "daily_corr_std",
+            "是否进入下一阶段",
+            "原因",
+        ]
+        return out.reindex(columns=ordered_cols)
+
     def _make_common_targets(self, ydf):
         return (
             ydf.groupby(["date", "interval"], sort=False)["fret12"]
@@ -524,15 +833,17 @@ class ExperimentRunner(object):
         )
         return merged["pred_common"].fillna(0.0).to_numpy(dtype=np.float32)
 
-    def make_rolling_folds(self, start_date, end_date, train_window=40, val_window=10, step=10, min_train_days=30):
+    def make_rolling_folds(self, start_date, end_date, train_window=40, val_window=10, step=10, min_train_days=30, embargo=0):
         all_dates = self.calendar.range(start_date, end_date)
         folds = []
         fold_id = 0
         if not all_dates:
             return folds
-        cursor = train_window
+        embargo = max(0, int(embargo))
+        cursor = train_window + embargo
         while cursor + val_window <= len(all_dates):
-            train_dates = tuple(all_dates[max(0, cursor - train_window):cursor])
+            train_end = cursor - embargo
+            train_dates = tuple(all_dates[max(0, train_end - train_window):train_end])
             val_dates = tuple(all_dates[cursor: cursor + val_window])
             if len(train_dates) >= min_train_days and len(val_dates) > 0:
                 folds.append(RollingFold(fold_id=fold_id, train_dates=train_dates, val_dates=val_dates))
@@ -822,6 +1133,7 @@ class ExperimentRunner(object):
         return {
             "model": model,
             "feature_cols": feature_cols,
+            "feature_count": int(len(feature_cols)),
             "baseline": baseline,
             "pred_train": pred_train,
             "pred_val": pred_val,
@@ -1407,6 +1719,8 @@ class ExperimentRunner(object):
         max_folds=4,
         max_train_days=None,
         max_val_days=None,
+        embargo=1,
+        specs=None,
     ):
         train_dates, _, _ = self.split_dates(split_config)
         folds = self.make_rolling_folds(
@@ -1416,35 +1730,37 @@ class ExperimentRunner(object):
             val_window=val_window,
             step=step,
             min_train_days=train_window,
+            embargo=embargo,
         )[:max_folds]
         if not folds:
             raise ValueError("No rolling folds available")
 
-        specs = [
-            {
-                "experiment_id": "R00_baseline_ridge",
-                "type": "standard",
-                "model": "ridge",
-                "target_mode": "raw",
-                "groups": ["legacy"],
-                "notes": "rolling baseline ridge",
-            },
-            {
-                "experiment_id": "R01_common_residual",
-                "type": "common_residual",
-                "notes": "rolling common plus residual",
-            },
-            {
-                "experiment_id": "R02_soft_regime_ensemble",
-                "type": "soft_regime",
-                "notes": "rolling soft gating ensemble",
-            },
-            {
-                "experiment_id": "R03_pair_blend",
-                "type": "pair_blend",
-                "notes": "rolling blend of common residual and soft regime",
-            },
-        ]
+        if specs is None:
+            specs = [
+                {
+                    "experiment_id": "R00_baseline_ridge",
+                    "type": "standard",
+                    "model": "ridge",
+                    "target_mode": "raw",
+                    "groups": ["legacy"],
+                    "notes": "rolling baseline ridge",
+                },
+                {
+                    "experiment_id": "R01_common_residual",
+                    "type": "common_residual",
+                    "notes": "rolling common plus residual",
+                },
+                {
+                    "experiment_id": "R02_soft_regime_ensemble",
+                    "type": "soft_regime",
+                    "notes": "rolling soft gating ensemble",
+                },
+                {
+                    "experiment_id": "R03_pair_blend",
+                    "type": "pair_blend",
+                    "notes": "rolling blend of common residual and soft regime",
+                },
+            ]
 
         rows = []
         for fold in folds:
@@ -1537,6 +1853,10 @@ class ExperimentRunner(object):
                     "val_r2": val_metrics["r2"],
                     "daily_corr_mean": val_metrics["daily_corr_mean"],
                     "daily_corr_std": val_metrics["daily_corr_std"],
+                    "rolling_corr_mean": np.nan,
+                    "rolling_corr_std": np.nan,
+                    "rolling_corr_min": np.nan,
+                    "stability_score": np.nan,
                     "train_val_corr_gap": self._corr_gap(train_metrics, val_metrics),
                     "runtime_sec": float(time.time() - start_ts),
                     "random_seed": 42,
@@ -1546,6 +1866,9 @@ class ExperimentRunner(object):
         df = pd.DataFrame(rows)
         summary_rows = []
         for experiment_id, group in df.groupby("experiment_id", sort=False):
+            rolling_corr_mean = float(group["val_corr"].mean())
+            rolling_corr_std = float(group["val_corr"].std(ddof=0)) if len(group) > 1 else 0.0
+            rolling_corr_min = float(group["val_corr"].min())
             summary_rows.append({
                 "fold_id": "summary",
                 "experiment_id": experiment_id,
@@ -1560,7 +1883,11 @@ class ExperimentRunner(object):
                 "train_r2": group["train_r2"].mean(),
                 "val_r2": group["val_r2"].mean(),
                 "daily_corr_mean": group["daily_corr_mean"].mean(),
-                "daily_corr_std": group["daily_corr_mean"].std(ddof=0) if len(group) > 1 else 0.0,
+                "daily_corr_std": group["daily_corr_std"].mean(),
+                "rolling_corr_mean": rolling_corr_mean,
+                "rolling_corr_std": rolling_corr_std,
+                "rolling_corr_min": rolling_corr_min,
+                "stability_score": rolling_corr_mean - 0.7 * rolling_corr_std,
                 "train_val_corr_gap": group["train_val_corr_gap"].mean(),
                 "runtime_sec": group["runtime_sec"].sum(),
                 "random_seed": 42,
@@ -1656,8 +1983,674 @@ class ExperimentRunner(object):
             "val_metrics": val_metrics,
         }
 
+    def _build_rolling_folds(self, split_config, train_window=8, val_window=2, step=10, max_folds=5, embargo=1):
+        train_dates, _, _ = self.split_dates(split_config)
+        folds = self.make_rolling_folds(
+            train_dates[0],
+            train_dates[-1],
+            train_window=train_window,
+            val_window=val_window,
+            step=step,
+            min_train_days=train_window,
+            embargo=embargo,
+        )[:max_folds]
+        if not folds:
+            raise ValueError("No rolling folds available")
+        return folds
+
+    def _evaluate_spec_on_fold(self, fold_split, spec, max_train_days=None, max_val_days=None):
+        start_ts = time.time()
+        coef_df = None
+        if spec["type"] == "standard":
+            result = self.run_with_groups(
+                split_config=fold_split,
+                model_name=spec["model"],
+                feature_groups=spec["groups"],
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                target_mode=spec.get("target_mode", "raw"),
+            )
+            train_metrics = result["train_metrics"]
+            val_metrics = result["val_metrics"]
+            feature_set = json.dumps(result["feature_groups"], ensure_ascii=False)
+            target_type = spec.get("target_mode", "raw")
+            model_type = spec["model"]
+            postprocess_type = "none"
+            if spec.get("collect_coefs"):
+                xtrain, ytrain = self.load_feature_split(
+                    self.calendar.range(fold_split.train_start, fold_split.train_end),
+                    max_days=max_train_days,
+                    groups=spec["groups"],
+                )
+                xtrain = xtrain.loc[:, ~xtrain.columns.duplicated()].copy()
+                model, feature_cols, _ = self.fit_model(spec["model"], xtrain, ytrain, target_mode=spec.get("target_mode", "raw"))
+                coef_df = self._extract_linear_coefficients(model, feature_cols)
+        elif spec["type"] == "common_residual":
+            result = self.run_common_residual_reconstruction(
+                split_config=fold_split,
+                residual_model_name=spec.get("residual_model", "tree"),
+                common_model_name=spec.get("common_model", "ridge"),
+                feature_groups=spec.get("feature_groups"),
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            train_metrics = result["train_metrics"]
+            val_metrics = result["val_metrics"]
+            feature_set = json.dumps(spec.get("feature_groups") or ["base", "lag", "roll", "cross", "common_aggregate"], ensure_ascii=False)
+            target_type = "common_plus_residual"
+            model_type = "common_residual"
+            postprocess_type = "none"
+        elif spec["type"] == "soft_regime":
+            result = self.run_soft_regime_ensemble(
+                split_config=fold_split,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                target_mode=spec.get("target_mode", "interval_demean"),
+            )
+            train_metrics = result["train_metrics"]
+            val_metrics = result["val_metrics"]
+            feature_set = json.dumps(["main_tree", "regime_tree", "regime_score"], ensure_ascii=False)
+            target_type = spec.get("target_mode", "interval_demean")
+            model_type = "tree_soft_regime"
+            postprocess_type = "none"
+        else:
+            raise ValueError(f"Unknown spec type: {spec['type']}")
+        return {
+            "result": result,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "feature_set": feature_set,
+            "target_type": target_type,
+            "model_type": model_type,
+            "postprocess_type": postprocess_type,
+            "runtime_sec": float(time.time() - start_ts),
+            "coef_df": coef_df,
+        }
+
+    def run_formal_rolling_suite(
+        self,
+        split_config,
+        specs,
+        train_window=8,
+        val_window=2,
+        step=10,
+        max_folds=5,
+        embargo=1,
+        max_train_days=None,
+        max_val_days=None,
+    ):
+        folds = self._build_rolling_folds(
+            split_config,
+            train_window=train_window,
+            val_window=val_window,
+            step=step,
+            max_folds=max_folds,
+            embargo=embargo,
+        )
+        rows = []
+        coef_payload = {}
+        for fold in folds:
+            fold_split = SplitConfig(
+                train_start=fold.train_dates[0],
+                train_end=fold.train_dates[-1],
+                val_start=fold.val_dates[0],
+                val_end=fold.val_dates[-1],
+                test_start=fold.val_dates[0],
+                test_end=fold.val_dates[-1],
+            )
+            log.inf(
+                f"Formal rolling fold {fold.fold_id}: train {fold.train_dates[0]} -> {fold.train_dates[-1]}, "
+                f"val {fold.val_dates[0]} -> {fold.val_dates[-1]}"
+            )
+            for spec in specs:
+                bundle = self._evaluate_spec_on_fold(
+                    fold_split,
+                    spec,
+                    max_train_days=max_train_days,
+                    max_val_days=max_val_days,
+                )
+                rows.append(
+                    self._fold_metric_row(
+                        fold_id=fold.fold_id,
+                        experiment_id=spec["experiment_id"],
+                        feature_set=bundle["feature_set"],
+                        target_type=bundle["target_type"],
+                        model_type=bundle["model_type"],
+                        postprocess_type=bundle["postprocess_type"],
+                        train_metrics=bundle["train_metrics"],
+                        val_metrics=bundle["val_metrics"],
+                        runtime_sec=bundle["runtime_sec"],
+                        notes=spec.get("notes", ""),
+                    )
+                )
+                if bundle["coef_df"] is not None:
+                    coef_payload.setdefault(spec["experiment_id"], []).append(bundle["coef_df"].assign(fold_id=fold.fold_id))
+        return self._summarize_rolling_rows(rows, len(folds)), pd.DataFrame(rows), coef_payload
+
+    def run_train_window_sensitivity_suite(
+        self,
+        split_config,
+        spec,
+        train_windows,
+        train_window=8,
+        val_window=2,
+        step=10,
+        max_folds=5,
+        embargo=1,
+        max_val_days=None,
+    ):
+        summary_rows = []
+        fold_frames = []
+        for train_days in train_windows:
+            summary, fold_rows, _ = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=[spec],
+                train_window=train_window,
+                val_window=val_window,
+                step=step,
+                max_folds=max_folds,
+                embargo=embargo,
+                max_train_days=train_days,
+                max_val_days=max_val_days,
+            )
+            row = summary.iloc[0].to_dict()
+            row["experiment_name"] = f'{spec["experiment_id"]}_max_train_{train_days if train_days is not None else "expanding"}'
+            row["max_train_days"] = -1 if train_days is None else int(train_days)
+            row["base_experiment_id"] = spec["experiment_id"]
+            row["reason"] = spec.get("notes", "")
+            summary_rows.append(row)
+            fold_rows = fold_rows.copy()
+            fold_rows["max_train_days"] = -1 if train_days is None else int(train_days)
+            fold_frames.append(fold_rows)
+        out = pd.DataFrame(summary_rows)
+        if not out.empty:
+            ordered = [
+                "experiment_name",
+                "base_experiment_id",
+                "max_train_days",
+                "model_type",
+                "feature_set",
+                "target_type",
+            ] + [c for c in out.columns if c.startswith("fold")] + [
+                "rolling_corr_mean",
+                "rolling_corr_std",
+                "rolling_corr_min",
+                "stability_score",
+                "rolling_mse_mean",
+                "rolling_r2_mean",
+                "daily_corr_mean",
+                "daily_corr_std",
+                "是否进入下一阶段",
+                "原因",
+            ]
+            out = out.reindex(columns=[c for c in ordered if c in out.columns])
+        fold_df = pd.concat(fold_frames, ignore_index=True) if fold_frames else pd.DataFrame()
+        return out, fold_df
+
+    def summarize_feature_coefficients(self, coef_payload, feature_names, experiment_id):
+        frames = coef_payload.get(experiment_id, [])
+        if not frames:
+            return pd.DataFrame()
+        coef_df = pd.concat(frames, ignore_index=True)
+        coef_df = coef_df[coef_df["feature"].isin(feature_names)].copy()
+        if coef_df.empty:
+            return pd.DataFrame()
+        ranked_frames = []
+        for fold_id, fold_group in coef_df.groupby("fold_id", sort=True):
+            fold_group = fold_group.sort_values("abs_coef", ascending=False).reset_index(drop=True)
+            fold_group["abs_rank"] = np.arange(1, len(fold_group) + 1)
+            ranked_frames.append(fold_group)
+        ranked = pd.concat(ranked_frames, ignore_index=True)
+        summary_rows = []
+        for feature, grp in ranked.groupby("feature", sort=False):
+            abs_values = grp["abs_coef"].to_numpy(dtype=np.float32)
+            coefs = grp["coef"].to_numpy(dtype=np.float32)
+            ranks = grp["abs_rank"].to_numpy(dtype=np.float32)
+            summary_rows.append({
+                "feature": feature,
+                "mean_coef": float(np.mean(coefs)),
+                "mean_abs_coef": float(np.mean(abs_values)),
+                "std_abs_coef": float(np.std(abs_values, ddof=0)),
+                "mean_abs_rank": float(np.mean(ranks)),
+                "sign_consistency": float(np.mean(np.sign(coefs) == np.sign(np.mean(coefs)))),
+                "fold_stability": float(1.0 / (1.0 + np.std(abs_values, ddof=0))),
+                "n_folds": int(grp["fold_id"].nunique()),
+            })
+        return pd.DataFrame(summary_rows).sort_values(["mean_abs_coef", "mean_abs_rank"], ascending=[False, True]).reset_index(drop=True)
+
+    def choose_weighted_fusion(
+        self,
+        split_config,
+        backbone_groups,
+        max_train_days=None,
+        max_val_days=None,
+        train_window=8,
+        val_window=2,
+        step=10,
+        max_folds=5,
+        embargo=1,
+    ):
+        folds = self._build_rolling_folds(
+            split_config,
+            train_window=train_window,
+            val_window=val_window,
+            step=step,
+            max_folds=max_folds,
+            embargo=embargo,
+        )
+        candidate_weights = []
+        for w0 in [0.70, 0.75, 0.80, 0.85, 0.90]:
+            for w1 in [0.00, 0.05, 0.10, 0.15]:
+                for w2 in [0.00, 0.05, 0.10, 0.15]:
+                    if abs((w0 + w1 + w2) - 1.0) < 1e-9:
+                        candidate_weights.append((w0, w1, w2))
+        if not candidate_weights:
+            raise ValueError("No valid fusion weights")
+
+        rows = []
+        for fold in folds:
+            fold_split = SplitConfig(
+                train_start=fold.train_dates[0],
+                train_end=fold.train_dates[-1],
+                val_start=fold.val_dates[0],
+                val_end=fold.val_dates[-1],
+                test_start=fold.val_dates[0],
+                test_end=fold.val_dates[-1],
+            )
+            backbone_bundle = self._evaluate_spec_on_fold(
+                fold_split,
+                {"type": "standard", "experiment_id": "backbone", "model": "ridge", "groups": backbone_groups, "target_mode": "raw", "notes": "backbone"},
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            common_bundle = self._evaluate_spec_on_fold(
+                fold_split,
+                {"type": "common_residual", "experiment_id": "common", "notes": "common"},
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            regime_bundle = self._evaluate_spec_on_fold(
+                fold_split,
+                {"type": "soft_regime", "experiment_id": "regime", "target_mode": "interval_demean", "notes": "regime"},
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            yval = self.load_feature_split(
+                self.calendar.range(fold.val_dates[0], fold.val_dates[-1]),
+                max_days=max_val_days,
+                groups=None,
+            )[1]
+            backbone_pred = np.asarray(backbone_bundle["result"]["pred_val"], dtype=np.float32)
+            common_pred = np.asarray(common_bundle["result"]["pred_val"], dtype=np.float32)
+            regime_pred = np.asarray(regime_bundle["result"]["pred_val"], dtype=np.float32)
+            for w0, w1, w2 in candidate_weights:
+                pred = w0 * backbone_pred + w1 * common_pred + w2 * regime_pred
+                metrics = self.evaluate_prediction_bundle(yval, pred)
+                rows.append({
+                    "fold_id": fold.fold_id,
+                    "weight_w0": w0,
+                    "weight_w1": w1,
+                    "weight_w2": w2,
+                    "corr": metrics["corr"],
+                    "mse": metrics["mse"],
+                    "r2": metrics["r2"],
+                    "daily_corr_mean": metrics["daily_corr_mean"],
+                    "daily_corr_std": metrics["daily_corr_std"],
+                })
+        df = pd.DataFrame(rows)
+        summary = (
+            df.groupby(["weight_w0", "weight_w1", "weight_w2"], sort=False)
+            .agg(
+                rolling_corr_mean=("corr", "mean"),
+                rolling_corr_std=("corr", lambda s: float(np.std(s.to_numpy(dtype=np.float32), ddof=0)) if len(s) > 1 else 0.0),
+                rolling_corr_min=("corr", "min"),
+                rolling_mse_mean=("mse", "mean"),
+                rolling_r2_mean=("r2", "mean"),
+                daily_corr_mean=("daily_corr_mean", "mean"),
+                daily_corr_std=("daily_corr_std", "mean"),
+            )
+            .reset_index()
+        )
+        summary["stability_score"] = summary["rolling_corr_mean"] - 0.7 * summary["rolling_corr_std"]
+        best = summary.sort_values(["stability_score", "rolling_corr_mean", "rolling_corr_min"], ascending=[False, False, False]).iloc[0]
+        return df, summary, best.to_dict()
+
     def run_suite(self, split_config, suite_name="ablation", max_train_days=None, max_val_days=None):
         suite_name = (suite_name or "ablation").lower()
+        if suite_name == "train_window_sensitivity_quick":
+            spec = {
+                "experiment_id": "R02_ridge_legacy_plus_norm_core",
+                "type": "standard",
+                "model": "ridge",
+                "target_mode": "raw",
+                "groups": ["legacy", "norm_core"],
+                "notes": "train window sensitivity on best ridge backbone",
+                "collect_coefs": False,
+            }
+            summary, fold_rows = self.run_train_window_sensitivity_suite(
+                split_config=split_config,
+                spec=spec,
+                train_windows=[4, 80],
+                train_window=80,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "train_window_sensitivity":
+            spec = {
+                "experiment_id": "R02_ridge_legacy_plus_norm_core",
+                "type": "standard",
+                "model": "ridge",
+                "target_mode": "raw",
+                "groups": ["legacy", "norm_core"],
+                "notes": "train window sensitivity on best ridge backbone",
+                "collect_coefs": False,
+            }
+            summary, fold_rows = self.run_train_window_sensitivity_suite(
+                split_config=split_config,
+                spec=spec,
+                train_windows=[4, 10, 20, 40, 80, None],
+                train_window=80,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "ofi_audit":
+            specs = [
+                {"experiment_id": "O1_R02_plus_ofi_raw", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_raw"], "notes": "R02 plus raw OFI"},
+                {"experiment_id": "O2_R02_plus_ofi_dynamic", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_dynamic"], "notes": "R02 plus dynamic OFI"},
+                {"experiment_id": "O3_R02_plus_ofi_rank", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_rank", "ofi_raw"], "notes": "R02 plus OFI cross ranks"},
+                {"experiment_id": "O4_R02_plus_ofi_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe"], "notes": "R02 plus all safe OFI"},
+                {"experiment_id": "O5_R02_plus_ofi_raw_dynamic", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_raw", "ofi_dynamic"], "notes": "R02 plus raw and dynamic OFI"},
+                {"experiment_id": "O6_R02_plus_all_ofi", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe", "ofi_rank"], "notes": "R02 plus all OFI groups"},
+            ]
+            summary, fold_rows, _ = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=specs,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "trade_impact_audit":
+            specs = [
+                {"experiment_id": "T1_R02_plus_trade_impact", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact"], "notes": "R02 plus trade impact base"},
+                {"experiment_id": "T2_R02_plus_trade_impact_dyn", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_dyn"], "notes": "R02 plus trade impact dynamic"},
+                {"experiment_id": "T3_R02_plus_trade_impact_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_interaction"], "notes": "R02 plus trade impact interactions"},
+                {"experiment_id": "T4_R02_plus_trade_impact_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_safe"], "notes": "R02 plus all safe trade impact"},
+            ]
+            summary, fold_rows, _ = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=specs,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "conditional_momentum_audit":
+            specs = [
+                {"experiment_id": "C1_R02_plus_conditional_momentum", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum"], "notes": "R02 plus conditional momentum base"},
+                {"experiment_id": "C2_R02_plus_conditional_momentum_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_interaction"], "notes": "R02 plus conditional momentum interactions"},
+                {"experiment_id": "C3_R02_plus_conditional_momentum_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_safe"], "notes": "R02 plus all safe conditional momentum"},
+            ]
+            summary, fold_rows, _ = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=specs,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "formal_backbone":
+            specs = [
+                {"experiment_id": "B0_ridge_legacy", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy"], "notes": "formal ridge legacy backbone", "collect_coefs": True},
+                {"experiment_id": "B6_common_residual", "type": "common_residual", "notes": "formal common residual branch"},
+                {"experiment_id": "B7_soft_regime", "type": "soft_regime", "notes": "formal soft regime ensemble"},
+                {"experiment_id": "B8_ridge_legacy_plus_core", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "base", "lag", "roll", "cross"], "notes": "formal ridge legacy plus core", "collect_coefs": True},
+            ]
+            summary, fold_rows, coef_payload = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=specs,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            summary.attrs["coef_payload"] = coef_payload
+            return summary
+        if suite_name == "ridge_enhance":
+            specs = [
+                {"experiment_id": "R00_ridge_legacy", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy"], "notes": "ridge legacy"},
+                {"experiment_id": "R01_ridge_legacy_plus_core", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "base", "lag", "roll", "cross"], "notes": "ridge legacy plus core"},
+                {"experiment_id": "R02_ridge_legacy_plus_norm_core", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core"], "notes": "ridge legacy plus normalized core"},
+                {"experiment_id": "R03_ridge_legacy_plus_patch_summary", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "patch_summary"], "notes": "ridge legacy plus patch summary"},
+                {"experiment_id": "R04_ridge_legacy_plus_cross_rank", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "cross_rank_features"], "notes": "ridge legacy plus cross-sectional ranks"},
+            ]
+            summary, fold_rows, _ = self.run_formal_rolling_suite(
+                split_config=split_config,
+                specs=specs,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                embargo=1,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+            )
+            summary.attrs["fold_rows"] = fold_rows
+            return summary
+        if suite_name == "restricted_fusion":
+            fusion_rows = []
+            for backbone_id, backbone_groups in [
+                ("B0_ridge_legacy", ["legacy"]),
+                ("B8_ridge_legacy_plus_core", ["legacy", "base", "lag", "roll", "cross"]),
+            ]:
+                per_fold_rows, summary, best = self.choose_weighted_fusion(
+                    split_config=split_config,
+                    backbone_groups=backbone_groups,
+                    max_train_days=max_train_days,
+                    max_val_days=max_val_days,
+                    train_window=8,
+                    val_window=2,
+                    step=10,
+                    max_folds=5,
+                    embargo=1,
+                )
+                best_row = summary.sort_values(["stability_score", "rolling_corr_mean", "rolling_corr_min"], ascending=[False, False, False]).iloc[0].to_dict()
+                best_weights = (best_row["weight_w0"], best_row["weight_w1"], best_row["weight_w2"])
+                best_fold = per_fold_rows[
+                    (per_fold_rows["weight_w0"] == best_weights[0])
+                    & (per_fold_rows["weight_w1"] == best_weights[1])
+                    & (per_fold_rows["weight_w2"] == best_weights[2])
+                ].sort_values("fold_id")
+                best_row.update({
+                    "experiment_name": f"{backbone_id}_plus_common_regime",
+                    "model_type": "restricted_fusion",
+                    "feature_set": json.dumps({"backbone": backbone_id, "common_expert": "B6_common_residual", "regime_expert": "B7_soft_regime", "weights": {
+                        "w0": float(best_row["weight_w0"]),
+                        "w1": float(best_row["weight_w1"]),
+                        "w2": float(best_row["weight_w2"]),
+                    }}, ensure_ascii=False),
+                    "target_type": "raw",
+                    "fold1_corr": float(best_fold.iloc[0]["corr"]) if len(best_fold) > 0 else np.nan,
+                    "fold2_corr": float(best_fold.iloc[1]["corr"]) if len(best_fold) > 1 else np.nan,
+                    "fold3_corr": float(best_fold.iloc[2]["corr"]) if len(best_fold) > 2 else np.nan,
+                    "fold4_corr": float(best_fold.iloc[3]["corr"]) if len(best_fold) > 3 else np.nan,
+                    "fold5_corr": float(best_fold.iloc[4]["corr"]) if len(best_fold) > 4 else np.nan,
+                    "是否进入下一阶段": "是" if best_row["stability_score"] >= 0 else "否",
+                    "原因": "受限融合候选",
+                })
+                fusion_rows.append(best_row)
+            return pd.DataFrame(fusion_rows)
+        if suite_name == "stage0":
+            return self.run_rolling_validation_suite(
+                split_config=split_config,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                embargo=1,
+                specs=[
+                    {
+                        "experiment_id": "B0_ridge_legacy",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["legacy"],
+                        "notes": "stage0 legacy ridge baseline",
+                    },
+                    {
+                        "experiment_id": "B1_ridge_core",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 ridge core features",
+                    },
+                    {
+                        "experiment_id": "B2_tree_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree core features",
+                    },
+                    {
+                        "experiment_id": "B3_tree_residual_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree residual core features",
+                    },
+                    {
+                        "experiment_id": "B4_hgb_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb core features",
+                    },
+                    {
+                        "experiment_id": "B5_hgb_residual_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb residual core features",
+                    },
+                    {
+                        "experiment_id": "B6_common_residual",
+                        "type": "common_residual",
+                        "notes": "stage0 common residual branch",
+                    },
+                    {
+                        "experiment_id": "B7_soft_regime",
+                        "type": "soft_regime",
+                        "notes": "stage0 current soft regime ensemble",
+                    },
+                ],
+            )
+        if suite_name == "stage0_quick":
+            return self.run_rolling_validation_suite(
+                split_config=split_config,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=3,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                embargo=1,
+                specs=[
+                    {
+                        "experiment_id": "B0_ridge_legacy",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["legacy"],
+                        "notes": "stage0 legacy ridge baseline",
+                    },
+                    {
+                        "experiment_id": "B1_ridge_core",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 ridge core features",
+                    },
+                    {
+                        "experiment_id": "B2_tree_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree core features",
+                    },
+                    {
+                        "experiment_id": "B3_tree_residual_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree residual core features",
+                    },
+                    {
+                        "experiment_id": "B4_hgb_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb core features",
+                    },
+                    {
+                        "experiment_id": "B5_hgb_residual_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb residual core features",
+                    },
+                    {
+                        "experiment_id": "B6_common_residual",
+                        "type": "common_residual",
+                        "notes": "stage0 common residual branch",
+                    },
+                    {
+                        "experiment_id": "B7_soft_regime",
+                        "type": "soft_regime",
+                        "notes": "stage0 current soft regime ensemble",
+                    },
+                ],
+            )
         if suite_name == "stage1":
             experiments = [
                 {"name": "E0_legacy_ridge", "model": "ridge", "target_mode": "raw", "groups": ["legacy"]},
@@ -1919,6 +2912,77 @@ class ExperimentRunner(object):
                 max_train_days=max_train_days,
                 max_val_days=max_val_days,
             )
+        elif suite_name == "stage0_roll":
+            return self.run_rolling_validation_suite(
+                split_config=split_config,
+                train_window=8,
+                val_window=2,
+                step=10,
+                max_folds=5,
+                max_train_days=max_train_days,
+                max_val_days=max_val_days,
+                embargo=1,
+                specs=[
+                    {
+                        "experiment_id": "B0_ridge_legacy",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["legacy"],
+                        "notes": "stage0 legacy ridge baseline",
+                    },
+                    {
+                        "experiment_id": "B1_ridge_core",
+                        "type": "standard",
+                        "model": "ridge",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 ridge core features",
+                    },
+                    {
+                        "experiment_id": "B2_tree_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree core features",
+                    },
+                    {
+                        "experiment_id": "B3_tree_residual_core",
+                        "type": "standard",
+                        "model": "tree",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 tree residual core features",
+                    },
+                    {
+                        "experiment_id": "B4_hgb_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "raw",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb core features",
+                    },
+                    {
+                        "experiment_id": "B5_hgb_residual_core",
+                        "type": "standard",
+                        "model": "histgb",
+                        "target_mode": "interval_residual",
+                        "groups": ["base", "lag", "roll", "cross"],
+                        "notes": "stage0 histgb residual core features",
+                    },
+                    {
+                        "experiment_id": "B6_common_residual",
+                        "type": "common_residual",
+                        "notes": "stage0 common residual branch",
+                    },
+                    {
+                        "experiment_id": "B7_soft_regime",
+                        "type": "soft_regime",
+                        "notes": "stage0 current soft regime ensemble",
+                    },
+                ],
+            )
         else:
             raise ValueError(f"Unknown suite: {suite_name}")
 
@@ -2046,7 +3110,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default="ridge", choices=["ridge", "elasticnet", "tree", "gbdt", "histgb", "lgbm", "mlp"])
     parser.add_argument("--target-mode", type=str, default="raw", choices=["raw", "date_demean", "interval_demean", "interval_residual"])
     parser.add_argument("--feature-groups", nargs="*", default=None, help="Feature groups to keep, e.g. base lag roll cross")
-    parser.add_argument("--suite", type=str, default=None, choices=["stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
+    parser.add_argument("--suite", type=str, default=None, choices=["stage0", "stage0_quick", "stage0_roll", "formal_backbone", "ridge_enhance", "restricted_fusion", "train_window_sensitivity", "ofi_audit", "trade_impact_audit", "conditional_momentum_audit", "stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
     parser.add_argument("--output-csv", type=str, default=None)
     parser.add_argument("--train-start", type=int, default=20230601)
     parser.add_argument("--train-end", type=int, default=20231031)
