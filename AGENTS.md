@@ -1,146 +1,117 @@
-# AGENTS.md
+# AGENTS.md — 开发规范与协作约定
 
-This repository uses git for fine-grained experiment tracking. Follow these rules for all future work.
+## 一、文档职责分工
 
-## 1. Core Principle
+| 文档 | 职责 |
+|---|---|
+| `README.md` | 稳定事实：项目定位、目录结构、运行方式、关键文档入口 |
+| `AGENTS.md` | 规则、流程、原则、协作约束（本文件） |
+| `CLAUDE.md` | 动态：当前阶段任务看板、进度、决策 |
+| `docs/实验记录.md` | 所有实验结果的唯一历史记录 |
 
-- One commit should represent one clearly scoped experimental change.
-- Do not mix unrelated changes in the same commit.
-- Every method change must be independently comparable against its parent commit.
-- If a change cannot be explained in one sentence, split it into multiple commits.
+## 二、禁止事项
 
-## 2. Commit Granularity
+- 禁止只看单次 val_corr 就下结论，必须看扩展 rolling 结果
+- 禁止在特征/归一化中使用未来信息（rolling / EMA / zscore 只能用历史数据）
+- 禁止用验证集真实 y 的均值、rank、分位数做还原（泄漏）
+- 禁止在同一验证集上反复调参后汇报单次最高分
+- 禁止把 quick/2折 结果与正式 5 折 rolling 结果直接并列比较
+- 禁止删除文件，旧文件一律移到 `.archive/`
+- 禁止提交 `data/`、`results/`、`*.log`、`*.out`、`*.err`
 
-Prefer commits at this level:
+## 三、信号验收标准
 
-- Data flow or split logic change
-- One feature group change
-- One target transformation change
-- One model family change
-- One fusion or postprocess change
-- One evaluation or logging change
+每个新信号组通过 rolling 验证的最低标准：
 
-Avoid these in a single commit:
-
-- Feature engineering + model tuning + logging refactor
-- Multiple competing methods in one patch
-- Experimental code plus unrelated documentation cleanup
-
-## 3. Branch and Commit Workflow
-
-- Keep `main` or the default branch clean and reproducible.
-- Use short-lived branches only when a change is large enough to need isolation.
-- Merge back only after the branch has a working run and clear result summary.
-- Commit in the order: code change, run experiment, record result, then commit result summary if needed.
-
-## 4. Naming Rules
-
-Use commit messages that make comparison easy.
-
-Suggested format:
-
-```text
-feat: add regime feature gating
-fix: prevent target leakage in common component
-exp: compare tree vs ridge on interval residual
-docs: record V3.1 experiment results
-refactor: isolate feature builder for scale experiments
+```
+rolling_corr_mean  提升 ≥ 0.003（相对当前基线）
+stability_score    不下降
+rolling_corr_min   不明显变差（不出现新的强负 fold）
+MSE / R²           不明显恶化
 ```
 
-For experiment commits, include the method name or experiment id in the message.
+如果某一类特征只让一个 fold 变好，其他 fold 变差，则放弃。
 
-## 5. Experiment Tracking
+## 四、实验开发 SOP
 
-Each experiment commit should preserve the following information:
+1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
+2. 在 `experiments/` 下新建或复用对应阶段脚本（p1_ofi_validation.py 等）
+3. 用 P0 确立的标准 rolling 口径评测
+4. 把结果写入 `docs/实验记录.md`，标注 `experiment_id / date / feature_set / model / split / seed / metrics / notes`
+5. 提交（遵循第六节 commit 规范）
+6. 与基线比较，只改一个变量
 
-- `experiment_id`
-- `date`
-- `feature_set`
-- `target_type`
-- `model_type`
-- `postprocess_type`
-- `split_config`
-- `seed`
-- `train_corr`
-- `val_corr`
-- `train_mse`
-- `val_mse`
-- `train_r2`
-- `val_r2`
-- `daily_corr_mean`
-- `daily_corr_std`
-- `runtime_sec`
-- short `notes`
+## 五、模型优先级
 
-Record results in the experiment log markdown or CSV before or together with the commit.
+```
+第一优先：Ridge
+第二优先：ElasticNet / HuberRegressor
+第三优先：浅 ExtraTrees（max_depth≤5）/ 浅 HistGradientBoosting
+第四优先：受限融合（仅当 P1-P3 有独立有效信号后）
+禁止：Transformer / LSTM / 复杂 MLP / 自由 stacking（当前阶段）
+```
 
-## 6. Comparison Rule
+新信号必须先在 Ridge 验证有效，再考虑上浅树。
 
-When comparing methods:
+## 六、特征工程规范
 
-- Change only one major variable at a time.
-- Keep the same split, seed, and evaluation metric set.
-- If two methods differ in more than one place, they are not directly comparable.
-- Preserve the parent commit hash or experiment id in the log.
+- 特征按信号族组织，每族独立评估贡献
+- 特征命名前缀对应信号族：`ofi_`、`trade_impact_`、`momentum_`、`regime_`、`cross_`
+- 所有滑动计算（rolling / EMA / lag）只能用 `shift(1)` 及以前的数据
+- 归一化策略：rolling zscore / cross-section rank / stock-level z-score，禁止全样本归一化
 
-## 7. Preferred Version Control Pattern
+## 七、三层评测体系（方案 B）
 
-For a new idea, use this sequence:
+```
+第一层：扩展 rolling validation  → 内部选模型的主要依据
+第二层：11 月 holdout           → 复核
+第三层：12 月 final holdout     → 尽量少看，模拟老师隐藏集
+```
 
-1. Create a minimal implementation commit.
-2. Run the smallest valid experiment.
-3. Commit the result table or result note.
-4. If the idea is promising, extend it in a second commit.
-5. If the idea fails, keep the failure commit and record why it failed.
+## 八、Git 提交规范
 
-This preserves the history of both successful and unsuccessful methods.
+### 8.1 粒度原则
 
-## 8. Reproducibility Rule
+- 每次 commit 代表一个明确的变更：特征组、目标变换、模型、split 逻辑、评测逻辑
+- 不混提：特征工程 + 模型调参 + 文档清理禁止一次提交
 
-Before a commit is considered valid:
+### 8.2 提交格式
 
-- The code must run from `python meow.py`.
-- The split must be explicit.
-- The seed must be fixed.
-- The result must be reproducible from the recorded configuration.
-- Any optional dependency must have a fallback or a clear note that it is optional.
+```
+feat:   新功能或新特征
+fix:    修复 bug
+exp:    实验结果记录
+docs:   文档更新
+refact: 重构（不改行为）
+```
 
-## 9. Data and Artifact Rules
+示例：
+```
+feat: add OFI multi-level features (bid/ask/total)
+exp: P1 OFI rolling audit, O3 best rolling_corr_mean=0.051
+fix: prevent target leakage in interval_demean normalization
+```
 
-- Do not commit raw data, archives, large binary dumps, or generated artifacts unless explicitly required.
-- Keep only source code, configuration, and concise result summaries under version control.
-- If a plot, table, or CSV is important for comparison, keep the smallest reproducible version.
+### 8.3 不可提交的内容
 
-## 10. Documentation Rule
+- `data/`（原始数据）
+- `results/`（中间结果 CSV）
+- `*.log / *.out / *.err`
+- `__pycache__/`
 
-For each meaningful commit, update one of:
+### 8.4 每次实验 commit 必须记录
 
-- `实验记录.md`
-- `目前成果与计划实验思路汇报.md`
-- a dedicated experiment summary file
+`experiment_id / date / feature_set / target_type / model / split_config / seed / rolling_corr_mean / rolling_corr_std / stability_score / notes`
 
-The documentation should state:
+## 九、目录约定
 
-- what changed
-- why it changed
-- what improved or regressed
-- what will be compared next
-
-## 11. Recommended Future Workflow
-
-For this project, the default loop is:
-
-1. Read the current experiment goal.
-2. Change only one method.
-3. Run the smallest meaningful validation.
-4. Save metrics and notes.
-5. Commit immediately with a focused message.
-6. Compare with the parent commit.
-
-## 12. Non-Negotiable Rules
-
-- Do not batch several competing methods into one commit.
-- Do not overwrite previous experiment history just to make the repo look clean.
-- Do not skip logging because the result seems obvious.
-- Do not use a commit unless the change can be compared against its parent.
-
+```
+src/              核心模块（特征、模型、评估、数据加载）
+experiments/      实验入口脚本（按 P 阶段命名）
+experiments/legacy/  历史脚本（可运行，不主动修改）
+results/          实验结果 CSV（gitignored）
+data/             原始 .h5 数据（gitignored）
+docs/             文档
+docs/archived/    历史快照（只读）
+.archive/         废弃文件（gitignored）
+```
