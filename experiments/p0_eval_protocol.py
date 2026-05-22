@@ -1,0 +1,207 @@
+"""
+P0：建立统一评测基准
+
+目标：
+  1. 在新 Rolling Evaluation Protocol 下重新评测所有历史实验（R/B/O/T/C 系列）
+  2. 以 R02_ridge_legacy_plus_norm_core 为 baseline，输出跨 profile 的 leaderboard
+  3. 可选加入 11月 review holdout 和 12月 final holdout
+
+运行方式：
+  # 快速验证（每个 profile 只跑 2 个 fold，只跑 Ridge 系列）
+  cd MEOW--predict
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --quick
+
+  # 完整 Ridge baseline 建立
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge
+
+  # 全部历史实验重新评测（含 O/T/C 系列，耗时较长）
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite full
+
+  # 指定特定 profile + 含 review holdout
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge \\
+    --profiles short_8d_2d medium_20d_5d --include-review-holdout
+
+  # 完整协议含 final holdout（慎用，少跑 final）
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite full \\
+    --include-review-holdout --include-final-holdout
+
+输出目录结构：
+  results/eval_protocol/<run_id>/
+    config.json
+    fold_manifest.csv
+    fold_metrics.csv
+    profile_summary.csv
+    leaderboard.csv
+    review_holdout.csv    （如果 --include-review-holdout）
+    final_holdout.csv     （如果 --include-final-holdout）
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+PROJ_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJ_ROOT / "src"))
+
+from eval_protocol import (
+    EvaluationProtocolRunner,
+    ROLLING_PROFILES,
+    ALL_SPECS,
+    RIDGE_SPECS,
+    BASELINE_ID,
+)
+from experiment_runner import ExperimentRunner
+
+
+# ================================================================== #
+# 默认配置
+# ================================================================== #
+
+DATA_DIR = str(PROJ_ROOT / "data")
+OUTPUT_DIR = str(PROJ_ROOT / "results" / "eval_protocol")
+
+# 第一层 rolling 区间（内部选模型主依据）
+ROLLING_START = 20230601
+ROLLING_END = 20231031
+
+# 第二层：11月 review holdout
+REVIEW_TRAIN_START = 20230601
+REVIEW_TRAIN_END = 20231031
+REVIEW_HOLDOUT_START = 20231101
+REVIEW_HOLDOUT_END = 20231130
+
+# 第三层：12月 final holdout（尽量少跑）
+FINAL_TRAIN_START = 20230601
+FINAL_TRAIN_END = 20231130
+FINAL_HOLDOUT_START = 20231201
+FINAL_HOLDOUT_END = 20231229
+
+
+# ================================================================== #
+# CLI
+# ================================================================== #
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="P0 Rolling Evaluation Protocol")
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="ridge",
+        choices=["quick", "ridge", "full"],
+        help="quick=2折Ridge调试; ridge=完整Ridge系列建基线; full=全部历史实验",
+    )
+    parser.add_argument(
+        "--profiles",
+        nargs="*",
+        default=None,
+        help="指定 profile 名称列表，默认运行全部四个",
+    )
+    parser.add_argument(
+        "--max-folds",
+        type=int,
+        default=None,
+        help="限制每个 profile 的 fold 数（调试用，默认不限制）",
+    )
+    parser.add_argument(
+        "--include-review-holdout",
+        action="store_true",
+        help="同时运行 11月 review holdout",
+    )
+    parser.add_argument(
+        "--include-final-holdout",
+        action="store_true",
+        help="同时运行 12月 final holdout（谨慎使用）",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=OUTPUT_DIR,
+        help="输出目录（默认 results/eval_protocol）",
+    )
+    parser.add_argument(
+        "--h5dir",
+        type=str,
+        default=DATA_DIR,
+        help="数据目录",
+    )
+    return parser
+
+
+def main():
+    args = build_arg_parser().parse_args()
+
+    # 选择要运行的 specs
+    if args.suite == "quick":
+        specs = RIDGE_SPECS[:3]           # R00/R01/R02，快速验证
+        max_folds = args.max_folds or 2   # 默认只跑 2 折
+        selected_profiles = ROLLING_PROFILES[:1]  # 只跑 short profile
+        print("[P0] 快速调试模式：R00-R02，short_8d_2d profile，2 folds")
+    elif args.suite == "ridge":
+        specs = RIDGE_SPECS               # R00-R04 完整 Ridge 系列
+        max_folds = args.max_folds        # None = 全部 fold
+        selected_profiles = ROLLING_PROFILES
+        print("[P0] Ridge 基线建立：R00-R04，四个 profiles，全量 folds")
+    else:  # full
+        specs = ALL_SPECS
+        max_folds = args.max_folds
+        selected_profiles = ROLLING_PROFILES
+        print(f"[P0] 完整评测：{len(specs)} 个历史实验，四个 profiles")
+
+    # 按用户指定过滤 profile
+    if args.profiles:
+        profile_map = {p.profile_name: p for p in ROLLING_PROFILES}
+        selected_profiles = [profile_map[name] for name in args.profiles if name in profile_map]
+        if not selected_profiles:
+            print(f"[P0] 警告：指定的 profiles {args.profiles} 无效，使用全部 profiles")
+            selected_profiles = ROLLING_PROFILES
+
+    print(f"\n[P0] 数据目录: {args.h5dir}")
+    print(f"[P0] 输出目录: {args.output_dir}")
+    print(f"[P0] rolling 区间: {ROLLING_START} ~ {ROLLING_END}")
+    print(f"[P0] 实验数: {len(specs)}, profiles: {[p.profile_name for p in selected_profiles]}")
+    print(f"[P0] max_folds: {max_folds or '全量'}")
+
+    runner = ExperimentRunner(args.h5dir)
+    protocol = EvaluationProtocolRunner(runner)
+
+    result = protocol.run_full_protocol(
+        rolling_start=ROLLING_START,
+        rolling_end=ROLLING_END,
+        specs=specs,
+        profiles=selected_profiles,
+        max_folds=max_folds,
+        include_review_holdout=args.include_review_holdout,
+        review_train_start=REVIEW_TRAIN_START,
+        review_train_end=REVIEW_TRAIN_END,
+        review_holdout_start=REVIEW_HOLDOUT_START,
+        review_holdout_end=REVIEW_HOLDOUT_END,
+        include_final_holdout=args.include_final_holdout,
+        final_train_start=FINAL_TRAIN_START,
+        final_train_end=FINAL_TRAIN_END,
+        final_holdout_start=FINAL_HOLDOUT_START,
+        final_holdout_end=FINAL_HOLDOUT_END,
+        baseline_id=BASELINE_ID,
+        output_dir=args.output_dir,
+    )
+
+    # 打印关键结果
+    lb = result["leaderboard"]
+    if not lb.empty:
+        display_cols = [
+            "experiment_id", "protocol_corr_mean", "protocol_stability_score",
+            "protocol_corr_min", "protocol_positive_fold_rate",
+            "baseline_delta_corr", "decision",
+        ]
+        display_cols = [c for c in display_cols if c in lb.columns]
+        print("\n" + "=" * 80)
+        print("Leaderboard（按 protocol_stability_score 降序）")
+        print("=" * 80)
+        print(lb[display_cols].to_string(index=False))
+    else:
+        print("\n[P0] 警告：leaderboard 为空，请检查数据和配置")
+
+    print(f"\n[P0] 完成。run_id={result['run_id']}")
+
+
+if __name__ == "__main__":
+    main()

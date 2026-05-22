@@ -1577,7 +1577,8 @@ class ExperimentRunner(object):
             "val_metrics": val_metrics,
         }
 
-    def _build_rolling_folds(self, split_config, train_window=8, val_window=2, step=10, max_folds=5, embargo=1):
+    def _build_rolling_folds(self, split_config, train_window=8, val_window=2, step=10, max_folds=None, embargo=1):
+        # max_folds=None 表示使用所有可用 fold，传正整数时截断（调试用）
         train_dates, _, _ = self.split_dates(split_config)
         folds = self.make_rolling_folds(
             train_dates[0],
@@ -1587,7 +1588,9 @@ class ExperimentRunner(object):
             step=step,
             min_train_days=train_window,
             embargo=embargo,
-        )[:max_folds]
+        )
+        if max_folds is not None:
+            folds = folds[:max_folds]
         if not folds:
             raise ValueError("No rolling folds available")
         return folds
@@ -1668,7 +1671,7 @@ class ExperimentRunner(object):
         train_window=8,
         val_window=2,
         step=10,
-        max_folds=5,
+        max_folds=None,
         embargo=1,
         max_train_days=None,
         max_val_days=None,
@@ -1729,7 +1732,7 @@ class ExperimentRunner(object):
         train_window=8,
         val_window=2,
         step=10,
-        max_folds=5,
+        max_folds=None,
         embargo=1,
         max_val_days=None,
     ):

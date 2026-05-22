@@ -61,14 +61,22 @@ def build_arg_parser():
         "--mode",
         type=str,
         default="legacy",
-        choices=["legacy", "suite"],
-        help="legacy runs the original fit/eval flow; suite runs the experiment runner",
+        choices=["legacy", "suite", "eval_protocol"],
+        help="legacy=原始流程; suite=实验套件; eval_protocol=新评测协议",
     )
-    parser.add_argument("--suite", type=str, default=None, choices=["stage0", "stage0_quick", "stage0_roll", "formal_backbone", "ridge_enhance", "restricted_fusion", "train_window_sensitivity", "train_window_sensitivity_quick", "ofi_audit", "trade_impact_audit", "conditional_momentum_audit", "stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll"])
+    parser.add_argument("--suite", type=str, default=None, choices=[
+        "stage0", "stage0_quick", "stage0_roll", "formal_backbone", "ridge_enhance",
+        "restricted_fusion", "train_window_sensitivity", "train_window_sensitivity_quick",
+        "ofi_audit", "trade_impact_audit", "conditional_momentum_audit",
+        "stage1", "stage2", "ablation", "v2", "v31", "v31_quick", "v31_roll",
+        # 新评测协议 suite
+        "eval_protocol_quick", "eval_protocol_ridge", "eval_protocol_full",
+    ])
     parser.add_argument("--model", type=str, default="ridge", choices=["ridge", "elasticnet", "tree", "gbdt", "histgb", "lgbm", "mlp"])
     parser.add_argument("--target-mode", type=str, default="raw", choices=["raw", "date_demean", "interval_demean", "interval_residual"])
     parser.add_argument("--feature-groups", nargs="*", default=None)
     parser.add_argument("--output-csv", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None, help="eval_protocol 输出目录")
     parser.add_argument("--train-start", type=int, default=20230601)
     parser.add_argument("--train-end", type=int, default=20231031)
     parser.add_argument("--val-start", type=int, default=20231101)
@@ -77,6 +85,10 @@ def build_arg_parser():
     parser.add_argument("--test-end", type=int, default=20231229)
     parser.add_argument("--max-train-days", type=int, default=None)
     parser.add_argument("--max-val-days", type=int, default=None)
+    parser.add_argument("--max-folds", type=int, default=None, help="限制每个 profile 的 fold 数（调试用）")
+    parser.add_argument("--profiles", nargs="*", default=None, help="指定 rolling profile 名称")
+    parser.add_argument("--include-review-holdout", action="store_true", help="运行 11月 review holdout")
+    parser.add_argument("--include-final-holdout", action="store_true", help="运行 12月 final holdout（谨慎）")
     parser.add_argument("--fit-start", type=int, default=20230601)
     parser.add_argument("--fit-end", type=int, default=20231130)
     parser.add_argument("--eval-start", type=int, default=20231201)
@@ -84,8 +96,83 @@ def build_arg_parser():
     return parser
 
 
+def _run_eval_protocol(args):
+    """处理 eval_protocol 模式（新三层评测协议）"""
+    from eval_protocol import (
+        EvaluationProtocolRunner, ROLLING_PROFILES,
+        ALL_SPECS, RIDGE_SPECS, BASELINE_ID,
+    )
+
+    suite = (args.suite or "eval_protocol_ridge").replace("eval_protocol_", "")
+    if suite == "quick":
+        specs = RIDGE_SPECS[:3]
+        max_folds = args.max_folds or 2
+        selected_profiles = ROLLING_PROFILES[:1]
+    elif suite == "ridge":
+        specs = RIDGE_SPECS
+        max_folds = args.max_folds
+        selected_profiles = ROLLING_PROFILES
+    else:  # full
+        specs = ALL_SPECS
+        max_folds = args.max_folds
+        selected_profiles = ROLLING_PROFILES
+
+    if args.profiles:
+        profile_map = {p.profile_name: p for p in ROLLING_PROFILES}
+        override = [profile_map[n] for n in args.profiles if n in profile_map]
+        if override:
+            selected_profiles = override
+
+    output_dir = args.output_dir or str(Path(__file__).resolve().parents[1] / "results" / "eval_protocol")
+
+    runner = ExperimentRunner(args.h5dir)
+    protocol = EvaluationProtocolRunner(runner)
+
+    result = protocol.run_full_protocol(
+        rolling_start=args.train_start,
+        rolling_end=args.train_end,
+        specs=specs,
+        profiles=selected_profiles,
+        max_folds=max_folds,
+        include_review_holdout=args.include_review_holdout,
+        review_train_start=args.train_start,
+        review_train_end=args.train_end,
+        review_holdout_start=args.val_start,
+        review_holdout_end=args.val_end,
+        include_final_holdout=args.include_final_holdout,
+        final_train_start=args.train_start,
+        final_train_end=args.val_end,
+        final_holdout_start=args.test_start,
+        final_holdout_end=args.test_end,
+        baseline_id=BASELINE_ID,
+        output_dir=output_dir,
+    )
+
+    lb = result["leaderboard"]
+    if not lb.empty:
+        display_cols = [c for c in [
+            "experiment_id", "protocol_corr_mean", "protocol_stability_score",
+            "protocol_corr_min", "protocol_positive_fold_rate",
+            "baseline_delta_corr", "decision",
+        ] if c in lb.columns]
+        log.inf("\n" + "=" * 80)
+        log.inf("Leaderboard（按 protocol_stability_score 降序）")
+        log.inf("=" * 80)
+        log.inf("\n" + lb[display_cols].to_string(index=False))
+
+    if args.output_csv:
+        lb.to_csv(args.output_csv, index=False, encoding="utf-8-sig")
+        log.inf(f"Leaderboard saved to {args.output_csv}")
+
+
 def main():
     args = build_arg_parser().parse_args()
+
+    # 新评测协议模式
+    if args.mode == "eval_protocol" or (args.suite and args.suite.startswith("eval_protocol")):
+        _run_eval_protocol(args)
+        return
+
     if args.mode == "suite" or args.suite:
         split_config = SplitConfig(
             train_start=args.train_start,

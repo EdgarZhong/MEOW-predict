@@ -67,7 +67,7 @@ def main():
         train_window=80,   # 构建 rolling fold 时允许的最大 train window
         val_window=2,
         step=10,
-        max_folds=5,
+        max_folds=None,    # 使用全部可用 fold，不再截断为 5
         embargo=1,
     )
 
