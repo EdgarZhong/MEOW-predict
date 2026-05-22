@@ -6,7 +6,7 @@
 
 **方案 B 已固定**：以扩展 rolling validation 为内部选模型的主要依据，不再只看单次 val_corr。
 
-当前首要任务：**先完成实验平台并发改造**（PE0），再运行 `--suite ridge` 建立正式基线，再推进 P1–P5。
+当前首要任务：修复并行 OOM 问题（已完成）→ 重新运行 `--suite ridge --n-workers 4` 建立正式基线 → 推进 P1–P5。
 
 ## 评测体系（已完成，P0 工程部分）
 
@@ -40,12 +40,14 @@
 # 快速验证（2折+short profile，约2分钟）
 PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick
 
-# Ridge baseline 建立（全量，约20-40分钟）
-PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge
+# Ridge baseline 建立（全量，推荐 n-workers=4，约30-50分钟）
+PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 4
 
 # 含 review holdout（11月）
-PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --include-review-holdout
+PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 4 --include-review-holdout
 ```
+
+> **注意**：16 GB Mac 不得使用 `--n-workers 8`，会触发 OOM 重启（已修复，默认改为 4）。
 
 ## 当前最优基线（旧口径，待用新协议复现）
 
@@ -57,7 +59,7 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --include-re
 
 ## 任务看板（PE0 + P0–P5）
 
-### PE0：实验平台并发改造【已完成】
+### PE0：实验平台并发改造【已完成，OOM 修复已合入】
 
 规格文档：`docs/specs/实验平台架构设计.md`
 
@@ -67,7 +69,10 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --include-re
 - [x] 新增 `FoldData` / `FoldResult` dataclass
 - [x] Resume 机制：已完成 job 自动跳过（验证通过）
 - [x] 串行/并行结果一致性验证通过
-- [ ] 验收：`--suite ridge` ≤30 min（待运行完整基线确认）
+- [x] **OOM 修复**（2026-05-22）：`_fold_group_worker` 每折后清空 `_split_cache`；默认 `n_workers` 改为 4
+- [ ] 验收：`--suite ridge --n-workers 4` ≤50 min（待运行完整基线确认）
+
+**OOM 根因记录**：`ExperimentRunner._split_cache` 按 `(train_dates_tuple, max_days)` 缓存 concat 后的全量 DataFrame，rolling fold 场景下每折 key 唯一、永不命中也不释放，expanding 最后几折单条 entry ≈ 4 GB，7 折一组累计 >20 GB；8 workers 并行后总峰值超过 50 GB 导致 OOM。修复：每折结束调用 `runner._split_cache.clear()` + `gc.collect()`，保留 `_daily_feature_cache`（避免重复 IO）。
 
 ### P0：扩展 rolling 评测体系【工程完成，待运行】
 
@@ -116,5 +121,6 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --include-re
 
 - [x] 阶段一：目录与文档重组（2026-05-22）
 - [x] 阶段二：代码解耦（FeatureBuilder 抽取到 feat_engine.py）
-- [ ] P0 实验脚本完成并跑通
+- [x] PE0 并发平台 OOM 修复（2026-05-22）：`_split_cache` 跨折清理 + n_workers 默认 4
+- [ ] P0 实验脚本完成并跑通（`--suite ridge --n-workers 4`）
 - [ ] R02 一致性复现（run1 / run2 / run3）

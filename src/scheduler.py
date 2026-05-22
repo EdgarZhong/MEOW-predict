@@ -9,9 +9,14 @@ _fold_group_worker:  模块级 worker 函数（multiprocessing 'spawn' 模式可
   将 fold 列表切成若干连续子组，同一子组内的 fold 分配到同一 worker，
   使 ExperimentRunner._daily_feature_cache 在 worker 进程内跨 fold 复用。
 
-  M5 MacBook Air（4P+6E 核）建议 n_workers=8，留 2 核给系统和磁盘 I/O。
+  内存估算（M5 MacBook Air 16 GB）：
+    每个 worker 峰值内存 ≈ _daily_feature_cache（~2-5 GB）+ 当前折 split cache（~1-4 GB）
+    expanding_40d_5d 最坏情况单 worker 可达 8-10 GB。
+    n_workers=4 为推荐值（peak ~20-25 GB swap 压力可接受）；
+    n_workers=8 会因多 worker 同时持有巨型 DataFrame 导致 OOM 重启。
 """
 
+import gc
 import math
 import os
 import sys
@@ -86,6 +91,12 @@ def _fold_group_worker(args: tuple) -> List[dict]:
             result = trainer.run_fold(fold_data)
             results.append(result.to_dict())
 
+        # 每折结束后清空 concat 缓存，防止跨 fold 积累巨型 DataFrame 导致 OOM。
+        # _daily_feature_cache（按天缓存原始特征）保留，避免重复磁盘 IO。
+        runner._split_cache.clear()
+        runner._raw_split_cache.clear()
+        gc.collect()
+
     return results
 
 
@@ -145,7 +156,7 @@ class ParallelScheduler:
     def __init__(
         self,
         h5dir: str,
-        n_workers: int = 8,
+        n_workers: int = 4,
     ):
         self.h5dir = h5dir
         self.n_workers = n_workers

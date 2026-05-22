@@ -115,8 +115,8 @@ def build_arg_parser():
     parser.add_argument(
         "--n-workers",
         type=int,
-        default=8,
-        help="并发 worker 进程数（默认 8，设为 1 退回串行模式）",
+        default=4,
+        help="并发 worker 进程数（默认 4，设为 1 退回串行模式；16 GB Mac 不建议超过 4）",
     )
     parser.add_argument(
         "--resume",
