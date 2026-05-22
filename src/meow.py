@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from log import log
 from dl import MeowDataLoader
-from feat import MeowFeatureGenerator
+from feat_legacy import MeowFeatureGenerator
 from mdl import MeowModel
 from eval import MeowEvaluator
 from tradingcalendar import Calendar
@@ -45,8 +45,8 @@ class MeowEngine(object):
 
 def _default_h5dir():
     candidates = [
-        Path(__file__).resolve().parents[2] / "archive",
-        Path.cwd() / "archive",
+        Path(__file__).resolve().parents[1] / "data",
+        Path.cwd() / "data",
     ]
     for path in candidates:
         if path.exists():
