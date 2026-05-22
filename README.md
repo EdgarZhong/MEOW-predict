@@ -55,6 +55,7 @@ python experiments/legacy/run_516v3_restricted.py
 
 | 文档 | 说明 |
 |---|---|
+| `NOTE.md` | 用户实验笔记：策略讨论、概念、待决问题 |
 | `CLAUDE.md` | 当前阶段任务看板、进度、决策 |
 | `AGENTS.md` | 开发规范、实验 SOP、禁止事项 |
 | `docs/实验记录.md` | 所有实验结果的历史记录 |
