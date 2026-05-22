@@ -6,7 +6,7 @@
 
 **方案 B 已固定**：以扩展 rolling validation 为内部选模型的主要依据，不再只看单次 val_corr。
 
-当前首要任务：运行 `p0_eval_protocol.py --suite ridge` 建立正式基线，再依次推进 P1–P5。
+当前首要任务：**先完成实验平台并发改造**（PE0），再运行 `--suite ridge` 建立正式基线，再推进 P1–P5。
 
 ## 评测体系（已完成，P0 工程部分）
 
@@ -55,7 +55,19 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --include-re
 
 来源：`results/ridge_enhance_results.csv`（5折旧口径），**需用新协议重新复现后替换**
 
-## 任务看板（P0–P5）
+## 任务看板（PE0 + P0–P5）
+
+### PE0：实验平台并发改造【已完成】
+
+规格文档：`docs/specs/实验平台架构设计.md`
+
+- [x] 新建 `src/trainer.py`：`BaseTrainer` ABC + `TabularTrainer`
+- [x] 新建 `src/scheduler.py`：`ParallelScheduler` + `_fold_group_worker`
+- [x] 改造 `src/eval_protocol.py`：`run_full_protocol` 接入 `ParallelScheduler`
+- [x] 新增 `FoldData` / `FoldResult` dataclass
+- [x] Resume 机制：已完成 job 自动跳过（验证通过）
+- [x] 串行/并行结果一致性验证通过
+- [ ] 验收：`--suite ridge` ≤30 min（待运行完整基线确认）
 
 ### P0：扩展 rolling 评测体系【工程完成，待运行】
 

@@ -113,6 +113,23 @@ def build_arg_parser():
         help="同时运行 12月 final holdout（谨慎使用）",
     )
     parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=8,
+        help="并发 worker 进程数（默认 8，设为 1 退回串行模式）",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="断点续跑：跳过已完成的 job（需与上次相同的 --run-id）",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="固定 run_id（resume 时必须与上次一致）",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=OUTPUT_DIR,
@@ -160,6 +177,9 @@ def main():
     print(f"[P0] rolling 区间: {ROLLING_START} ~ {ROLLING_END}")
     print(f"[P0] 实验数: {len(specs)}, profiles: {[p.profile_name for p in selected_profiles]}")
     print(f"[P0] max_folds: {max_folds or '全量'}")
+    print(f"[P0] n_workers: {args.n_workers}{'（串行）' if args.n_workers == 1 else '（并行）'}")
+    if args.resume:
+        print(f"[P0] resume 模式：跳过已完成 job")
 
     runner = ExperimentRunner(args.h5dir)
     protocol = EvaluationProtocolRunner(runner)
@@ -181,7 +201,10 @@ def main():
         final_holdout_start=FINAL_HOLDOUT_START,
         final_holdout_end=FINAL_HOLDOUT_END,
         baseline_id=BASELINE_ID,
+        n_workers=args.n_workers,
+        resume=args.resume,
         output_dir=args.output_dir,
+        run_id=args.run_id,
     )
 
     # 打印关键结果

@@ -24,6 +24,11 @@ import pandas as pd
 
 from experiment_runner import ExperimentRunner, SplitConfig, RollingFold
 
+try:
+    from scheduler import ParallelScheduler
+except ImportError:
+    ParallelScheduler = None
+
 
 # ================================================================== #
 # Rolling Profile 配置
@@ -669,6 +674,8 @@ class EvaluationProtocolRunner:
         final_holdout_start: Optional[int] = None,
         final_holdout_end: Optional[int] = None,
         baseline_id: str = BASELINE_ID,
+        n_workers: int = 1,
+        resume: bool = False,
         output_dir: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -700,23 +707,73 @@ class EvaluationProtocolRunner:
         all_manifests: List[FoldManifestEntry] = []
         all_fold_metrics: List[pd.DataFrame] = []
         profile_summaries: Dict[str, pd.DataFrame] = {}
+        _parallel_wrote_fold_metrics = False  # 并行模式下 scheduler 已增量落盘，末尾跳过重写
 
-        for profile in profiles:
-            print(f"\n[Profile] {profile.profile_name} (mode={profile.mode})")
-            manifest, fold_df = self.run_profile(
-                profile, rolling_start, rolling_end, specs, max_folds=max_folds
+        if n_workers > 1 and ParallelScheduler is not None:
+            # ── 并行路径 ─────────────────────────────────────────────────────
+            # 1. 主进程统一构建所有 fold manifest
+            profiles_with_folds = []
+            for profile in profiles:
+                folds, manifest = self.build_folds_for_profile(
+                    profile, rolling_start, rolling_end, max_folds=max_folds
+                )
+                profiles_with_folds.append((profile, folds))
+                all_manifests.extend(manifest)
+
+            # 2. 提前创建输出目录，配置 scheduler 落盘路径（供 resume 使用）
+            _run_dir_parallel = os.path.join(output_dir, run_id) if output_dir else None
+            if _run_dir_parallel:
+                os.makedirs(_run_dir_parallel, exist_ok=True)
+            _fold_metrics_csv = (
+                os.path.join(_run_dir_parallel, "fold_metrics.csv")
+                if _run_dir_parallel else None
             )
-            all_manifests.extend(manifest)
-            if not fold_df.empty:
-                all_fold_metrics.append(fold_df)
-                n_folds = fold_df["fold_id"].nunique()
-                n_exp = fold_df["experiment_id"].nunique()
-                print(f"  → {n_folds} folds × {n_exp} experiments = {len(fold_df)} rows")
-            else:
-                print("  → 无有效 fold（日期范围不足）")
 
-            summary = self.summarize_profile(fold_df, profile.profile_name)
-            profile_summaries[profile.profile_name] = summary
+            # 3. 并发执行
+            h5dir = self.runner.loader.h5dir
+            scheduler = ParallelScheduler(h5dir, n_workers=n_workers)
+            if _fold_metrics_csv:
+                scheduler.set_output_path(_fold_metrics_csv)
+                _parallel_wrote_fold_metrics = True
+
+            merged_fold_df = scheduler.run(profiles_with_folds, specs, resume=resume)
+
+            # 4. 按 profile 拆分，分别做 summarize_profile
+            if not merged_fold_df.empty:
+                all_fold_metrics.append(merged_fold_df)
+            for profile in profiles:
+                pname = profile.profile_name
+                profile_df = (
+                    merged_fold_df[merged_fold_df["profile_name"] == pname].copy()
+                    if not merged_fold_df.empty else pd.DataFrame()
+                )
+                if not profile_df.empty:
+                    n_folds = profile_df["fold_id"].nunique()
+                    n_exp = profile_df["experiment_id"].nunique()
+                    print(f"  [Profile] {pname}: {n_folds} folds × {n_exp} experiments = {len(profile_df)} rows")
+                else:
+                    print(f"  [Profile] {pname}: 无有效结果")
+                summary = self.summarize_profile(profile_df, pname)
+                profile_summaries[pname] = summary
+
+        else:
+            # ── 串行路径（原有逻辑，完全不变）────────────────────────────────
+            for profile in profiles:
+                print(f"\n[Profile] {profile.profile_name} (mode={profile.mode})")
+                manifest, fold_df = self.run_profile(
+                    profile, rolling_start, rolling_end, specs, max_folds=max_folds
+                )
+                all_manifests.extend(manifest)
+                if not fold_df.empty:
+                    all_fold_metrics.append(fold_df)
+                    n_folds = fold_df["fold_id"].nunique()
+                    n_exp = fold_df["experiment_id"].nunique()
+                    print(f"  → {n_folds} folds × {n_exp} experiments = {len(fold_df)} rows")
+                else:
+                    print("  → 无有效 fold（日期范围不足）")
+
+                summary = self.summarize_profile(fold_df, profile.profile_name)
+                profile_summaries[profile.profile_name] = summary
 
         # 组装汇总表
         fold_manifest_df = (
@@ -798,7 +855,7 @@ class EvaluationProtocolRunner:
 
             if not fold_manifest_df.empty:
                 fold_manifest_df.to_csv(os.path.join(run_dir, "fold_manifest.csv"), index=False, encoding="utf-8-sig")
-            if not fold_metrics_df.empty:
+            if not fold_metrics_df.empty and not _parallel_wrote_fold_metrics:
                 fold_metrics_df.to_csv(os.path.join(run_dir, "fold_metrics.csv"), index=False, encoding="utf-8-sig")
             if not profile_summary_df.empty:
                 profile_summary_df.to_csv(os.path.join(run_dir, "profile_summary.csv"), index=False, encoding="utf-8-sig")

@@ -33,16 +33,35 @@
 
 ## 三、信号验收标准
 
-每个新信号组通过 rolling 验证的最低标准：
+### 3.1 数值门槛（protocol 层）
 
 ```
-rolling_corr_mean  提升 ≥ 0.003（相对当前基线）
-stability_score    不下降
-rolling_corr_min   不明显变差（不出现新的强负 fold）
-MSE / R²           不明显恶化
+protocol_corr_mean   提升 ≥ 0.003（相对当前基线）
+protocol_stability_score  不下降
+protocol_corr_min    不明显变差（不出现新的强负 fold）
+MSE / R²             不明显恶化
 ```
 
 如果某一类特征只让一个 fold 变好，其他 fold 变差，则放弃。
+
+### 3.2 Per-profile 一致性检查（protocol 分数通过后必做）
+
+`protocol_stability_score` 只是第一道筛选器，通过后必须手动检查 per-profile 明细：
+
+**必须核查的项目：**
+- 4 个 profile 中至少 3 个的 `delta_corr > 0`（跨窗口长度一致性）
+- 各 profile 的 `rolling_corr_min` 不出现强负值
+- short 与 expanding 的结论方向一致（两者相反则信号对训练历史长度敏感，标记为 review）
+
+**信号强度分级（基于 105 天数据的置信度）：**
+
+| 情况 | 结论 |
+|---|---|
+| delta_corr ≥ 0.005，short + medium + expanding 三个 profile 一致 | 有信心，可 promote |
+| delta_corr = 0.003～0.005，2 个以上 profile 一致 | 边界，进 Review Holdout 验证后决策 |
+| delta_corr ≤ 0.003，或仅 1 个 profile 支持 | 不接受 |
+
+**关于 long_40d_5d：** 只有 ~6 折，方差极大。它的负结论（信号在长窗口下明确有害）是有效信息；正结论不单独作为 promote 依据。
 
 ## 四、实验开发 SOP
 
