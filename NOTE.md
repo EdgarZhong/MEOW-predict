@@ -105,6 +105,43 @@ Long profile 只能切出 ~6 折，统计上很脆弱。
 
 ---
 
+## 特征管道设计宪法
+
+### 核心原则
+
+> 系统不是为了做漂亮的 feature store，而是为了支撑冲高分实验的快速迭代、自由试错、计算复用和特征生命周期管理。
+
+这条原则是在 2026-05-23 的重构设计讨论中确立的。当时 GPT 审计提出了包含 7 个子系统（FeatureComposer、Diagnostics、Ledger 等）的方案，讨论后砍掉了所有过度设计，只保留了三个核心组件：FeatureRegistry（特征定义 + 依赖 DAG）、FeatureStore（磁盘缓存管理）、FeatureLoader（无状态读取）。
+
+### 一票否决规则
+
+以下任一条成立则方案有问题（已写入 AGENTS.md 第二节）：
+
+- 为了试一个新特征，需要手动改多个无关模块
+- 改一个特征组导致全量 144 天所有组无脑重算
+- 缓存失效规则不清楚，结果不知来自新代码还是旧缓存
+- 最终 meow.py 离开本地 cache 就跑不起来
+
+### 背景：为什么走到这一步
+
+起因是 `--suite ridge --n-workers 4` 跑 OOM。排查后发现 ExperimentRunner 里 4 个内存 cache 无上限积累，单 worker 在 long/expanding profile 下峰值 18-20 GB，4 worker 总峰值 >50 GB，16 GB Mac 必然 OOM。
+
+深挖后发现 OOM 只是表象，更根本的问题是：
+1. `feat_engine.py` 的 `build()` 是 monolithic 线性链，但实际依赖是 DAG（ofi 完全不依赖 base）
+2. 改一个特征组要重算全部 9 组 × 144 天 ≈ 17 分钟
+3. `select_groups()` 和 builder 两处信息不同步
+4. ExperimentRunner 900 行 god object，缓存/加载/训练/评估全揉一起
+
+所以从"修 OOM"扩展到了"重构特征管道"，趁项目在重启阶段、技术债还少，把基础设施做对。
+
+### 明确不做的事
+
+Hamilton、YAML recipe 系统、表达式 DSL、SQLite manifest、完整生命周期管理平台、column-level 状态管理、DuckDB/PyArrow dataset 优化、跨日 context 抽象、复杂 fingerprint、FeatureComposer。
+
+如果将来 stage 数增长到 30+ 或需要跨日特征，可以重新评估 Hamilton 迁移。
+
+---
+
 ## 待讨论 / 未决问题
 
 - [ ] 老师的测试集是否一定是时间外推？（目前假设是，但未确认）
@@ -118,3 +155,4 @@ Long profile 只能切出 ~6 折，统计上很脆弱。
 |---|---|
 | 2026-05-22 | 建立文件，整理评测体系讨论 |
 | 2026-05-22 | 补充：综合分数与 profile 明细的关系、105天局限的实操原则、跨 profile 一致性标准 |
+| 2026-05-23 | 新增：特征管道设计宪法（核心原则、一票否决、背景、不做的事） |

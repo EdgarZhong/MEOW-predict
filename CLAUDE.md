@@ -1,12 +1,12 @@
 # CLAUDE.md — 当前阶段进度与任务看板
 
-更新日期：2026-05-22
+更新日期：2026-05-23
 
 ## 当前阶段目标
 
 **方案 B 已固定**：以扩展 rolling validation 为内部选模型的主要依据，不再只看单次 val_corr。
 
-当前首要任务：修复并行 OOM 问题（已完成）→ 重新运行 `--suite ridge --n-workers 4` 建立正式基线 → 推进 P1–P5。
+当前首要任务：PE1 特征管道重构 → 重新运行 `--suite ridge --n-workers 4` 建立正式基线 → 推进 P1–P5。
 
 ## 评测体系（已完成，P0 工程部分）
 
@@ -74,7 +74,36 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 
 **OOM 根因记录**：`ExperimentRunner._split_cache` 按 `(train_dates_tuple, max_days)` 缓存 concat 后的全量 DataFrame，rolling fold 场景下每折 key 唯一、永不命中也不释放，expanding 最后几折单条 entry ≈ 4 GB，7 折一组累计 >20 GB；8 workers 并行后总峰值超过 50 GB 导致 OOM。修复：每折结束调用 `runner._split_cache.clear()` + `gc.collect()`，保留 `_daily_feature_cache`（避免重复 IO）。
 
-### P0：扩展 rolling 评测体系【工程完成，待运行】
+### PE1：特征管道重构【设计完成，待实施】
+
+规格文档：`docs/specs/特征管道重构规格.md`
+交接文档：`docs/交接文档_特征管道重构_20260523.md`
+
+**目标**：解决 OOM 根因 + 支撑 P1–P5 快速特征迭代
+
+- [ ] 新建 `src/feature_registry.py`：FeatureRegistry 类 + 9 个 stage builder + status 字段
+- [ ] 新建 `src/feature_store.py`：FeatureStore 类 + 脏检测（code_hash + FEATURE_COMMON_VERSION）+ CLI
+- [ ] 新建 `src/feature_loader.py`：FeatureLoader 类 + key 对齐校验 + resolved_columns 记录
+- [ ] 修改 `src/experiment_runner.py`：删 4 个 cache dict + load 系列方法，保留模型训练评估
+- [ ] 修改 `src/scheduler.py`：worker 改用 FeatureLoader
+- [ ] 修改 `src/trainer.py`：TabularTrainer 注入 FeatureLoader
+- [ ] 修改 `src/eval_protocol.py`：运行时保存 manifest_snapshot + resolved_columns.json
+- [ ] 迁移 `src/feat_engine.py`：builder 逻辑迁入 registry，旧文件归档到 .archive/
+- [ ] 正确性验证：新旧管道同 spec 同日期的特征输出 allclose
+- [ ] OOM 验证：`--suite ridge --n-workers 4` 全部 4 profile 完成无异常
+- [ ] 全量特征首次构建：`python -m feature_store build --all` ≤ 20 min
+
+**设计决策记录（2026-05-23 拍板）**：
+- target/meta 来源：FeatureLoader 从 raw h5 读取
+- 动态列名：build 后扫描实际输出列写入 manifest
+- TabularTrainer：保留，注入 FeatureLoader
+- 设计宪法：AGENTS.md 精简版（第二节）+ NOTE.md 完整背景
+- stage status：装饰器声明 promoted/candidate/archived
+- 公共函数版本：FEATURE_COMMON_VERSION 手动递增
+- 实验可追溯：resolved_columns.json 快照
+- loader 安全：多 stage 拼接时 key 对齐校验
+
+### P0：扩展 rolling 评测体系【工程完成，待 PE1 后运行】
 
 - [x] `src/eval_protocol.py` 三层评测协议实现
 - [x] 四个 rolling profiles（short/medium/long/expanding）
@@ -122,5 +151,7 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 - [x] 阶段一：目录与文档重组（2026-05-22）
 - [x] 阶段二：代码解耦（FeatureBuilder 抽取到 feat_engine.py）
 - [x] PE0 并发平台 OOM 修复（2026-05-22）：`_split_cache` 跨折清理 + n_workers 默认 4
-- [ ] P0 实验脚本完成并跑通（`--suite ridge --n-workers 4`）
+- [x] PE1 设计完成（2026-05-23）：规格文档 + 交接文档 + 4 个设计决策拍板 + GPT 审计反馈整合
+- [ ] **PE1 实施**：特征管道重构（FeatureRegistry + FeatureStore + FeatureLoader）
+- [ ] P0 实验脚本跑通（`--suite ridge --n-workers 4`，依赖 PE1）
 - [ ] R02 一致性复现（run1 / run2 / run3）

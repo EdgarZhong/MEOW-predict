@@ -20,7 +20,20 @@
 - **格式**：按主题分节，每节末尾可附"待讨论/未决问题"列表；底部维护版本记录表
 - **agent 行为**：每次讨论出值得记录的结论后，主动追问"要落实到 NOTE.md 吗"，或直接写入后告知用户
 
-## 二、禁止事项
+## 二、设计宪法
+
+> 系统不是为了做漂亮的 feature store，而是为了支撑冲高分实验的快速迭代、自由试错、计算复用和特征生命周期管理。
+
+一票否决规则——以下任一条成立则方案有问题：
+
+- 为了试一个新特征，需要手动改多个无关模块
+- 改一个特征组导致全量 144 天所有组无脑重算
+- 缓存失效规则不清楚，结果不知来自新代码还是旧缓存
+- 最终 meow.py 离开本地 cache 就跑不起来
+
+不做的事：Hamilton、YAML recipe、表达式 DSL、SQLite manifest、复杂生命周期平台、column-level 状态管理。
+
+## 三、禁止事项
 
 - 禁止只看单次 val_corr 就下结论，必须看扩展 rolling 结果
 - 禁止在特征/归一化中使用未来信息（rolling / EMA / zscore 只能用历史数据）
@@ -31,9 +44,9 @@
 - 禁止删除文件，旧文件一律移到 `.archive/`
 - 禁止提交 `data/`、`results/`、`*.log`、`*.out`、`*.err`
 
-## 三、信号验收标准
+## 四、信号验收标准
 
-### 3.1 数值门槛（protocol 层）
+### 4.1 数值门槛（protocol 层）
 
 ```
 protocol_corr_mean   提升 ≥ 0.003（相对当前基线）
@@ -44,7 +57,7 @@ MSE / R²             不明显恶化
 
 如果某一类特征只让一个 fold 变好，其他 fold 变差，则放弃。
 
-### 3.2 Per-profile 一致性检查（protocol 分数通过后必做）
+### 4.2 Per-profile 一致性检查（protocol 分数通过后必做）
 
 `protocol_stability_score` 只是第一道筛选器，通过后必须手动检查 per-profile 明细：
 
@@ -63,7 +76,7 @@ MSE / R²             不明显恶化
 
 **关于 long_40d_5d：** 只有 ~6 折，方差极大。它的负结论（信号在长窗口下明确有害）是有效信息；正结论不单独作为 promote 依据。
 
-## 四、实验开发 SOP
+## 五、实验开发 SOP
 
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
 2. 在 `experiments/` 下新建或复用对应阶段脚本（p1_ofi_validation.py 等）
@@ -72,7 +85,7 @@ MSE / R²             不明显恶化
 5. 提交（遵循第六节 commit 规范）
 6. 与基线比较，只改一个变量
 
-## 五、模型优先级
+## 六、模型优先级
 
 ```
 第一优先：Ridge
@@ -84,16 +97,76 @@ MSE / R²             不明显恶化
 
 新信号必须先在 Ridge 验证有效，再考虑上浅树。
 
-## 六、特征工程规范
+## 七、特征工程规范
 
 - 特征按信号族组织，每族独立评估贡献
 - 特征命名前缀对应信号族：`ofi_`、`trade_impact_`、`momentum_`、`regime_`、`cross_`
 - 所有滑动计算（rolling / EMA / lag）只能用 `shift(1)` 及以前的数据
 - 归一化策略：rolling zscore / cross-section rank / stock-level z-score，禁止全样本归一化
 
-## 七、三层评测体系（方案 B）
+### 7.1 新增实验 spec 规程
 
-### 7.1 三层的目的与限制
+新增实验组合 = 在 `src/eval_protocol.py` 的 `ALL_SPECS` 列表中添加一条 dict。必须包含：
+
+```python
+{
+    "experiment_id": "O1_R02_plus_ofi_raw",    # 唯一 ID，前缀表示系列
+    "type": "standard",                         # standard / common_residual / soft_regime
+    "model": "ridge",                           # 模型名
+    "target_mode": "raw",                       # 目标变换
+    "groups": ["legacy", "norm_core", "ofi_raw"], # 使用的特征组
+    "notes": "R02 plus raw OFI",                # 一句话说明
+}
+```
+
+命名规范：`{系列}{编号}_{模型}_{特征描述}`。系列前缀：R=Ridge 基线，O=OFI，T=Trade Impact，C=Conditional Momentum。
+
+### 7.2 交互项探索规程（手动操作）
+
+探索阶段的交互项不需要注册为正式 stage。在实验脚本中直接用 pandas 计算：
+
+```python
+# experiments/ 下的实验脚本中
+xtrain["ofi_x_spread"] = xtrain["ofi_total"] * xtrain["spread"]
+```
+
+验证流程：
+1. 在实验脚本中手动添加交互列，跑 Dev Rolling
+2. 如果 `delta_corr ≥ 0.003` 且跨 profile 一致 → 提升为正式 stage
+3. 提升方法：在 `src/feature_registry.py` 中写 builder 函数 + `@registry.stage` 注册
+4. 重建特征缓存：`python -m feature_store build`
+
+禁止在探索阶段就把临时交互项写入 registry。避免 stage 膨胀。
+
+**晋级红线**：一个临时交互项如果被第二个实验复用，或准备进入正式 rolling 对比，就必须移入正式 registry。一次性试错可以手写，反复使用必须注册。
+
+### 7.3 特征生命周期管理（手动维护）
+
+每个特征组有四种状态，在 registry 的 `@registry.stage(status=...)` 中声明：
+
+| 状态 | 含义 | 操作 |
+|---|---|---|
+| scratch | 探索中，交互项写在实验脚本里 | 不进 registry |
+| candidate | 初步有信号，已注册为 stage | 进 registry，跑完整 rolling |
+| promoted | 通过验收标准，进入主候选集 | 保留，参与后续融合评估 |
+| archived | 失败或被替代 | 从 registry 移除，builder 代码移入 `.archive/` |
+
+当前所有 9 个 stage（base / lag / roll / patch / ofi / trade_impact / cross / conditional_momentum / regime）状态均为 **promoted**。
+
+特征组状态变更时，同步更新 `docs/实验记录.md` 中的对应条目，记录变更原因和关联实验 ID。
+
+### 7.4 特征缓存一票否决规则
+
+以下任一条成立，说明特征管道设计有问题，必须修正：
+
+- 为了试一个新特征，需要手动改多个无关模块
+- 改一个特征组导致全量 144 天所有组无脑重算
+- 缓存失效规则不清楚，结果不知来自新代码还是旧缓存
+- 最终 `meow.py` 离开本地 cache 就跑不起来
+
+## 八、三层评测体系（方案 B）
+
+### 8.1 三层的目的与限制
 
 | 层级 | 数据区间 | 用途 | 允许频率 | 结果可否用于调参 |
 |---|---|---|---|---|
@@ -101,7 +174,7 @@ MSE / R²             不明显恶化
 | 第二层：Review Holdout | 训练6~10月，验证11月 | 候选模型缩窄后复核 | 谨慎，同一候选不超过3次 | **否** |
 | 第三层：Final Holdout | 训练6~11月，验证12月 | 最终提交前的一次性确认 | **只跑一次** | **严禁** |
 
-### 7.2 为什么 Final Holdout 是"一次性"的
+### 8.2 为什么 Final Holdout 是"一次性"的
 
 老师的隐藏测试集是某段你没见过的未来数据。12月是我们手里最靠近那段数据的时间区间，所以它是最好的代理。
 
@@ -111,7 +184,7 @@ MSE / R²             不明显恶化
 
 > 类比：期末考试的卷子提前泄题，你做了一遍，再去"复习"——这次考试的成绩不能代表你的真实水平。
 
-### 7.3 正确的四步开发流程
+### 8.3 正确的四步开发流程
 
 ```
 步骤 1：Dev Rolling（反复跑）
@@ -131,7 +204,7 @@ MSE / R²             不明显恶化
   → 结果记录在 docs/实验记录.md，仅供复盘
 ```
 
-### 7.4 什么行为会污染 Holdout
+### 8.4 什么行为会污染 Holdout
 
 以下行为会让对应 holdout 层失去可信度，应当视为该层作废：
 
@@ -141,14 +214,14 @@ MSE / R²             不明显恶化
 
 如果 Review Holdout 已被污染，应当**直接跳过，只依赖 Dev Rolling 结果**做决策，不要试图用 final holdout 来补救。
 
-## 八、Git 提交规范
+## 九、Git 提交规范
 
-### 8.1 粒度原则
+### 9.1 粒度原则
 
 - 每次 commit 代表一个明确的变更：特征组、目标变换、模型、split 逻辑、评测逻辑
 - 不混提：特征工程 + 模型调参 + 文档清理禁止一次提交
 
-### 8.2 提交格式
+### 9.2 提交格式
 
 ```
 feat:   新功能或新特征
@@ -165,18 +238,18 @@ exp: P1 OFI rolling audit, O3 best rolling_corr_mean=0.051
 fix: prevent target leakage in interval_demean normalization
 ```
 
-### 8.3 不可提交的内容
+### 9.3 不可提交的内容
 
 - `data/`（原始数据）
 - `results/`（中间结果 CSV）
 - `*.log / *.out / *.err`
 - `__pycache__/`
 
-### 8.4 每次实验 commit 必须记录
+### 9.4 每次实验 commit 必须记录
 
 `experiment_id / date / feature_set / target_type / model / split_config / seed / rolling_corr_mean / rolling_corr_std / stability_score / notes`
 
-## 九、目录约定
+## 十、目录约定
 
 ```
 src/              核心模块（特征、模型、评估、数据加载）
