@@ -74,14 +74,14 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 
 **OOM 根因记录**：`ExperimentRunner._split_cache` 按 `(train_dates_tuple, max_days)` 缓存 concat 后的全量 DataFrame，rolling fold 场景下每折 key 唯一、永不命中也不释放，expanding 最后几折单条 entry ≈ 4 GB，7 折一组累计 >20 GB；8 workers 并行后总峰值超过 50 GB 导致 OOM。修复：每折结束调用 `runner._split_cache.clear()` + `gc.collect()`，保留 `_daily_feature_cache`（避免重复 IO）。
 
-### PE1：特征管道重构【设计完成，待实施】
+### PE1：特征管道重构【实施中，M1 已完成】
 
 规格文档：`docs/specs/特征管道重构规格.md`
 交接文档：`docs/交接文档_特征管道重构_20260523.md`
 
 **目标**：解决 OOM 根因 + 支撑 P1–P5 快速特征迭代
 
-- [ ] 新建 `src/feature_registry.py`：FeatureRegistry 类 + 9 个 stage builder + status 字段
+- [x] 新建 `src/feature_registry.py`：FeatureRegistry 类 + 9 个 stage builder + status 字段
 - [ ] 新建 `src/feature_store.py`：FeatureStore 类 + 脏检测（code_hash + FEATURE_COMMON_VERSION）+ CLI
 - [ ] 新建 `src/feature_loader.py`：FeatureLoader 类 + key 对齐校验 + resolved_columns 记录
 - [ ] 修改 `src/experiment_runner.py`：删 4 个 cache dict + load 系列方法，保留模型训练评估
@@ -92,6 +92,11 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 - [ ] 正确性验证：新旧管道同 spec 同日期的特征输出 allclose
 - [ ] OOM 验证：`--suite ridge --n-workers 4` 全部 4 profile 完成无异常
 - [ ] 全量特征首次构建：`python -m feature_store build --all` ≤ 20 min
+
+**最新进展（2026-05-23 / M1）**：
+- 已完成 `FeatureRegistry` 首版实现：9 个 stage builder、status、DAG、`resolve_groups()`、`code_hash()` 全部落地
+- 已新增 `test_feature_registry.py`：验证拓扑序、downstream 闭包、group 列映射与旧 `FeatureBuilder.select_groups()` 兼容
+- 当前验证结果：M1 测试通过，9 个 stage 合并后的总特征列集合与旧管道一致（462 列）
 
 **设计决策记录（2026-05-23 拍板）**：
 - target/meta 来源：FeatureLoader 从 raw h5 读取
