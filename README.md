@@ -26,6 +26,7 @@ MEOW--predict/
 │   └── log.py               # 日志
 ├── experiments/             # 实验入口脚本
 │   ├── p0_eval_protocol.py  # P0：Rolling 评测基准（主入口）
+│   ├── run_with_memory_guard.py # 通用内存看门狗包装器（可复用）
 │   ├── p1_ofi_validation.py # P1：OFI 特征验证
 │   ├── p2_impact_validation.py
 │   ├── p3_momentum_validation.py
@@ -52,8 +53,20 @@ cd MEOW--predict
 # 快速验证（2折 × short profile，约 2 分钟）
 PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick
 
-# Ridge 基线建立（全量，约 20-30 分钟，8 并发）
-PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 8
+# Ridge 基线建立（全量，推荐 4 并发）
+PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 4
+
+# 通用内存看门狗：为任意长任务加 RSS 保护（示例：12 GB 阈值续跑 P0）
+python experiments/run_with_memory_guard.py \
+  --rss-limit-gb 12 \
+  --rss-limit-duration-sec 30 \
+  --rss-hard-limit-gb 13 \
+  --env PYTHONPATH=src \
+  -- python experiments/p0_eval_protocol.py \
+    --suite ridge \
+    --n-workers 4 \
+    --resume \
+    --run-id 20260523_223257
 
 # 旧实验脚本（仍可运行）
 PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
@@ -70,3 +83,4 @@ PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
 | `docs/specs/MEOW金融时序预测V3.3_论文启发稳健冲10_AI执行版.md` | V3.3 执行方案 |
 | `docs/specs/实验平台架构设计.md` | 并发实验平台架构（trainer/scheduler/resume） |
+| `experiments/run_with_memory_guard.py` | 通用内存看门狗包装器，超过 RSS 阈值自动终止任务 |
