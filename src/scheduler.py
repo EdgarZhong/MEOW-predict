@@ -4,19 +4,14 @@
 ParallelScheduler:   将 (profile × fold) 任务展平，ProcessPoolExecutor 并发执行
 _fold_group_worker:  模块级 worker 函数（multiprocessing 'spawn' 模式可 pickle）
 
-并发策略：
-  同一 profile 内相邻 fold 的 train_dates 高度重叠。
-  将 fold 列表切成若干连续子组，同一子组内的 fold 分配到同一 worker，
-  使 ExperimentRunner._daily_feature_cache 在 worker 进程内跨 fold 复用。
-
-  内存估算（M5 MacBook Air 16 GB）：
-    每个 worker 峰值内存 ≈ _daily_feature_cache（~2-5 GB）+ 当前折 split cache（~1-4 GB）
-    expanding_40d_5d 最坏情况单 worker 可达 8-10 GB。
-    n_workers=4 为推荐值（peak ~20-25 GB swap 压力可接受）；
-    n_workers=8 会因多 worker 同时持有巨型 DataFrame 导致 OOM 重启。
+M4 调整后的并发策略：
+  - worker 不再依赖 ExperimentRunner 的 `_daily_feature_cache/_split_cache`
+  - 每个任务显式创建 `FeatureLoader`，直接从磁盘 stage artifact 读取数据
+  - fold 分组仍然保留，目的是减少任务调度开销，而不是复用旧内存缓存
+  - long / expanding 视为重任务批次，进入该阶段后总并发硬限制为 2，
+    避免 long_g0 + expanding_g0 + expanding_g1 这类三重任务同时在飞
 """
 
-import gc
 import math
 import os
 import sys
@@ -28,6 +23,7 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+from feature_store import DEFAULT_FEATURE_DIR
 
 # ================================================================== #
 # 元数据结构
@@ -57,10 +53,10 @@ def _fold_group_worker(args: tuple) -> List[dict]:
     """
     进程池 worker。
 
-    每个 worker 在进程内创建独立 ExperimentRunner（独立 cache），
-    按顺序处理组内各 fold，充分复用相邻 fold 的 _daily_feature_cache。
+    每个 worker 在进程内创建独立 ExperimentRunner + FeatureLoader，
+    按顺序处理组内各 fold。数据加载直接走 FeatureLoader，不再清理旧 cache。
 
-    args: (h5dir, fold_group, specs, completed_keys)
+    args: (h5dir, feature_dir, fold_group, specs, completed_keys)
     返回: list[FoldResult.to_dict()]
     """
     # macOS 'spawn' 模式：确保 src/ 在 sys.path 中
@@ -69,11 +65,13 @@ def _fold_group_worker(args: tuple) -> List[dict]:
         sys.path.insert(0, _this_dir)
 
     from experiment_runner import ExperimentRunner
+    from feature_loader import FeatureLoader
     from trainer import FoldData, TabularTrainer
 
-    h5dir, fold_group, specs, completed_keys = args
+    h5dir, feature_dir, fold_group, specs, completed_keys = args
 
-    runner = ExperimentRunner(h5dir)
+    runner = ExperimentRunner(h5dir, feature_dir=feature_dir)
+    loader = FeatureLoader(h5dir=h5dir, feature_dir=feature_dir)
     results: List[dict] = []
 
     for meta in fold_group.fold_metas:
@@ -87,15 +85,9 @@ def _fold_group_worker(args: tuple) -> List[dict]:
             key = (meta.profile_name, meta.fold_id, spec["experiment_id"])
             if key in completed_keys:
                 continue
-            trainer = TabularTrainer(spec, runner)
+            trainer = TabularTrainer(spec, runner, loader)
             result = trainer.run_fold(fold_data)
             results.append(result.to_dict())
-
-        # 每折结束后清空 concat 缓存，防止跨 fold 积累巨型 DataFrame 导致 OOM。
-        # _daily_feature_cache（按天缓存原始特征）保留，避免重复磁盘 IO。
-        runner._split_cache.clear()
-        runner._raw_split_cache.clear()
-        gc.collect()
 
     return results
 
@@ -139,6 +131,22 @@ def _build_fold_groups(
     return groups
 
 
+def _is_heavy_group(group: FoldGroup) -> bool:
+    """
+    判断 group 是否属于重任务 profile。
+
+    当前只按 profile_name 做最小规则判断：
+    - long_40d_5d
+    - expanding_40d_5d
+
+    不引入更复杂的预算模型，先用稳定的硬限制挡住 OOM。
+    """
+    if not group.fold_metas:
+        return False
+    profile_name = group.fold_metas[0].profile_name
+    return profile_name.startswith("long_") or profile_name.startswith("expanding_")
+
+
 # ================================================================== #
 # ParallelScheduler
 # ================================================================== #
@@ -156,10 +164,14 @@ class ParallelScheduler:
     def __init__(
         self,
         h5dir: str,
+        feature_dir: str = DEFAULT_FEATURE_DIR,
         n_workers: int = 4,
+        heavy_max_workers: int = 2,
     ):
         self.h5dir = h5dir
+        self.feature_dir = feature_dir
         self.n_workers = n_workers
+        self.heavy_max_workers = heavy_max_workers
         self._fold_metrics_path: Optional[str] = None
 
     def set_output_path(self, fold_metrics_path: str):
@@ -217,6 +229,63 @@ class ParallelScheduler:
     # 主入口
     # ---------------------------------------------------------------- #
 
+    def _run_group_batch(
+        self,
+        groups: List[FoldGroup],
+        specs: List[dict],
+        completed_keys: FrozenSet[Tuple],
+        max_workers: int,
+        t0: float,
+        completed_groups: int,
+        total_groups: int,
+        new_rows: List[dict],
+    ) -> int:
+        """
+        执行一批 group，并返回累计完成的 group 数。
+
+        这里故意按批次跑：
+        - light 批次：保持原 n_workers
+        - heavy 批次：硬限制到 heavy_max_workers
+
+        这样可以在不改训练链路的前提下，直接阻止重任务阶段出现 >2 个并发。
+        """
+        if not groups:
+            return completed_groups
+
+        # 至少保留 1 个 worker，避免外部误传 0 导致进程池报错。
+        actual_workers = max(1, min(max_workers, self.n_workers))
+        worker_args = [
+            (self.h5dir, self.feature_dir, group, specs, completed_keys)
+            for group in groups
+        ]
+
+        with ProcessPoolExecutor(max_workers=actual_workers) as pool:
+            futures = {
+                pool.submit(_fold_group_worker, args): args[2].group_id
+                for args in worker_args
+            }
+            for future in as_completed(futures):
+                group_id = futures[future]
+                try:
+                    rows = future.result()
+                    self._append_results(rows)
+                    new_rows.extend(rows)
+                    completed_groups += 1
+                    elapsed = time.time() - t0
+                    ok_cnt = sum(1 for r in rows if r.get("status") == "ok")
+                    err_cnt = len(rows) - ok_cnt
+                    status_str = f"{ok_cnt} ok" + (f", {err_cnt} err" if err_cnt else "")
+                    print(
+                        f"  [✓] {group_id}  {status_str}"
+                        f"  {completed_groups}/{total_groups} groups"
+                        f"  {elapsed:.0f}s elapsed"
+                    )
+                except Exception as e:
+                    completed_groups += 1
+                    print(f"  [✗] {group_id} worker 进程失败: {e}")
+
+        return completed_groups
+
     def run(
         self,
         profiles_with_folds: List[Tuple],   # [(RollingProfile, List[RollingFold])]
@@ -249,39 +318,38 @@ class ParallelScheduler:
             print("[Scheduler] 全部 job 已完成，直接读取历史结果。")
             return self._read_all_results()
 
-        worker_args = [
-            (self.h5dir, group, specs, completed_keys)
-            for group in all_groups
-        ]
+        # 将重任务单独拆批，进入 long/expanding 阶段后硬降总并发到 2。
+        light_groups = [group for group in all_groups if not _is_heavy_group(group)]
+        heavy_groups = [group for group in all_groups if _is_heavy_group(group)]
+        heavy_worker_cap = max(1, min(self.heavy_max_workers, self.n_workers))
+        print(
+            f"[Scheduler] 调度批次：light={len(light_groups)} groups @ {self.n_workers} workers，"
+            f"heavy={len(heavy_groups)} groups @ {heavy_worker_cap} workers"
+        )
 
         t0 = time.time()
         completed_groups = 0
         new_rows: List[dict] = []
-
-        with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
-            futures = {
-                pool.submit(_fold_group_worker, args): args[1].group_id
-                for args in worker_args
-            }
-            for future in as_completed(futures):
-                group_id = futures[future]
-                try:
-                    rows = future.result()
-                    self._append_results(rows)
-                    new_rows.extend(rows)
-                    completed_groups += 1
-                    elapsed = time.time() - t0
-                    ok_cnt = sum(1 for r in rows if r.get("status") == "ok")
-                    err_cnt = len(rows) - ok_cnt
-                    status_str = f"{ok_cnt} ok" + (f", {err_cnt} err" if err_cnt else "")
-                    print(
-                        f"  [✓] {group_id}  {status_str}"
-                        f"  {completed_groups}/{len(all_groups)} groups"
-                        f"  {elapsed:.0f}s elapsed"
-                    )
-                except Exception as e:
-                    completed_groups += 1
-                    print(f"  [✗] {group_id} worker 进程失败: {e}")
+        completed_groups = self._run_group_batch(
+            groups=light_groups,
+            specs=specs,
+            completed_keys=completed_keys,
+            max_workers=self.n_workers,
+            t0=t0,
+            completed_groups=completed_groups,
+            total_groups=len(all_groups),
+            new_rows=new_rows,
+        )
+        completed_groups = self._run_group_batch(
+            groups=heavy_groups,
+            specs=specs,
+            completed_keys=completed_keys,
+            max_workers=heavy_worker_cap,
+            t0=t0,
+            completed_groups=completed_groups,
+            total_groups=len(all_groups),
+            new_rows=new_rows,
+        )
 
         total_elapsed = time.time() - t0
         print(f"\n[Scheduler] 完成，耗时 {total_elapsed:.1f}s，新增 {len(new_rows)} 条结果。")
