@@ -18,6 +18,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from dl import MeowDataLoader
+from feature_loader import FeatureLoader
+from feature_store import DEFAULT_FEATURE_DIR
 from log import log
 from tradingcalendar import Calendar
 
@@ -54,9 +56,35 @@ class RollingFold:
 from feat_engine import FeatureBuilder
 
 class ExperimentRunner(object):
-    def __init__(self, h5dir):
+    def __init__(
+        self,
+        h5dir,
+        feature_dir=DEFAULT_FEATURE_DIR,
+        loader_cls=MeowDataLoader,
+        feature_loader=None,
+        feature_loader_cls=FeatureLoader,
+    ):
+        """
+        实验执行器。
+
+        M4 开始承担两条职责：
+        1. 保留旧接口，继续提供模型训练/评估逻辑。
+        2. 默认注入 FeatureLoader，让主链路优先走磁盘特征缓存。
+
+        兼容策略：
+        - 旧的 raw/build/cache 逻辑先不删除，便于回归比对和逐步迁移。
+        - 真正的数据加载优先走 `self.feature_loader`；只有显式不给 loader 时，
+          才会回退到旧的 `load_feature_split()`。
+        """
         self.calendar = Calendar()
-        self.loader = MeowDataLoader(h5dir=h5dir)
+        self.h5dir = h5dir
+        self.feature_dir = feature_dir
+        self.loader = loader_cls(h5dir=h5dir)
+        self.feature_loader = feature_loader or feature_loader_cls(
+            h5dir=h5dir,
+            feature_dir=feature_dir,
+            loader_cls=loader_cls,
+        )
         self.builder = FeatureBuilder()
         self._split_cache = {}
         self._raw_split_cache = {}
@@ -233,6 +261,25 @@ class ExperimentRunner(object):
         xdf, ydf = self.load_split(dates, max_days=max_days)
         xdf = self._filter_features(xdf, groups)
         return xdf, ydf
+
+    def _load_group_split(self, dates, groups=None, max_days=None, loader=None):
+        """
+        统一的数据加载入口。
+
+        优先级：
+        1. 调用方显式传入的 loader（供 scheduler / trainer 注入）
+        2. runner 自身持有的 FeatureLoader
+        3. 旧版 `load_feature_split()` 兜底
+
+        这样做的目的是把“主链路切到 FeatureLoader”收敛成一处改动，
+        避免每个实验分支各自维护一套加载逻辑。
+        """
+        if max_days is not None:
+            dates = dates[:max_days]
+        active_loader = loader or self.feature_loader
+        if active_loader is None:
+            return self.load_feature_split(dates, max_days=None, groups=groups)
+        return active_loader.load(dates, groups=groups)
 
     def evaluate_predictions(self, ydf, pred):
         y = ydf["fret12"].to_numpy()
@@ -606,12 +653,23 @@ class ExperimentRunner(object):
         max_train_days=None,
         max_val_days=None,
         target_mode="raw",
+        loader=None,
     ):
         train_dates, val_dates, test_dates = self.split_dates(split_config)
         log.inf(f"Train dates: {train_dates[0]} -> {train_dates[-1]} ({len(train_dates)})")
         log.inf(f"Val dates: {val_dates[0]} -> {val_dates[-1]} ({len(val_dates)})")
-        xtrain, ytrain = self.load_feature_split(train_dates, max_days=max_train_days, groups=feature_groups)
-        xval, yval = self.load_feature_split(val_dates, max_days=max_val_days, groups=feature_groups)
+        xtrain, ytrain = self._load_group_split(
+            train_dates,
+            groups=feature_groups,
+            max_days=max_train_days,
+            loader=loader,
+        )
+        xval, yval = self._load_group_split(
+            val_dates,
+            groups=feature_groups,
+            max_days=max_val_days,
+            loader=loader,
+        )
         log.inf(f"Train shape: {xtrain.shape}, Val shape: {xval.shape}")
         model, feature_cols, baseline = self.fit_model(model_name, xtrain, ytrain, target_mode=target_mode)
         pred_train = self._predict_with_baseline(
@@ -698,10 +756,21 @@ class ExperimentRunner(object):
         max_train_days=None,
         max_val_days=None,
         lambda_grid=None,
+        loader=None,
     ):
         train_dates, val_dates, _ = self.split_dates(split_config)
-        xtrain, ytrain = self.load_feature_split(train_dates, max_days=max_train_days, groups=feature_groups)
-        xval, yval = self.load_feature_split(val_dates, max_days=max_val_days, groups=feature_groups)
+        xtrain, ytrain = self._load_group_split(
+            train_dates,
+            groups=feature_groups,
+            max_days=max_train_days,
+            loader=loader,
+        )
+        xval, yval = self._load_group_split(
+            val_dates,
+            groups=feature_groups,
+            max_days=max_val_days,
+            loader=loader,
+        )
         common_model, common_feature_cols = self._fit_common_model(xtrain, ytrain, model_name=common_model_name)
         common_train = self._predict_common_component(common_model, common_feature_cols, xtrain)
         common_val = self._predict_common_component(common_model, common_feature_cols, xval)
@@ -746,10 +815,20 @@ class ExperimentRunner(object):
             "val_metrics": val_metrics,
         }
 
-    def run_soft_regime_ensemble(self, split_config, max_train_days=None, max_val_days=None, target_mode="interval_demean"):
+    def run_soft_regime_ensemble(self, split_config, max_train_days=None, max_val_days=None, target_mode="interval_demean", loader=None):
         train_dates, val_dates, _ = self.split_dates(split_config)
-        xtrain_full, ytrain = self.load_feature_split(train_dates, max_days=max_train_days, groups=None)
-        xval_full, yval = self.load_feature_split(val_dates, max_days=max_val_days, groups=None)
+        xtrain_full, ytrain = self._load_group_split(
+            train_dates,
+            groups=None,
+            max_days=max_train_days,
+            loader=loader,
+        )
+        xval_full, yval = self._load_group_split(
+            val_dates,
+            groups=None,
+            max_days=max_val_days,
+            loader=loader,
+        )
 
         main_result = self.run_with_groups(
             split_config=split_config,
@@ -758,6 +837,7 @@ class ExperimentRunner(object):
             max_train_days=max_train_days,
             max_val_days=max_val_days,
             target_mode=target_mode,
+            loader=loader,
         )
         regime_result = self.run_with_groups(
             split_config=split_config,
@@ -766,6 +846,7 @@ class ExperimentRunner(object):
             max_train_days=max_train_days,
             max_val_days=max_val_days,
             target_mode=target_mode,
+            loader=loader,
         )
 
         train_meta = pd.DataFrame({
@@ -875,7 +956,7 @@ class ExperimentRunner(object):
             raise ValueError("No rolling folds available")
         return folds
 
-    def _evaluate_spec_on_fold(self, fold_split, spec, max_train_days=None, max_val_days=None):
+    def _evaluate_spec_on_fold(self, fold_split, spec, max_train_days=None, max_val_days=None, loader=None):
         start_ts = time.time()
         coef_df = None
         if spec["type"] == "standard":
@@ -886,6 +967,7 @@ class ExperimentRunner(object):
                 max_train_days=max_train_days,
                 max_val_days=max_val_days,
                 target_mode=spec.get("target_mode", "raw"),
+                loader=loader,
             )
             train_metrics = result["train_metrics"]
             val_metrics = result["val_metrics"]
@@ -894,10 +976,11 @@ class ExperimentRunner(object):
             model_type = spec["model"]
             postprocess_type = "none"
             if spec.get("collect_coefs"):
-                xtrain, ytrain = self.load_feature_split(
+                xtrain, ytrain = self._load_group_split(
                     self.calendar.range(fold_split.train_start, fold_split.train_end),
-                    max_days=max_train_days,
                     groups=spec["groups"],
+                    max_days=max_train_days,
+                    loader=loader,
                 )
                 xtrain = xtrain.loc[:, ~xtrain.columns.duplicated()].copy()
                 model, feature_cols, _ = self.fit_model(spec["model"], xtrain, ytrain, target_mode=spec.get("target_mode", "raw"))
@@ -910,6 +993,7 @@ class ExperimentRunner(object):
                 feature_groups=spec.get("feature_groups"),
                 max_train_days=max_train_days,
                 max_val_days=max_val_days,
+                loader=loader,
             )
             train_metrics = result["train_metrics"]
             val_metrics = result["val_metrics"]
@@ -923,6 +1007,7 @@ class ExperimentRunner(object):
                 max_train_days=max_train_days,
                 max_val_days=max_val_days,
                 target_mode=spec.get("target_mode", "interval_demean"),
+                loader=loader,
             )
             train_metrics = result["train_metrics"]
             val_metrics = result["val_metrics"]
@@ -943,4 +1028,3 @@ class ExperimentRunner(object):
             "runtime_sec": float(time.time() - start_ts),
             "coef_df": coef_df,
         }
-

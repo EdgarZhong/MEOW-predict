@@ -59,6 +59,7 @@ from experiment_runner import ExperimentRunner
 
 DATA_DIR = str(PROJ_ROOT / "data")
 OUTPUT_DIR = str(PROJ_ROOT / "results" / "eval_protocol")
+FEATURE_DIR = str(PROJ_ROOT / "data" / "features")
 
 # 第一层 rolling 区间（内部选模型主依据）
 ROLLING_START = 20230601
@@ -141,6 +142,12 @@ def build_arg_parser():
         default=DATA_DIR,
         help="数据目录",
     )
+    parser.add_argument(
+        "--feature-dir",
+        type=str,
+        default=FEATURE_DIR,
+        help="特征缓存目录（PE1/M4 起评测主链路依赖该目录）",
+    )
     return parser
 
 
@@ -173,6 +180,7 @@ def main():
             selected_profiles = ROLLING_PROFILES
 
     print(f"\n[P0] 数据目录: {args.h5dir}")
+    print(f"[P0] 特征目录: {args.feature_dir}")
     print(f"[P0] 输出目录: {args.output_dir}")
     print(f"[P0] rolling 区间: {ROLLING_START} ~ {ROLLING_END}")
     print(f"[P0] 实验数: {len(specs)}, profiles: {[p.profile_name for p in selected_profiles]}")
@@ -181,7 +189,7 @@ def main():
     if args.resume:
         print(f"[P0] resume 模式：跳过已完成 job")
 
-    runner = ExperimentRunner(args.h5dir)
+    runner = ExperimentRunner(args.h5dir, feature_dir=args.feature_dir)
     protocol = EvaluationProtocolRunner(runner)
 
     result = protocol.run_full_protocol(

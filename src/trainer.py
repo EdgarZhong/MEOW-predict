@@ -172,13 +172,16 @@ class TabularTrainer(BaseTrainer):
     以复用 _daily_feature_cache。
     """
 
-    def __init__(self, spec: dict, runner):
+    def __init__(self, spec: dict, runner, loader):
         """
         spec:   实验配置 dict（与 ALL_SPECS 中的格式一致）
         runner: 进程内的 ExperimentRunner 实例
+        loader: FeatureLoader 实例。M4 起由调度层显式注入，避免 Trainer
+                再隐式依赖 runner 内部的旧缓存加载逻辑。
         """
         super().__init__(spec)
         self.runner = runner
+        self.loader = loader
 
     def run_fold(self, fold_data: FoldData) -> FoldResult:
         from experiment_runner import SplitConfig
@@ -193,7 +196,11 @@ class TabularTrainer(BaseTrainer):
         )
         start_ts = time.time()
         try:
-            bundle = self.runner._evaluate_spec_on_fold(fold_split, self.spec)
+            bundle = self.runner._evaluate_spec_on_fold(
+                fold_split,
+                self.spec,
+                loader=self.loader,
+            )
             vm = bundle["val_metrics"]
             tm = bundle["train_metrics"]
             return FoldResult(

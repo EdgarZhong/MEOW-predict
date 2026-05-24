@@ -731,7 +731,12 @@ class EvaluationProtocolRunner:
 
             # 3. 并发执行
             h5dir = self.runner.loader.h5dir
-            scheduler = ParallelScheduler(h5dir, n_workers=n_workers)
+            feature_dir = getattr(self.runner, "feature_dir", "data/features")
+            scheduler = ParallelScheduler(
+                h5dir,
+                feature_dir=feature_dir,
+                n_workers=n_workers,
+            )
             if _fold_metrics_csv:
                 scheduler.set_output_path(_fold_metrics_csv)
                 _parallel_wrote_fold_metrics = True
