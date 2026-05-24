@@ -76,6 +76,39 @@ MSE / R²             不明显恶化
 
 **关于 long_40d_5d：** 只有 ~6 折，方差极大。它的负结论（信号在长窗口下明确有害）是有效信息；正结论不单独作为 promote 依据。
 
+### 4.3 多重比较与边界增益纪律
+
+Dev Rolling 只有 ~105 个交易日，short profile 实际仅 ~5–6 个独立样本。R02 基线 `rolling_corr_std≈0.015`，对应均值标准误 ≈ 0.015/√6 ≈ **0.006**。
+
+**因此单个 profile 上的 +0.003 低于一个标准误，本身无法与噪声区分**，必须靠跨 profile 一致性 + Review Holdout 才能下结论。
+
+- 边界增益（`delta_corr` 0.003～0.005）**禁止只凭 Dev Rolling 直接 promote**，必须进 11 月 Review Holdout 复核后再决策
+- 每个阶段开跑前**先固定候选 spec 集合**，一次性跑完一起看；禁止"边加 spec 边重筛"——反复试探等于把 Dev 窗口磨成被过拟合的调参集（garden of forking paths）
+- 对同一份 Dev Rolling 比较的 spec 越多，纯靠运气过线的越多：候选集越大，promote 的一致性与门槛要求越要从严
+
+### 4.4 Profile 分层执行与 expanding 硬门槛
+
+隐藏测试是时间外推，`expanding_40d_5d` 最接近真实部署（累积全历史 → 向前预测），是泛化判断里最有代表性的 profile；而日常筛选用的 short/medium 是滑窗，最便宜也最不像真实任务。为同时兼顾成本与代表性，按层执行：
+
+| 层 | profiles | 用途 | 频率 |
+|---|---|---|---|
+| 内层筛选 | short + medium | P1–P3 日常换特征筛选 | 随意，目标 ~15–20 min |
+| 负向 veto | long | 候选通过内层后，确认无"长窗口明确有害" | 候选过内层才跑 |
+| promote 硬门槛 | expanding（串行 + memory guard） | 确认时间外推下信号仍成立 | promote 关口**必跑** |
+
+- long 的正向结论不单独采信（仅 6 折），故内层**不必每轮跑 long**，避免为否决票付固定大成本
+- **expanding 是 promote 的硬门槛**：任何候选 promote 前必须单独串行跑过 expanding，expanding 上不成立则不得 promote，**不得因为它慢而跳过**
+
+### 4.5 组合不可加：叠加后必须重跑
+
+P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过线，也**不能假设增益相加**：
+
+- 特征间常有信息重叠（如 OFI 与成交冲击都刻画买卖压力），合并后真实增益通常**小于**各自之和
+- 维度变多在固定 alpha 下可能拟合噪声，合并模型甚至可能**差于**只加最好的单组
+- 偶有互补使合并**大于**之和，但不可预先假定
+
+**规则：任何把多个特征组叠加使用的方案，必须作为一个新 spec、走同一套 rolling 重新验收，禁止用各组单独 delta 推算合并分数。** 这是 P1–P3（单组筛选）通向 P3.5/P4/P5（组合/融合）的强制关卡。
+
 ## 五、实验开发 SOP
 
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
@@ -163,6 +196,102 @@ xtrain["ofi_x_spread"] = xtrain["ofi_total"] * xtrain["spread"]
 - 改一个特征组导致全量 144 天所有组无脑重算
 - 缓存失效规则不清楚，结果不知来自新代码还是旧缓存
 - 最终 `meow.py` 离开本地 cache 就跑不起来
+
+### 7.5 Target Mode 准入规则
+
+最终提交给老师评测的预测值，**必须对应原始 `fret12` 尺度**。因此 target mode 分两类：
+
+**A. 可作为最终提交候选（允许继续实验）**
+
+- `raw`：直接预测原始 `fret12`
+- `interval_residual`：训练时预测残差，但**仅当**预测阶段能用测试时已知信息把公共基线严格加回，最终输出恢复为原始 `fret12`
+- `common_residual`：先预测 common component，再预测 residual，最终显式重构为原始 `fret12`
+- 其他未来新增 mode：只有在**不使用验证/测试真实 y 统计量**的前提下，能把预测值严格恢复到原始 `fret12`，才允许进入正式 rolling
+
+**B. 不可作为最终提交候选（原则上放弃）**
+
+- `date_demean`
+- `interval_demean`
+- `rank target` / `quantile target`
+- 任何需要用验证/测试真实 y 的均值、rank、std、分位数做还原的 mode
+- 任何最终输出仍停留在 residual / demean / rank / zscore 尺度的 mode
+
+**准入判定原则：**
+
+- 如果 target 变换后**无法在测试时仅依赖已知特征、已知 meta、训练期固定参数**恢复原始 `fret12`，则该 mode 只能作为研究分支，不能进入最终提交候选集
+- 如果 target 变换可逆，但逆变换依赖验证/测试真实 y，视为泄漏，禁止使用
+- 若存在争议，默认按“不可提交”处理，直到恢复路径被明确写清并代码验证通过
+
+### 7.6 阶段推进与调参边界
+
+P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执行：
+
+| 阶段 | 主目标 | 默认允许变动 | 默认禁止事项 |
+|---|---|---|---|
+| P0 | 建立统一 rolling 评测基线 | 修评测协议、补跑 profile、确认 baseline | 混入大量新特征 / 新模型 / 新 target mode |
+| P1-P3 | 验证新特征组（OFI / trade impact / conditional momentum） | 变动 feature groups；模型固定 `Ridge`；target 固定 `raw` | 大规模模型调参；把弱信号带进复杂模型 |
+| P3.5 | 少量跨信号族交互项冲刺 | 手工加入少量 scratch 交互列做 rolling 验证 | 大规模组合爆炸；尚未验证就写进正式 registry |
+| P4 | 稳健传统模型比较 | `Ridge / ElasticNet / Huber / 浅 ExtraTrees / 浅 HistGB` 小范围调参 | 深模型；大网格搜索；用 holdout 调参 |
+| P5 | 受限融合 | 少量有效分支的权重搜索 / 二层线性融合 | 自由 stacking；把弱分支也拉入融合 |
+| 交付演练 | 验证最终提交路径 | raw `fret12` 输出、`meow.py` 可独立运行、无泄漏检查 | 借机再开新实验方向 |
+
+### 7.7 各阶段允许的调参粒度
+
+- `P1-P3`：重点是**换特征定义**，不是反复微调同一个 spec
+- `P3.5`：允许少量离散型交互结构搜索，如 `ofi_total x spread`，但不允许扩成参数网格
+- `P4`：才正式允许系统性模型调参，但应以小范围人工扫为主，不做大规模网格
+- `P5`：允许融合权重、二层 Ridge/ElasticNet 正则强度等小规模调参
+- `Review Holdout / Final Holdout`：禁止作为普通调参集使用
+
+**Ridge alpha 口径（2026-05-24 拍板）：**
+
+- 标准 ridge 路径当前固定 `alpha=2.0`（前接 StandardScaler，见 `src/experiment_runner.py` 的 `fit_model`）
+- 进 P1 前先做一次性扫描：**仅用 R02 baseline、仅 short+medium**，在 `{0.5,1,2,5,10,20}` 上确认 2.0 落在平台区（或取平台中心），随后 **P1–P3 全程锁定该 alpha**，不逐 spec 调
+- 锁定理由：P1–P3 是单变量换特征对比，alpha 若随特征集大小变动，会把”特征是否有效”和”alpha 是否合适”混在一起，污染对比
+- per-fold / per-spec 的 alpha 调参属于 **P4**，禁止提前在 P1–P3 做
+- promote 关口可对候选做一次 3–4 点 alpha 敏感性抽查，确认增益不是 alpha 设错造成的假象
+
+判断”换 spec”还是”调参”的口径：
+
+- 换 spec：feature groups / 交互结构 / target 路线改变
+- 调参：spec 主体不变，只调整模型超参数、融合权重、后处理参数
+
+### 7.8 P4 模型比较准入标准
+
+一个新特征分支进入 P4 前，至少满足：
+
+- 相对当前基线 `delta_corr >= 0.003`
+- `protocol_stability_score` 不下降
+- `protocol_corr_min` 不明显变差
+- 不出现新的强负 fold
+- profile 结论尽量一致；在 long / expanding 未齐时，至少 `short + medium` 同向为正
+
+设计原因：
+
+- 防止弱信号被复杂模型“化妆”
+- 节省实验预算
+- 面向隐藏测试集时，把泛化性前置
+
+### 7.9 P5 融合准入标准
+
+一个分支进入融合池前，除满足 P4 准入标准外，还应满足：
+
+- 已在单模型下证明自己独立有效
+- 与当前主分支不是高度同质，最好能在不同 profile / 时段提供补充
+- 若使用二层融合，必须使用 OOF prediction，禁止直接用同折预测训练融合器
+- 若最佳融合不如 backbone 稳，最终提交 backbone，不为融合而融合
+
+### 7.10 P3.5 交互项冲刺规则
+
+- 只允许少量高先验交互项，优先测试：
+  - `ofi_total x spread`
+  - `ofi_total x trade_activity`
+  - `trade_pressure_qty x spread`
+  - `lagret12 x ofi_total`
+  - `lagret12 x order_pressure`
+  - `trade_pressure_qty x regime_score`
+- 交互项默认先作为 scratch 写在实验脚本里
+- 任一交互项如果被第二个实验复用，或准备进入正式 rolling 对比，必须晋级为 registry stage
 
 ## 八、三层评测体系（方案 B）
 
