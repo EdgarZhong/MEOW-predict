@@ -18,3 +18,5 @@ release/
 *.egg-info/
 dask-worker-space/
 .archive/
+.DS_Store
+logs/
