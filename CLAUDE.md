@@ -77,7 +77,7 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 
 实施规格见 `docs/specs/开跑前编码指导_评测口径与提速.md`（两边都不直接改代码，由 coding agent 实施）：
 - [ ] 日常 suite 默认 profiles = short + long（medium 移出日常，可 ad-hoc 单跑）
-- [ ] expanding 关口跑法：候选 vs 基线 2 spec + float32 + 2 worker 成本均衡切分（明确不做增量正规方程）
+- [ ] expanding 关口跑法：候选 vs 基线 2 spec + float32 + 2 worker 成本均衡切分（**2 worker 须 float32 数值验收通过后才开，否则维持串行**；明确不做增量正规方程）
 - [ ] make_decision 硬契约 + 3 条单测（AGENTS §4.6）
 - [ ] 每日 IC、IC-IR 并进 leaderboard 主视图（零额外成本）
 - [ ] 训练目标 winsorize 实现（AGENTS §7.11，与 P0.5 一起扫锁）

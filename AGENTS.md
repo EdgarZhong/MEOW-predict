@@ -52,7 +52,8 @@
 protocol_corr_mean   提升 ≥ 0.003（相对当前基线）
 protocol_stability_score  不下降
 protocol_corr_min    不明显变差（不出现新的强负 fold）
-MSE / R²             不明显恶化
+每日 IC-IR           不下降（每日截面 IC 的均值÷波动，分辨"选股 vs 大盘"，详见 §4.7）
+MSE / R²             不明显恶化（同一 winsorize 设定下比，见 §7.11）
 ```
 
 如果某一类特征只让一个 fold 变好，其他 fold 变差，则放弃。
@@ -96,7 +97,7 @@ Dev Rolling 只有 ~105 个交易日，short profile 实际仅 ~5–6 个独立�
 | P1–P3 提交关口 | 把候选并入 backbone？ | 慢车道：expanding（候选 vs 基线）+ 每日 IC + 11月 Review | §4.7 六步；§4.6 硬契约 | 每批一次，~30 min |
 | P3.5 交互 | 交互项收不收 | 同筛选，**额外看系数符号稳定性** | 交互极易过拟合 → §4.6 门槛比 P1–P3 更严 | 每候选 |
 | P4 选模型 | 用哪个模型 | short+long 初筛；expanding 只在 2–3 个决赛模型上跑 | 树吃数据、short 对树不公平 → 加权 long/expanding；**minimax：选最差折最好的，不是均值最高的** | 决赛才上 expanding |
-| P5 融合 | 融合 vs 单 backbone | **expanding 为主** + 11月 Review + OOF 预测 | 不比 backbone 更稳就交 backbone；融合在 short 上的增益最像噪声 | 最少次，最高规格 |
+| P5 融合 | 融合 vs 单 backbone | 以 expanding 关口为准（只跑一次）+ 11月 Review + OOF 预测 | 不比 backbone 更稳就交 backbone；融合在 short 上的增益最像噪声 | 最少次，最高规格 |
 
 - **筛选只产出”候选”，不产出”采纳”**：过了快车道只进候选池，真正并入 backbone 必须过慢车道。
 - **expanding 是 promote 的硬门槛**：任何候选 promote 前必须单独跑过 expanding（与日常 suite 分开、配 memory guard；worker 数等提速口径见 `docs/specs/开跑前编码指导_评测口径与提速.md`），expanding 上不成立则不得 promote，**不得因为它慢而跳过**。这是 §4.6”缺 expanding 最高只能 review”的来源。
@@ -127,7 +128,8 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 - **没跑 expanding 就不准 promote**：如果结果里没有 expanding（比如只跑了 short+long 的快车道批次），`make_decision` 最高只能返回 `review`，不得 `promote`。
 - **排行榜排序键要改**：头条按 `protocol_corr_mean` 排（这才对齐老师评分，回答“这个大概能打多少分”），`stability_score` 作为并排展示的守门指标——**不要再拿 stability 当第一排序键**。但“采纳”与否仍走上表的鲁棒性门槛，不能因为排在前面就采纳。
-- **必须有单测**：至少覆盖三条断言——“`delta_corr=0.004` 必须返回 `review`”、“缺 expanding 必须不能 promote”、“出现强负折必须不能 promote”。
+- **量化口径（供单测落地，P0.5 可按基线 std 复核校准）**：`long 不显著翻负` = long 的 `delta_corr ≥ −0.006`（约一个均值标准误，见 §4.3）；`新的强负折` = 候选使某折 corr 由非负转负（基线该折 ≥ 0、候选该折 < 0），或某折 corr < −0.01。没有量化定义，单测断言无法落地。
+- **必须有单测**：至少覆盖三条断言——“`delta_corr=0.004` 必须返回 `review`”、“缺 expanding 必须不能 promote”、“出现强负折（按上面定义）必须不能 promote”。
 
 ### 4.7 单候选 per-profile 复核方法论（promote 前必做）
 
@@ -223,12 +225,7 @@ xtrain["ofi_x_spread"] = xtrain["ofi_total"] * xtrain["spread"]
 
 ### 7.4 特征缓存一票否决规则
 
-以下任一条成立，说明特征管道设计有问题，必须修正：
-
-- 为了试一个新特征，需要手动改多个无关模块
-- 改一个特征组导致全量 144 天所有组无脑重算
-- 缓存失效规则不清楚，结果不知来自新代码还是旧缓存
-- 最终 `meow.py` 离开本地 cache 就跑不起来
+与 §二"设计宪法"的一票否决规则同一套，不重复列举：为试一个新特征要改多个无关模块、改一组导致全量重算、缓存失效规则不清、`meow.py` 离开本地 cache 跑不起来——任一条成立即特征管道设计有问题，必须修正。
 
 ### 7.5 Target Mode 准入规则
 
@@ -280,7 +277,7 @@ P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执�
 
 - 标准 ridge 路径当前固定 `alpha=2.0`（前接 StandardScaler，见 `src/experiment_runner.py` 的 `fit_model`）
 - 进 P1 前先做一次性扫描：**仅用 R02 baseline、仅 short+medium**，在 `{0.5,1,2,5,10,20}` 上确认 2.0 落在平台区（或取平台中心），随后 **P1–P3 全程锁定该 alpha**，不逐 spec 调
-  - 这次标定刻意用 short+medium、而非日常筛选的 short+long：扫平台区要的是折数多、曲线平滑，medium 的 ~16 折在这里有用。属于 §4.2"medium 移出日常"的**有意例外**，仅限这次一次性标定
+  - 这次标定刻意用 short+medium、而非日常筛选的 short+long：扫平台区要的是折数多、曲线平滑，medium 的 ~16 折在这里有用；也不用 expanding（它太贵、且要少看，不适合反复评估的标定扫描）。属于 §4.2"medium 移出日常"的**有意例外**，仅限这次一次性标定
 - 锁定理由：P1–P3 是单变量换特征对比，alpha 若随特征集大小变动，会把”特征是否有效”和”alpha 是否合适”混在一起，污染对比
 - per-fold / per-spec 的 alpha 调参属于 **P4**，禁止提前在 P1–P3 做
 - promote 关口可对候选做一次 3–4 点 alpha 敏感性抽查，确认增益不是 alpha 设错造成的假象

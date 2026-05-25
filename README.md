@@ -6,7 +6,7 @@
 
 - 数据：144 个交易日（2023-06-01 ~ 2023-12-29），每日一个 `.h5` 文件，约 2.45 GB
 - 任务：截面预测，评价指标为 `rolling_corr_mean`（IC 均值）和 `stability_score`
-- 当前 rolling 结果与基线口径：见 `CLAUDE.md` 和 `docs/实验记录.md`（P0 分段结果已产出）
+- 当前 rolling 结果与基线口径：见 `CLAUDE.md` 和 `docs/实验记录.md`
 
 ## 目录结构
 
