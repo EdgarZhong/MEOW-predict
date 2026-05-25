@@ -4,12 +4,9 @@
 
 ## 当前阶段目标
 
-**方案 B（扩展 rolling 选模型）+ 两速评测结构已固定。** 当前主线，按顺序：
+**方案 B（扩展 rolling 选模型）+ 两速评测结构已固定。文档全部落定。**
 
-1. PE1 特征管道重构收尾（experiment_runner 瘦身 + 正确性/OOM 验证）
-2. P0.5：alpha + winsorize clip 一次性扫描后锁定
-3. 落地两速 suite（日常 short+long）+ expanding 提速（float32 + 2 worker）——实施规格见 `docs/specs/开跑前编码指导_评测口径与提速.md`
-4. 打通 `meow.py` 提交通道（AGENTS §十一）后开 P1
+**当前唯一主线：开跑前债务清零。** 用户硬约束（2026-05-25）：正式开 P1 跑实验前，不允许残留任何工程/口径债务。所有 specs 工程项（`docs/specs/开跑前编码指导_评测口径与提速.md`）+ PE1 收尾 + P0.5 锁超参 + 提交通道，必须全部清完并跑冒烟验证，才能开 P1。冲刺看板见下方「开跑前债务清零冲刺」，A→E 档按序推进。
 
 ## 当前口径收敛（指针表）
 
@@ -39,6 +36,26 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 来源：`results/eval_protocol/20260523_223257`（short/medium/long）、`results/eval_protocol/20260524_220846`（expanding）。expanding 串行耗时分析见 `docs/P0运行耗时监控报告_20260525.md`。
 
 ## 任务看板
+
+### ⭐ 开跑前债务清零冲刺【当前唯一焦点 · 进行中】
+
+任务系统 #10–#20。A→E 按序；D 档 #17(2worker) 须等 #16(float32验收) 通过、E 档 #18(P0.5) 须等 #15(winsorize) 就绪。
+
+| 档 | 任务 | # | 验收 |
+|---|---|---|---|
+| A | make_decision 硬契约 + 3 条单测 | #10 | 3 条断言过(delta=0.004→review / 缺expanding不promote / 强负折不promote) |
+| A | 日常 suite 默认改 short+long | #11 | 日常跑只跑 short+long、~10-15min |
+| A | 每日 IC-IR 并进 leaderboard 主视图 | #12 | leaderboard 含每日 IC 均值 + IC-IR 两列 |
+| A | manifest_snapshot + resolved_columns.json 写盘 | #13 | 运行后磁盘有两文件 |
+| B | 删旧 cache + feat_engine 归档 | #14 | 主链路冒烟通过、feat_engine 入 .archive/ |
+| C | 训练目标 winsorize 实现 | #15 | 开关+分位可配、测试/提交回 raw fret12 |
+| D | 特征 float32 + 同折数值对照验收 | #16 | 同折 \|Δcorr\|<1e-4 |
+| D | expanding 关口:成本均衡切分+候选vs基线+2worker | #17 | 2 spec / 2 worker 无 OOM、~30min |
+| E | P0.5:alpha + winsorize 一次性扫锁 | #18 | 取平台中心锁死，固化进标准 ridge |
+| E | OOM 冒烟 + 全量构建计时 | #19 | 日常 suite 无 OOM、build --all ≤20min |
+| E | meow.py 提交通道在 held-out 日跑通 | #20 | forecast 列对齐、每行有限、回 raw fret12 |
+
+> 下方 PE1/P0.5/两速suite/提交通道各节的待办已并入本冲刺看板，原节仅留背景。
 
 ### PE0 实验平台并发改造【已完成】
 
