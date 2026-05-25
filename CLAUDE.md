@@ -40,6 +40,8 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 ### ⭐ 开跑前债务清零冲刺【当前唯一焦点】
 
 > **接手须知（无会话上下文也能实施）**：实施总规格 = `docs/specs/开跑前编码指导_评测口径与提速.md`（下称「编码指导」）+ `AGENTS.md`。每项已标：实施指针 / 关键约束 / 验收 / 依赖 / 状态。按 A→E 推进。依赖：#17 须等 #16 通过、#18 须等 #15 就绪。commit 纪律：一条一提交（编码指导总原则 3）。
+>
+> **接手第一步**：① 读 `AGENTS.md` + 本看板；② 验现状健康：`PYTHONPATH=src python tests/test_eval_protocol.py`（8 条应全过）、`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick`（应 exit 0，run 目录含 leaderboard/manifest_snapshot/resolved_columns）；③ 从下一个待办 **#14（B 档）** 开始，按其归档清单逐文件移 `.archive/`，每步跑 quick 冒烟。当前 git 已提交至 `f7a3805`，工作区仅 `meow/`（老师仓库原样克隆，勿动）。
 
 **A 档 评测口径代码化 —— ✅ 已完成（commit `2ebb5fb`）**
 - ✅ #10 make_decision 硬契约 + 单测（编码指导§4 / AGENTS §4.6）
