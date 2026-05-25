@@ -83,13 +83,18 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 
 > **注意**：16 GB Mac 不得使用 `--n-workers 8`，会触发 OOM 重启（已修复，默认改为 4）。
 
-## 当前最优基线（旧口径，待用新协议复现）
+## 当前最优基线（P0 分段结果）
 
-| 实验名 | rolling_corr_mean | rolling_corr_std | rolling_corr_min | stability_score |
-|---|---:|---:|---:|---:|
-| R02_ridge_legacy_plus_norm_core | 0.047976 | 0.014975 | 0.032599 | 0.037494 |
+> 说明：这次 P0 的结果分成两个 run 目录保存。`20260523_223257` 负责 short / medium / long，`20260524_220846` 负责串行补完 expanding。下面表格按结果范围分开记录，避免把不同 scope 混成一个单点。
 
-来源：`results/ridge_enhance_results.csv`（5折旧口径），**需用新协议重新复现后替换**
+| 范围 | experiment_id | protocol_corr_mean | protocol_stability_score | protocol_corr_min | decision |
+|---|---|---:|---:|---:|---|
+| short / medium / long aggregate | R02_ridge_legacy_plus_norm_core | 0.057463 | 0.041396 | 0.025214 | baseline |
+| expanding only | R01_ridge_legacy_plus_core | 0.066095 | 0.053459 | 0.041181 | promote |
+
+来源：
+- `results/eval_protocol/20260523_223257`（short / medium / long）
+- `results/eval_protocol/20260524_220846`（expanding）
 
 ## 任务看板（PE0 + P0–P5）
 
@@ -197,6 +202,22 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 - 当前最小修复口径：
   - 需要跑 `expanding` 时，**单独跑、串行跑**
   - 即把 `expanding` 视为慢速复核层，而不是日常主筛选层
+- 当前确认的续跑命令：
+  ```bash
+  PYTHONPATH=src python experiments/p0_eval_protocol.py \
+    --suite ridge \
+    --profiles expanding_40d_5d \
+    --n-workers 1
+  ```
+  - 该命令固定只跑 `expanding_40d_5d`
+  - `--n-workers 1` 代表串行模式，避免 expanded 阶段再次并发触发内存问题
+- 当前这次续跑已完成：
+  - `run_id=20260524_220846`
+  - `expanding_40d_5d` 串行跑通，未再出现并发 OOM
+  - `R01_ridge_legacy_plus_core` 在 expanding 上 `protocol_corr_mean=0.066095`、`protocol_stability_score=0.053459`，相对 `R02` 的 `baseline_delta_corr=0.003036`
+  - 这说明 expanding 口径本身是可用的，当前 P0 的结果分段保存在两个目录：
+    - `results/eval_protocol/20260523_223257`（short / medium / long）
+    - `results/eval_protocol/20260524_220846`（expanding）
 
 **设计决策记录（2026-05-23 拍板）**：
 - target/meta 来源：FeatureLoader 从 raw h5 读取
@@ -216,8 +237,8 @@ PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 
 - [x] baseline delta + make_decision 自动判断
 - [x] `experiments/p0_eval_protocol.py` 主入口（quick/ridge/full 三种 suite）
 - [x] `experiment_runner.py` max_folds 默认值改为 None
-- [ ] 运行 `--suite ridge` 跑通并记录正式基线指标
-- [ ] 用新口径更新 CLAUDE.md 的"当前最优基线"表格
+- [x] 运行 `--suite ridge` 分段跑通：`20260523_223257` 已完成 short / medium / long，`20260524_220846` 已串行补完 expanding
+- [x] 用新口径更新 CLAUDE.md 的"当前最优基线"表格（分段结果）
 
 ### P0.5：alpha 一次性扫描与锁定【下一步即时任务，编码+实验】
 

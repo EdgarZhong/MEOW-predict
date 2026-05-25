@@ -6,7 +6,7 @@
 
 - 数据：144 个交易日（2023-06-01 ~ 2023-12-29），每日一个 `.h5` 文件，约 2.45 GB
 - 任务：截面预测，评价指标为 `rolling_corr_mean`（IC 均值）和 `stability_score`
-- 当前最优基线：`R02_ridge_legacy_plus_norm_core`（新 rolling 口径指标待 `--suite ridge` 运行后更新）
+- 当前 rolling 结果与基线口径：见 `CLAUDE.md` 和 `docs/实验记录.md`（P0 分段结果已产出）
 
 ## 目录结构
 
@@ -80,6 +80,7 @@ PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
 | `CLAUDE.md` | 当前阶段任务看板、进度、决策 |
 | `AGENTS.md` | 开发规范、实验 SOP、禁止事项 |
 | `docs/实验记录.md` | 所有实验结果的历史记录 |
+| `docs/P0运行耗时监控报告_20260525.md` | 本次 P0 `expanding_40d_5d` 运行的耗时监控与阶段分析报告 |
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
 | `docs/specs/MEOW金融时序预测V3.3_论文启发稳健冲10_AI执行版.md` | V3.3 执行方案 |
 | `docs/specs/实验平台架构设计.md` | 并发实验平台架构（trainer/scheduler/resume） |
