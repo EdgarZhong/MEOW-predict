@@ -153,7 +153,7 @@ Long profile 只能切出 ~6 折，统计上很脆弱。
 - 9 个 stage 合起来约 **461–462 个特征**（菜单很大，但 R02 基线只用了其中一部分）。
 - 每天每个 stage 都没有缺失列、没有常数列，**只有 regime 的两列例外**（`state_spread_cs` / `state_activity_cs`）：它们是"一天一个值"的广播量，对"选哪只股票"几乎没用，只能蹭一点大盘当天的方向；以后上树模型（P4）时它们会造很多重复分裂，要留意。
 - 主路径**没有结构性泄漏**（StandardScaler 只在训练集上 fit）。唯一要在看 Final Holdout 之前确认的边界，是 `choose_postprocess_params` 这个在验证集上调参的函数，它的参考集合要钉死。
-- 提交契约：预测列必须叫 `forecast`、每个 (symbol,date,interval) 给一个有限值、行的顺序要和 `genFeatures` 的输出对齐（详见 AGENTS §十一）。
+- 提交契约：预测列必须叫 `forecast`、每个 (symbol,date,interval) 给一个有限值、行的顺序要和 `genFeatures` 的输出对齐（详见 AGENTS §十）。
 
 ---
 

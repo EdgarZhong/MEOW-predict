@@ -144,14 +144,36 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 第 1~5 步基本都用现成输出就能看（per-profile delta、`corr_min`、每折日期、每日 IC），只是换个姿势读；只有第 6 步要额外记录每折的系数。
 
+### 4.8 三层 Holdout 纪律（Dev / Review / Final）
+
+§4.2 的两速结构都在第一层 Dev Rolling 内部展开；其外还有两层只读 holdout，逐层收口、绝不回头调参：
+
+| 层级 | 数据区间 | 用途 | 频率 | 可否用于调参 |
+|---|---|---|---|---|
+| 第一层 Dev Rolling | 6–10月（内部切折） | 日常筛选、选模型、调参 | 随意反复 | 是 |
+| 第二层 Review Holdout | 训练6–10月、验证11月 | 候选缩窄后复核 | 同一候选 ≤3 次 | **否** |
+| 第三层 Final Holdout | 训练6–11月、验证12月 | 提交前一次性确认 | **只跑一次** | **严禁** |
+
+- **Final Holdout 只跑一次**：12月是手里最像老师隐藏集的代理，可信度完全建立在"开发全程没看过"上。一旦看了结果再据此改任何东西（哪怕"感觉调一下"），它就退化成又一个被过拟合的验证集，失去模拟隐藏集的意义。
+- **四步流程**：Dev Rolling 反复筛 → 只有 `promote` 的候选进 Review Holdout 复核 → 11月对得上才定方案、此后不再改 → Final Holdout 只确认、好坏都不再改提交决策。
+- **什么会污染 holdout（视为该层作废）**：看了 11/12月结果后改了特征/参数/后处理再跑一次；把 holdout 结果当普通指标纳入选择循环；用 holdout 期真实 `y` 做任何归一化或残差。Review 一旦被污染，直接只依赖 Dev Rolling 决策，不要试图用 Final 补救。
+
 ## 五、实验开发 SOP
 
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
-2. 在 `experiments/` 下新建或复用对应阶段脚本（p1_ofi_validation.py 等）
-3. 用 P0 确立的标准 rolling 口径评测
-4. 把结果写入 `docs/实验记录.md`，标注 `experiment_id / date / feature_set / model / split / seed / metrics / notes`
-5. 提交（遵循第六节 commit 规范）
-6. 与基线比较，只改一个变量
+2. 在 `src/eval_protocol.py` 的 `ALL_SPECS` 里固定本轮候选 spec（§7.1）
+3. 先过快车道筛选（`--suite daily`），过线候选再进慢车道关口（`--suite gate`），按 §4.4 口径评测
+4. 把结果写入 `docs/实验记录.md`，标注 `experiment_id / date / feature_set / model / split / seed / metrics / notes`（§九 必录字段）
+5. 与基线比较，只改一个变量；提交遵循 §八 commit 规范
+
+### 5.1 跑命令前自查清单（每次执行 `experiments/*.py` 前逐条过）
+
+1. **suite 选对了吗**：日常筛选 `--suite daily`（short+long+每日IC）；提交关口 `--suite gate --candidate-spec-id <ID>`（候选 vs 基线、只跑 expanding）。别拿 `full`/`ridge` 当日常。
+2. **macOS 跑 expanding / gate 必须显式 `--n-workers 1`**：`gate` 入口默认会压到 2 worker，在这台 16GB Mac 上会撞「双并行 expanding 尾段」OOM 风险；标准跑法是单 worker 串行，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c。只有迁到 20GB+ 空闲内存机器才开 2 worker。
+3. **候选 spec 已一次性固定**：禁止边加 spec 边重筛（§4.3 多重比较）。本轮要比的全集先定死、一起跑、一起看。
+4. **已锁默认别手改**：训练标签 winsorize = 开启 + P1/P99，ridge alpha = 2.0，特征 dtype = float32，都是 P0.5 扫锁结论（§7.11 / §7.7）。要做对照才显式覆写，且记录在案。
+5. **长任务挂保护**：`caffeinate -i` 防休眠 + `experiments/run_with_memory_guard.py` 兜 RSS；长跑用 `--run-id` 固定、`--resume` 可续。
+6. **目标与输出回 raw `fret12`**：winsorize 只作用于训练标签，评测/提交一律原始 `fret12`；提交通道不依赖 `data/features/` 缓存、不依赖任何不可见统计量（§十 推理契约）。
 
 ## 六、模型优先级
 
@@ -191,22 +213,11 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 ### 7.2 交互项探索规程（手动操作）
 
-探索阶段的交互项不需要注册为正式 stage。在实验脚本中直接用 pandas 计算：
+探索阶段的交互项不注册为正式 stage：在实验脚本里直接用 pandas 临时构造（如 `ofi_total × spread`），跑 Dev Rolling 看 `delta_corr` 与跨 profile 一致性。
 
-```python
-# experiments/ 下的实验脚本中
-xtrain["ofi_x_spread"] = xtrain["ofi_total"] * xtrain["spread"]
-```
-
-验证流程：
-1. 在实验脚本中手动添加交互列，跑 Dev Rolling
-2. 如果 `delta_corr ≥ 0.003` 且跨 profile 一致 → 提升为正式 stage
-3. 提升方法：在 `src/feature_registry.py` 中写 builder 函数 + `@registry.stage` 注册
-4. 重建特征缓存：`python -m feature_store build`
-
-禁止在探索阶段就把临时交互项写入 registry。避免 stage 膨胀。
-
-**晋级红线**：一个临时交互项如果被第二个实验复用，或准备进入正式 rolling 对比，就必须移入正式 registry。一次性试错可以手写，反复使用必须注册。
+- 临时手写 → 过线（`delta_corr ≥ 0.003` 且跨 profile 一致）才提升为正式 stage：在 `src/feature_registry.py` 写 builder + `@registry.stage` 注册，再 `python -m feature_store build`。
+- 禁止探索阶段就把临时交互项写进 registry，避免 stage 膨胀。
+- **晋级红线**：一个临时交互项被第二个实验复用、或要进正式 rolling 对比，就必须移入 registry。一次性试错可手写，反复使用必须注册。
 
 ### 7.3 特征生命周期管理（手动维护）
 
@@ -335,64 +346,14 @@ P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执�
 - **它对评分是有影响的，别误解**：winsorize 不改 eval 时的算法本身，但它改了训练出来的系数，系数变了预测就变了，最终的池化 Pearson 自然会变（系数更贴主体、少被尾部带偏）。不是“只稳梯度、跟 Pearson 无关”。到底好不好是经验问题（极端 `y` 是真信号还是噪声事先不知道），所以默认带上、但以 rolling 实测为准。
 - **P0.5 实测锁定（2026-05-25）**：在同一份 short+medium 扫描里，`P1/P99` 整体优于 `P0.5/P99.5` 和 `不裁`：最佳 `protocol_corr_mean` 约 `0.054181`，高于 `P0.5/P99.5` 的 `0.054123`，也明显高于 `不裁` 的 `0.053483`。因此标准训练口径正式锁为 **winsorize 开启 + `P1/P99`**。
 
-## 八、三层评测体系（方案 B）
+## 八、Git 提交规范
 
-### 8.1 三层的目的与限制
-
-| 层级 | 数据区间 | 用途 | 允许频率 | 结果可否用于调参 |
-|---|---|---|---|---|
-| 第一层：Dev Rolling | 6月～10月（内部切折） | 日常开发、特征筛选、模型选择 | 随意，反复跑 | 是 |
-| 第二层：Review Holdout | 训练6~10月，验证11月 | 候选模型缩窄后复核 | 谨慎，同一候选不超过3次 | **否** |
-| 第三层：Final Holdout | 训练6~11月，验证12月 | 最终提交前的一次性确认 | **只跑一次** | **严禁** |
-
-### 8.2 为什么 Final Holdout 是"一次性"的
-
-老师的隐藏测试集是某段你没见过的未来数据。12月是我们手里最靠近那段数据的时间区间，所以它是最好的代理。
-
-**完整性的前提是：你在整个开发过程中从未看过它。**
-
-一旦你看了 12月结果，就等于悄悄知道了答案的一部分。如果再根据这个结果调参——即使只是"感觉调一下"——12月的可信度就归零了，它变成了又一个被你过拟合的验证集，失去了模拟隐藏集的意义。
-
-> 类比：期末考试的卷子提前泄题，你做了一遍，再去"复习"——这次考试的成绩不能代表你的真实水平。
-
-### 8.3 正确的四步开发流程
-
-```
-步骤 1：Dev Rolling（反复跑）
-  → 用全量 rolling protocol 筛选特征/模型/参数
-  → 只有 decision=promote 的方案进入下一步
-
-步骤 2：Review Holdout（11月，谨慎跑）
-  → 对步骤1筛出的少数候选做一次复核
-  → 如果 11月结果和 rolling 一致 → 有信心
-  → 如果 11月结果崩了 → 重回步骤1，不能根据11月结果直接改参数
-
-步骤 3：确定最终提交方案
-  → 此时不再改任何东西
-
-步骤 4：Final Holdout（12月，只跑一次）
-  → 纯粹确认，结果好坏都不影响提交决策
-  → 结果记录在 docs/实验记录.md，仅供复盘
-```
-
-### 8.4 什么行为会污染 Holdout
-
-以下行为会让对应 holdout 层失去可信度，应当视为该层作废：
-
-- 看了 11月/12月结果后，**修改了特征、模型参数、后处理逻辑**，然后再跑一次
-- 在调参循环中**把 holdout 结果当作一个普通指标**纳入选择
-- 用 holdout 期间的真实 y 做任何归一化或残差计算
-
-如果 Review Holdout 已被污染，应当**直接跳过，只依赖 Dev Rolling 结果**做决策，不要试图用 final holdout 来补救。
-
-## 九、Git 提交规范
-
-### 9.1 粒度原则
+### 8.1 粒度原则
 
 - 每次 commit 代表一个明确的变更：特征组、目标变换、模型、split 逻辑、评测逻辑
 - 不混提：特征工程 + 模型调参 + 文档清理禁止一次提交
 
-### 9.2 提交格式
+### 8.2 提交格式
 
 ```
 feat:   新功能或新特征
@@ -409,18 +370,18 @@ exp: P1 OFI rolling audit, O3 best rolling_corr_mean=0.051
 fix: prevent target leakage in interval_demean normalization
 ```
 
-### 9.3 不可提交的内容
+### 8.3 不可提交的内容
 
 - `data/`（原始数据）
 - `results/`（中间结果 CSV）
 - `*.log / *.out / *.err`
 - `__pycache__/`
 
-### 9.4 每次实验 commit 必须记录
+### 8.4 每次实验 commit 必须记录
 
 `experiment_id / date / feature_set / target_type / model / split_config / seed / rolling_corr_mean / rolling_corr_std / stability_score / notes`
 
-## 十、目录约定
+## 九、目录约定
 
 ```
 src/              核心模块（特征、模型、评估、数据加载）
@@ -433,7 +394,7 @@ docs/archived/    历史快照（只读）
 .archive/         废弃文件（gitignored）
 ```
 
-## 十一、推理契约与交付约束
+## 十、推理契约与交付约束
 
 最终提交走老师的 `meow.py`：`engine.eval(start,end)` → `genFeatures(rawData)` → `predict(xdf)` → `ydf["forecast"]=pred` → `evaluator.eval(ydf)`（也就是 `ydf[["forecast","fret12"]].corr()`）。由此固定下面几条硬约束：
 

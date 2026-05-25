@@ -12,31 +12,31 @@
 
 ```
 MEOW--predict/
-├── src/                     # 核心代码
-│   ├── dl.py                # 数据加载
-│   ├── feat.py              # teacher 原始 6 特征（legacy）
-│   ├── feat_engine.py       # 增强特征工程（FeatureBuilder）
-│   ├── eval_protocol.py     # 三层评测协议（Rolling Profiles / Leaderboard）
-│   ├── trainer.py           # BaseTrainer ABC + TabularTrainer（DL 扩展点）
-│   ├── scheduler.py         # 并发调度（ProcessPoolExecutor + resume）
-│   ├── experiment_runner.py # 实验编排（特征/模型/评估核心逻辑）
-│   ├── mdl.py               # 模型接口
-│   ├── eval.py              # 评估工具
-│   ├── tradingcalendar.py   # 交易日历
-│   └── log.py               # 日志
-├── experiments/             # 实验入口脚本
-│   ├── p0_eval_protocol.py  # P0：Rolling 评测基准（主入口）
-│   ├── run_with_memory_guard.py # 通用内存看门狗包装器（可复用）
-│   ├── p1_ofi_validation.py # P1：OFI 特征验证
-│   ├── p2_impact_validation.py
-│   ├── p3_momentum_validation.py
-│   └── legacy/              # 历史实验脚本（保留可运行）
-├── data/                    # 原始 .h5 数据（gitignored）
-├── results/                 # 实验结果 CSV（gitignored）
-└── docs/                    # 文档
-    ├── 实验记录.md           # 所有实验记录的唯一入口
-    ├── specs/               # 规格文档
-    └── archived/            # 历史快照（只读）
+├── src/                       # 核心代码
+│   ├── feature_registry.py    # 特征族注册表（@registry.stage builder）
+│   ├── feature_store.py       # 特征构造 + 落盘（python -m feature_store build）
+│   ├── feature_loader.py      # 特征加载（resolve_groups + manifest，默认 float32）
+│   ├── eval_protocol.py       # 评测协议（Rolling Profiles / Leaderboard / make_decision）
+│   ├── experiment_runner.py   # 实验编排（特征/模型/训练/评估核心逻辑）
+│   ├── scheduler.py           # 并发调度（ProcessPoolExecutor + resume + 成本均衡切组）
+│   ├── submission_pipeline.py # 提交桥接层（正式特征现算 + 复用 runner 训练/推理核心）
+│   ├── trainer.py             # BaseTrainer ABC + TabularTrainer（DL 扩展点）
+│   ├── feat_legacy.py         # teacher 原始 6 特征（legacy 对照）
+│   ├── dl.py / mdl.py / eval.py / tradingcalendar.py / log.py  # 数据/模型/评估/日历/日志
+├── experiments/               # 实验入口脚本
+│   ├── p0_eval_protocol.py    # P0：Rolling 评测基准（主入口，含 daily/gate/ridge/quick/full suite）
+│   ├── p05_lock_ridge_alpha_and_winsorize.py # P0.5：alpha + winsorize 扫锁
+│   ├── run_with_memory_guard.py # 通用 RSS 内存看门狗包装器（可复用）
+│   └── legacy/p0_rolling_audit.py # 历史 rolling 审计脚本
+├── meow/                      # 老师提交目录（python meow.py 入口；正式提交通道）
+├── data/features/             # 特征缓存（gitignored；pickle_fallback 后端）
+├── data/                      # 原始 .h5 数据（gitignored）
+├── results/                   # 实验结果 CSV（gitignored）
+├── .archive/                  # 废弃/归档文件（gitignored，不主动追踪）
+└── docs/                      # 文档
+    ├── 实验记录.md             # 所有实验记录的唯一入口
+    ├── specs/                 # 规格文档
+    └── archived/              # 历史快照（只读）
 ```
 
 ## 运行环境
@@ -53,24 +53,25 @@ cd MEOW--predict
 # 快速验证（2折 × short profile，约 2 分钟）
 PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick
 
-# Ridge 基线建立（全量，推荐 4 并发）
-PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge --n-workers 4
+# 日常筛选（默认）：short + long 快车道 + 每日 IC
+PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily
 
-# 通用内存看门狗：为任意长任务加 RSS 保护（示例：12 GB 阈值续跑 P0）
+# 提交关口：候选 vs 基线、只跑 expanding（macOS 必须显式 --n-workers 1，见 AGENTS §5.1）
+PYTHONPATH=src python experiments/p0_eval_protocol.py \
+  --suite gate --candidate-spec-id <候选实验ID> --n-workers 1
+
+# 通用内存看门狗：为任意长任务加 RSS 保护（防休眠用 caffeinate -i）
 python experiments/run_with_memory_guard.py \
-  --rss-limit-gb 12 \
-  --rss-limit-duration-sec 30 \
-  --rss-hard-limit-gb 13 \
+  --rss-limit-gb 12 --rss-limit-duration-sec 30 --rss-hard-limit-gb 13 \
   --env PYTHONPATH=src \
-  -- python experiments/p0_eval_protocol.py \
-    --suite ridge \
-    --n-workers 4 \
-    --resume \
-    --run-id 20260523_223257
+  -- caffeinate -i python experiments/p0_eval_protocol.py \
+    --suite daily --resume --run-id <run_id>
 
-# 旧实验脚本（仍可运行）
-PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
+# 正式提交通道（老师入口，正式特征现算，不依赖本地缓存）
+cd meow && python meow.py
 ```
+
+**已锁定的标准口径（勿手改，对照才显式覆写）**：训练标签 winsorize = 开启 + P1/P99；ridge alpha = 2.0；特征 dtype = float32。来源见 AGENTS §7.7 / §7.11。
 
 ## 关键文档
 
@@ -84,5 +85,7 @@ PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
 | `docs/specs/MEOW金融时序预测V3.3_论文启发稳健冲10_AI执行版.md` | V3.3 执行方案 |
 | `docs/specs/实验平台架构设计.md` | 并发实验平台架构（trainer/scheduler/resume） |
-| `docs/specs/开跑前编码指导_评测口径与提速.md` | 两速评测口径落地 + expanding 提速的编码实施清单（面向 coding agent） |
+| `docs/specs/特征管道重构规格.md` | PE1 特征三件套（registry/store/loader）设计与实现规格 |
+| `docs/specs/开跑前编码指导_评测口径与提速.md` | 两速评测口径落地 + expanding 提速的编码实施清单（含 §2c 串/并行口径） |
+| `docs/specs/meow提交通道收口规格.md` | 提交通道（meow.py）正式特征现算与训练/推理复用规格 |
 | `experiments/run_with_memory_guard.py` | 通用内存看门狗包装器，超过 RSS 阈值自动终止任务 |
