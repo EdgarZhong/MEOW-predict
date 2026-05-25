@@ -182,12 +182,21 @@ def _weighted_avg(profile_scores: Dict[str, Dict], key: str) -> float:
 
 def make_decision(row: Dict, baseline: Dict) -> Tuple[str, str]:
     """
-    判断实验是否值得进入下一阶段。
+    promote / review / reject 自动判定，严格实现 AGENTS §4.6 硬契约。
 
-    返回 (decision, reason)：
-      promote  - 稳定超过基线，建议进入下阶段
-      review   - corr 有提升但 MSE 恶化，需人工检查
-      reject   - 不建议继续
+    coding agent 在循环里只认本函数返回的标签，所以判定表必须固化在这里、由单测锁住，
+    不能让“散文比代码严”的地方往松处漂。
+
+    判定表：
+      delta_corr < 0.003                          → reject
+      0.003 ≤ delta_corr < 0.005                  → review（边界增益，禁止直接 promote）
+      delta_corr ≥ 0.005 且通过全部 promote 附加门槛 → promote
+      其它                                          → review
+    缺 expanding 结果时最高只能 review，不得 promote。
+
+    依赖字段（均来自 build_leaderboard 的一行 row / baseline）：
+      protocol_corr_mean / protocol_stability_score / protocol_daily_ic_mean
+      {short,long,expanding}_corr_mean / {short,long,expanding}_corr_min
     """
     def _safe(d, k):
         v = d.get(k, np.nan)
@@ -196,38 +205,79 @@ def make_decision(row: Dict, baseline: Dict) -> Tuple[str, str]:
         except (TypeError, ValueError):
             return np.nan
 
+    def _has(d, k):
+        return k in d and not np.isnan(_safe(d, k))
+
     base_corr = _safe(baseline, "protocol_corr_mean")
-    base_stability = _safe(baseline, "protocol_stability_score")
-    base_mse = _safe(baseline, "protocol_mse_mean")
-    base_r2 = _safe(baseline, "protocol_r2_mean")
-
     corr = _safe(row, "protocol_corr_mean")
-    stability = _safe(row, "protocol_stability_score")
-    pfr = _safe(row, "protocol_positive_fold_rate")
-    mse = _safe(row, "protocol_mse_mean")
-    r2 = _safe(row, "protocol_r2_mean")
-
     if np.isnan(corr) or np.isnan(base_corr):
         return "unknown", "缺少 protocol_corr_mean"
 
-    if corr < base_corr + 0.003:
-        return "reject", f"corr 提升不足（{corr:.4f} vs 基线 {base_corr:.4f}+0.003）"
-
-    if not np.isnan(stability) and not np.isnan(base_stability) and stability < base_stability:
-        return "reject", f"stability_score 劣于基线（{stability:.4f} < {base_stability:.4f}）"
-
-    if not np.isnan(pfr) and pfr < 0.8:
-        return "reject", f"负 fold 过多（positive_fold_rate={pfr:.2f} < 0.8）"
-
-    if not np.isnan(mse) and not np.isnan(base_mse) and abs(base_mse) > 1e-12:
-        mse_delta_pct = (mse - base_mse) / abs(base_mse)
-        if mse_delta_pct > 0.05:
-            return "review", f"corr 提升但 MSE 恶化 {mse_delta_pct:.1%}（>5%）"
-
     delta_corr = corr - base_corr
-    delta_stab = (stability - base_stability) if not (np.isnan(stability) or np.isnan(base_stability)) else float("nan")
-    stab_str = f"+{delta_stab:.4f}" if not np.isnan(delta_stab) else "n/a"
-    return "promote", f"稳定超基线（corr +{delta_corr:.4f}，stability {stab_str}）"
+
+    # —— 安全地板：低于 +0.003 直接拒（§4.3：低于一个标准误，与噪声不可分）——
+    if delta_corr < 0.003:
+        return "reject", f"corr 提升不足（Δ={delta_corr:+.4f} < 0.003）"
+
+    # —— 边界区间 [0.003, 0.005)：只能 review，禁止直接 promote ——
+    if delta_corr < 0.005:
+        return "review", f"边界增益（Δ={delta_corr:+.4f} ∈ [0.003,0.005)），送复核"
+
+    # —— delta_corr ≥ 0.005：逐项核 promote 附加门槛，任一不过则降级为 review ——
+    # (1) expanding 必须已单独跑过，否则最高 review（硬约束，不得 promote）
+    if not _has(row, "expanding_corr_mean"):
+        return "review", f"Δ={delta_corr:+.4f} 达标但缺 expanding 结果，最高只能 review"
+
+    fails = []
+    exp_corr = _safe(row, "expanding_corr_mean")
+
+    # expanding 不为负
+    if exp_corr < 0:
+        fails.append(f"expanding 为负（{exp_corr:+.4f}）")
+
+    # (2) short 与 expanding 相对基线同向为正
+    short_delta = _safe(row, "short_corr_mean") - _safe(baseline, "short_corr_mean")
+    exp_delta = exp_corr - _safe(baseline, "expanding_corr_mean")
+    if not (short_delta > 0 and exp_delta > 0):
+        fails.append(f"short/expanding 未同向为正（short Δ={short_delta:+.4f}, exp Δ={exp_delta:+.4f}）")
+
+    # (3) long 不显著翻负：long 的 delta_corr ≥ -0.006（约一个均值标准误，§4.3）
+    if _has(row, "long_corr_mean") and _has(baseline, "long_corr_mean"):
+        long_delta = _safe(row, "long_corr_mean") - _safe(baseline, "long_corr_mean")
+        if long_delta < -0.006:
+            fails.append(f"long 显著翻负（Δ={long_delta:+.4f} < -0.006）")
+
+    # (4) 每日 IC 不恶化（两边都有该字段时才核；#12 已保证生产环境存在）
+    if _has(row, "protocol_daily_ic_mean") and _has(baseline, "protocol_daily_ic_mean"):
+        dic_delta = _safe(row, "protocol_daily_ic_mean") - _safe(baseline, "protocol_daily_ic_mean")
+        if dic_delta < -1e-6:
+            fails.append(f"每日 IC 恶化（Δ={dic_delta:+.4f}）")
+
+    # (5) stability 不降
+    if _has(row, "protocol_stability_score") and _has(baseline, "protocol_stability_score"):
+        stab_delta = _safe(row, "protocol_stability_score") - _safe(baseline, "protocol_stability_score")
+        if stab_delta < -1e-6:
+            fails.append(f"stability 下降（Δ={stab_delta:+.4f}）")
+
+    # (6) 没有新的强负折：某 profile 候选 corr_min < -0.01，或由非负转负（§4.6 量化定义）
+    neg_fold_hits = []
+    for prefix in ("short", "long", "expanding"):
+        ck = f"{prefix}_corr_min"
+        if not _has(row, ck):
+            continue
+        cand_min = _safe(row, ck)
+        base_min = _safe(baseline, ck) if _has(baseline, ck) else np.nan
+        if cand_min < -0.01:
+            neg_fold_hits.append(f"{prefix}(min={cand_min:+.4f}<-0.01)")
+        elif cand_min < 0 and not np.isnan(base_min) and base_min >= 0:
+            neg_fold_hits.append(f"{prefix}(min 由非负转负 {base_min:+.4f}→{cand_min:+.4f})")
+    if neg_fold_hits:
+        fails.append("出现新强负折：" + ", ".join(neg_fold_hits))
+
+    if fails:
+        return "review", f"Δ={delta_corr:+.4f} 达标但未过 promote 门槛：" + "；".join(fails)
+
+    return "promote", f"稳定超基线（Δ={delta_corr:+.4f}，expanding={exp_corr:+.4f}，已过全部门槛）"
 
 
 # ================================================================== #
@@ -572,9 +622,17 @@ class EvaluationProtocolRunner:
                 # 取 profile 名称前缀（short/medium/long/expanding）
                 prefix = pname.split("_")[0]
                 for metric in ["corr_mean", "corr_std", "corr_min", "stability_score",
-                               "n_folds", "positive_fold_rate"]:
+                               "n_folds", "positive_fold_rate", "daily_corr_mean", "daily_corr_std"]:
                     src_key = f"rolling_{metric}" if metric in ["corr_mean", "corr_std", "corr_min"] else metric
                     row[f"{prefix}_{metric}"] = r.get(src_key, np.nan)
+                # 每日截面 IC-IR（每日 IC 的 均值÷波动）：区分“稳的选股钱”与“虚胖”，防除零
+                _dic_m = float(r.get("daily_corr_mean", np.nan))
+                _dic_s = float(r.get("daily_corr_std", np.nan))
+                row[f"{prefix}_daily_ic_ir"] = (
+                    _dic_m / _dic_s
+                    if not (np.isnan(_dic_m) or np.isnan(_dic_s)) and abs(_dic_s) > 1e-12
+                    else np.nan
+                )
 
                 profile_scores[pname] = {
                     "corr_mean": r.get("rolling_corr_mean", np.nan),
@@ -583,6 +641,8 @@ class EvaluationProtocolRunner:
                     "mse_mean": r.get("rolling_mse_mean", np.nan),
                     "r2_mean": r.get("rolling_r2_mean", np.nan),
                     "positive_fold_rate": r.get("positive_fold_rate", np.nan),
+                    "daily_corr_mean": r.get("daily_corr_mean", np.nan),
+                    "daily_corr_std": r.get("daily_corr_std", np.nan),
                 }
                 # 顺便从第一个匹配的 profile 取元信息
                 if "model_type" not in row:
@@ -597,6 +657,13 @@ class EvaluationProtocolRunner:
             row["protocol_mse_mean"] = _weighted_avg(profile_scores, "mse_mean")
             row["protocol_r2_mean"] = _weighted_avg(profile_scores, "r2_mean")
             row["protocol_positive_fold_rate"] = _weighted_avg(profile_scores, "positive_fold_rate")
+            # 每日截面 IC 一等指标：均值 + IC-IR（均值÷波动），与池化 corr 并列进主视图
+            row["protocol_daily_ic_mean"] = _weighted_avg(profile_scores, "daily_corr_mean")
+            _pic_std = _weighted_avg(profile_scores, "daily_corr_std")
+            row["protocol_daily_ic_ir"] = (
+                row["protocol_daily_ic_mean"] / _pic_std
+                if not np.isnan(_pic_std) and abs(_pic_std) > 1e-12 else np.nan
+            )
 
             # holdout 结果（不参与 protocol_stability_score）
             if review_holdout_df is not None and not review_holdout_df.empty:
@@ -646,9 +713,9 @@ class EvaluationProtocolRunner:
             lb.loc[lb["experiment_id"] == baseline_id, "decision"] = "baseline"
             lb.loc[lb["experiment_id"] == baseline_id, "reason"] = "当前稳定基线"
 
-        # 按 protocol_stability_score 降序排列
-        if "protocol_stability_score" in lb.columns:
-            lb = lb.sort_values("protocol_stability_score", ascending=False).reset_index(drop=True)
+        # 头条按 protocol_corr_mean 降序（§4.6：对齐老师评分；stability 作并排守门指标，不再当第一排序键）
+        if "protocol_corr_mean" in lb.columns:
+            lb = lb.sort_values("protocol_corr_mean", ascending=False).reset_index(drop=True)
 
         return lb
 
@@ -870,6 +937,39 @@ class EvaluationProtocolRunner:
                 review_holdout_df.to_csv(os.path.join(run_dir, "review_holdout.csv"), index=False, encoding="utf-8-sig")
             if final_holdout_df is not None and not final_holdout_df.empty:
                 final_holdout_df.to_csv(os.path.join(run_dir, "final_holdout.csv"), index=False, encoding="utf-8-sig")
+
+            # —— 复现审计快照：特征 manifest + 本次解析的特征列清单 ——
+            # 放在主结果落盘之后；快照失败只告警，绝不影响已保存的 leaderboard 等主结果。
+            try:
+                fl = getattr(self.runner, "feature_loader", None)
+                manifest_path = getattr(fl, "manifest_path", None) if fl is not None else None
+                if manifest_path is not None and os.path.exists(str(manifest_path)):
+                    with open(str(manifest_path), "r", encoding="utf-8") as f:
+                        manifest_payload = json.load(f)
+                    with open(os.path.join(run_dir, "manifest_snapshot.json"), "w", encoding="utf-8") as f:
+                        json.dump(manifest_payload, f, ensure_ascii=False, indent=2, default=str)
+
+                registry = getattr(fl, "registry", None) if fl is not None else None
+                if registry is not None:
+                    all_groups = sorted({g for s in specs for g in s.get("groups", [])})
+                    resolved = registry.resolve_groups(all_groups) if all_groups else {}
+                    resolved_payload = {
+                        "feature_dir": str(getattr(self.runner, "feature_dir", "")),
+                        "manifest_path": str(manifest_path) if manifest_path is not None else "",
+                        "all_groups": list(all_groups),
+                        "resolved_stage_columns": {k: list(v) for k, v in resolved.items()},
+                        "specs_groups": {s["experiment_id"]: list(s.get("groups", [])) for s in specs},
+                    }
+                    try:
+                        resolved_payload["stage_code_hash"] = {
+                            st: registry.code_hash(st) for st in resolved.keys()
+                        }
+                    except Exception:
+                        pass
+                    with open(os.path.join(run_dir, "resolved_columns.json"), "w", encoding="utf-8") as f:
+                        json.dump(resolved_payload, f, ensure_ascii=False, indent=2, default=str)
+            except Exception as e:
+                print(f"[Protocol] 警告：特征快照写盘失败（不影响主结果）：{e}")
 
             print(f"\n[Protocol] 输出已保存至: {run_dir}")
 

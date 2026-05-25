@@ -7,11 +7,14 @@ P0：建立统一评测基准
   3. 可选加入 11月 review holdout 和 12月 final holdout
 
 运行方式：
-  # 快速验证（每个 profile 只跑 2 个 fold，只跑 Ridge 系列）
+  # 日常筛选（默认）：short + long 快车道，~10-15 min
   cd MEOW--predict
-  PYTHONPATH=src python experiments/p0_eval_protocol.py --quick
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily
 
-  # 完整 Ridge baseline 建立
+  # 快速验证（每个 profile 只跑 2 个 fold，只跑 Ridge 系列）
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick
+
+  # Ridge 全四 profile 重建基线
   PYTHONPATH=src python experiments/p0_eval_protocol.py --suite ridge
 
   # 全部历史实验重新评测（含 O/T/C 系列，耗时较长）
@@ -87,15 +90,16 @@ def build_arg_parser():
     parser.add_argument(
         "--suite",
         type=str,
-        default="ridge",
-        choices=["quick", "ridge", "full"],
-        help="quick=2折Ridge调试; ridge=完整Ridge系列建基线; full=全部历史实验",
+        default="daily",
+        choices=["quick", "daily", "ridge", "full"],
+        help="daily=日常筛选(short+long 快车道, 默认); quick=2折Ridge调试; "
+             "ridge=Ridge 全四 profile 重建基线; full=全部历史实验",
     )
     parser.add_argument(
         "--profiles",
         nargs="*",
         default=None,
-        help="指定 profile 名称列表，默认运行全部四个",
+        help="指定 profile 名称列表覆盖 suite 默认（如单独 ad-hoc 跑 medium_20d_5d / expanding_40d_5d）",
     )
     parser.add_argument(
         "--max-folds",
@@ -154,17 +158,26 @@ def build_arg_parser():
 def main():
     args = build_arg_parser().parse_args()
 
-    # 选择要运行的 specs
+    # profile 名 → 对象映射，供 daily 选取与 --profiles 覆盖
+    profile_map = {p.profile_name: p for p in ROLLING_PROFILES}
+    daily_profiles = [profile_map[n] for n in ("short_8d_2d", "long_40d_5d") if n in profile_map]
+
+    # 选择要运行的 specs 与 profiles
     if args.suite == "quick":
         specs = RIDGE_SPECS[:3]           # R00/R01/R02，快速验证
         max_folds = args.max_folds or 2   # 默认只跑 2 折
         selected_profiles = ROLLING_PROFILES[:1]  # 只跑 short profile
         print("[P0] 快速调试模式：R00-R02，short_8d_2d profile，2 folds")
+    elif args.suite == "daily":
+        specs = RIDGE_SPECS               # 日常筛选默认 Ridge 系列
+        max_folds = args.max_folds        # None = 全部 fold
+        selected_profiles = daily_profiles  # 快车道：short + long（medium/expanding 不进日常）
+        print("[P0] 日常筛选 suite：short + long 快车道（medium 移出日常、expanding 只在关口跑）")
     elif args.suite == "ridge":
         specs = RIDGE_SPECS               # R00-R04 完整 Ridge 系列
         max_folds = args.max_folds        # None = 全部 fold
         selected_profiles = ROLLING_PROFILES
-        print("[P0] Ridge 基线建立：R00-R04，四个 profiles，全量 folds")
+        print("[P0] Ridge 全 profile 重建：R00-R04，四个 profiles，全量 folds")
     else:  # full
         specs = ALL_SPECS
         max_folds = args.max_folds
@@ -220,12 +233,13 @@ def main():
     if not lb.empty:
         display_cols = [
             "experiment_id", "protocol_corr_mean", "protocol_stability_score",
+            "protocol_daily_ic_mean", "protocol_daily_ic_ir",
             "protocol_corr_min", "protocol_positive_fold_rate",
             "baseline_delta_corr", "decision",
         ]
         display_cols = [c for c in display_cols if c in lb.columns]
         print("\n" + "=" * 80)
-        print("Leaderboard（按 protocol_stability_score 降序）")
+        print("Leaderboard（按 protocol_corr_mean 降序；stability / 每日 IC-IR 为并排守门指标）")
         print("=" * 80)
         print(lb[display_cols].to_string(index=False))
     else:
