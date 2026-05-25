@@ -169,7 +169,7 @@ class TabularTrainer(BaseTrainer):
 
     完全委托给 ExperimentRunner._evaluate_spec_on_fold，不重复任何模型逻辑。
     runner 由调度层在 worker 进程内创建，跨同一 worker 的多个 fold 共享，
-    以复用 _daily_feature_cache。
+    以复用同一份 FeatureLoader / 模型执行上下文。
     """
 
     def __init__(self, spec: dict, runner, loader):

@@ -40,7 +40,7 @@ class FoldMeta:
 
 @dataclass
 class FoldGroup:
-    """一组连续 fold，作为单个 worker 任务的输入单元"""
+    """一组 fold，作为单个 worker 任务的输入单元"""
     group_id: str              # "{profile_name}_g{n}"，用于日志
     fold_metas: List[FoldMeta]
 
@@ -56,7 +56,7 @@ def _fold_group_worker(args: tuple) -> List[dict]:
     每个 worker 在进程内创建独立 ExperimentRunner + FeatureLoader，
     按顺序处理组内各 fold。数据加载直接走 FeatureLoader，不再清理旧 cache。
 
-    args: (h5dir, feature_dir, fold_group, specs, completed_keys)
+    args: (h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys)
     返回: list[FoldResult.to_dict()]
     """
     # macOS 'spawn' 模式：确保 src/ 在 sys.path 中
@@ -68,10 +68,16 @@ def _fold_group_worker(args: tuple) -> List[dict]:
     from feature_loader import FeatureLoader
     from trainer import FoldData, TabularTrainer
 
-    h5dir, feature_dir, fold_group, specs, completed_keys = args
+    h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys = args
 
-    runner = ExperimentRunner(h5dir, feature_dir=feature_dir)
-    loader = FeatureLoader(h5dir=h5dir, feature_dir=feature_dir)
+    runner = ExperimentRunner(
+        h5dir,
+        feature_dir=feature_dir,
+        target_winsorize_config=target_winsorize_config,
+        feature_dtype=feature_dtype,
+        ridge_alpha=ridge_alpha,
+    )
+    loader = FeatureLoader(h5dir=h5dir, feature_dir=feature_dir, feature_dtype=feature_dtype)
     results: List[dict] = []
 
     for meta in fold_group.fold_metas:
@@ -131,6 +137,78 @@ def _build_fold_groups(
     return groups
 
 
+def _estimate_fold_cost(fold) -> int:
+    """
+    估算单个 fold 的训练成本。
+
+    这里直接用 train_dates 长度近似：
+    - long / expanding 的主要成本来自训练窗口越来越长；
+    - 比只看 fold_id 更稳，因为它直接对应真实载入天数。
+    """
+    return len(getattr(fold, "train_dates", ()) or ())
+
+
+def _build_cost_balanced_fold_groups(
+    profile_name: str,
+    folds: list,
+    n_groups: int = 2,
+) -> List[FoldGroup]:
+    """
+    按 fold 成本做贪心均衡切分。
+
+    用途：
+    - #17 关口提速要求 heavy profile 不再按连续区间切组；
+    - 后段 expanding fold 最重，若连续切分会把最重折堆在同一 worker；
+    - 这里改成“先放最重折，再贪心塞给当前总成本最低的组”，
+      让 2 个 worker 的负载更接近。
+    """
+    if not folds:
+        return []
+    actual_groups = max(1, min(int(n_groups), len(folds)))
+    buckets = [
+        {"cost": 0, "folds": []}
+        for _ in range(actual_groups)
+    ]
+    indexed_folds = list(enumerate(folds))
+    indexed_folds.sort(
+        key=lambda item: (_estimate_fold_cost(item[1]), getattr(item[1], "fold_id", item[0])),
+        reverse=True,
+    )
+    for original_index, fold in indexed_folds:
+        target_bucket = min(
+            buckets,
+            key=lambda bucket: (
+                bucket["cost"],
+                len(bucket["folds"]),
+            ),
+        )
+        target_bucket["folds"].append((original_index, fold))
+        target_bucket["cost"] += _estimate_fold_cost(fold)
+
+    groups: List[FoldGroup] = []
+    for group_idx, bucket in enumerate(buckets):
+        if not bucket["folds"]:
+            continue
+        # 组内仍按原始 fold 顺序执行，避免日志和结果顺序过于跳跃。
+        ordered_pairs = sorted(bucket["folds"], key=lambda item: item[0])
+        metas = [
+            FoldMeta(
+                profile_name=profile_name,
+                fold_id=fold.fold_id,
+                train_dates=fold.train_dates,
+                val_dates=fold.val_dates,
+            )
+            for _, fold in ordered_pairs
+        ]
+        groups.append(
+            FoldGroup(
+                group_id=f"{profile_name}_g{group_idx}",
+                fold_metas=metas,
+            )
+        )
+    return groups
+
+
 def _is_heavy_group(group: FoldGroup) -> bool:
     """
     判断 group 是否属于重任务 profile。
@@ -144,6 +222,11 @@ def _is_heavy_group(group: FoldGroup) -> bool:
     if not group.fold_metas:
         return False
     profile_name = group.fold_metas[0].profile_name
+    return profile_name.startswith("long_") or profile_name.startswith("expanding_")
+
+
+def _is_heavy_profile_name(profile_name: str) -> bool:
+    """把 heavy profile 判定单独抽出来，便于建组前决定策略。"""
     return profile_name.startswith("long_") or profile_name.startswith("expanding_")
 
 
@@ -167,11 +250,24 @@ class ParallelScheduler:
         feature_dir: str = DEFAULT_FEATURE_DIR,
         n_workers: int = 4,
         heavy_max_workers: int = 2,
+        target_winsorize_config: Optional[Dict[str, object]] = None,
+        feature_dtype: str = "float32",
+        ridge_alpha: float = 2.0,
     ):
         self.h5dir = h5dir
         self.feature_dir = feature_dir
         self.n_workers = n_workers
         self.heavy_max_workers = heavy_max_workers
+        # worker 内会重新实例化 ExperimentRunner/FeatureLoader，
+        # 这里必须显式透传 feature_dtype，避免主进程与子进程口径漂移。
+        self.feature_dtype = feature_dtype
+        # 标准 ridge alpha 也必须显式透传给 worker，
+        # 否则主进程扫参和子进程真实训练会用不同值。
+        self.ridge_alpha = float(ridge_alpha)
+        # worker 会在独立进程里重新实例化 ExperimentRunner，
+        # 这里必须显式保存 winsorize 配置并一并透传，
+        # 否则真实并行跑数时会悄悄退回默认值，形成口径不一致。
+        self.target_winsorize_config = dict(target_winsorize_config or {})
         self._fold_metrics_path: Optional[str] = None
 
     def set_output_path(self, fold_metrics_path: str):
@@ -255,13 +351,23 @@ class ParallelScheduler:
         # 至少保留 1 个 worker，避免外部误传 0 导致进程池报错。
         actual_workers = max(1, min(max_workers, self.n_workers))
         worker_args = [
-            (self.h5dir, self.feature_dir, group, specs, completed_keys)
+            (
+                self.h5dir,
+                self.feature_dir,
+                self.target_winsorize_config,
+                self.feature_dtype,
+                self.ridge_alpha,
+                group,
+                specs,
+                completed_keys,
+            )
             for group in groups
         ]
 
         with ProcessPoolExecutor(max_workers=actual_workers) as pool:
             futures = {
-                pool.submit(_fold_group_worker, args): args[2].group_id
+                # args[5] 才是 FoldGroup；前面新增了 feature_dtype / ridge_alpha 两个透传参数。
+                pool.submit(_fold_group_worker, args): args[5].group_id
                 for args in worker_args
             }
             for future in as_completed(futures):
@@ -304,7 +410,14 @@ class ParallelScheduler:
         # 展平所有 profile → FoldGroup 列表
         all_groups: List[FoldGroup] = []
         for profile, folds in profiles_with_folds:
-            groups = _build_fold_groups(profile.profile_name, folds)
+            if _is_heavy_profile_name(profile.profile_name):
+                groups = _build_cost_balanced_fold_groups(
+                    profile.profile_name,
+                    folds,
+                    n_groups=2,
+                )
+            else:
+                groups = _build_fold_groups(profile.profile_name, folds)
             all_groups.extend(groups)
 
         total_jobs = sum(len(g.fold_metas) for g in all_groups) * len(specs)

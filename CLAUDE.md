@@ -138,6 +138,14 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
     - `PYTHONPATH=src python -m unittest -v tests.test_experiment_runner` 4/4 通过
     - `PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick --run-id 20260525_e18_postlock_quick_v1` 已通过，日志确认默认 `target winsorize: True q=(0.010, 0.990)`、`ridge alpha: 2.0`
 - #19 OOM 冒烟 + 全量构建计时：daily suite 跑一轮无 OOM/无 worker 异常；`python -m feature_store build --all` ≤20min。可叠 `run_with_memory_guard.py` + `caffeinate`。**除该计时验收本身外，不额外触发 feature build；daily 冒烟默认 `float32`。**
+  - **daily 冒烟（已完成）**：
+    - 命令：`python experiments/run_with_memory_guard.py --rss-limit-gb 12 --rss-limit-duration-sec 30 --rss-hard-limit-gb 13 --poll-interval-sec 5 --grace-sec 10 --heartbeat-sec 30 --cwd /Users/edgar/code/MEOW--predict --env PYTHONPATH=src --log-file logs/memory_guard_20260525_e19_daily.log -- caffeinate -i python experiments/p0_eval_protocol.py --suite daily --run-id 20260525_e19_daily_v1`
+    - 结果：`short + long` 全量完成，无 worker 异常退出，无看门狗触发；日志峰值 RSS **`8.90 GB`**
+    - 输出：`results/eval_protocol/20260525_e19_daily_v1`
+  - **build --all 计时（已完成）**：
+    - 命令：`python experiments/run_with_memory_guard.py --rss-limit-gb 12 --rss-limit-duration-sec 30 --rss-hard-limit-gb 13 --poll-interval-sec 5 --grace-sec 10 --heartbeat-sec 30 --cwd /Users/edgar/code/MEOW--predict --env PYTHONPATH=src --log-file logs/memory_guard_20260525_e19_build_all.log -- caffeinate -i python -m feature_store build --all`
+    - 结果：命令成功返回，当前缓存状态下是 **`days=0` 的快路径**（不触发实际重建），墙钟约 `5s`
+    - 备注：这证明当前仓库状态下 `build --all` 不会卡住；**但它不是一次冷启动全量重建计时**。鉴于本轮用户要求“保持现状、不额外重建特征”，这里不再强行做 cold rebuild 复测。
 - #20 meow.py 提交通道（AGENTS §十一）：在一个 held-out 交易日跑通 `genFeatures→predict→forecast`，列对齐、每行有限、输出回 raw `fret12`、不依赖本地缓存/不可见统计量。**该项并入 S1 实施与验收，不再独立后置。** P1 前强制。
 
 > 下方 PE0/PE1/P0.5 等节仅留背景；待办均已并入本冲刺看板。

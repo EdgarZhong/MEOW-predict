@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 from dl import MeowDataLoader
@@ -45,6 +46,7 @@ class FeatureLoader:
         registry: FeatureRegistry = default_registry,
         loader_cls=MeowDataLoader,
         storage_backend: Optional[str] = None,
+        feature_dtype: Optional[str] = "float32",
     ):
         self.h5dir = Path(h5dir)
         self.feature_dir = Path(feature_dir)
@@ -54,6 +56,10 @@ class FeatureLoader:
         # 让 registry 在运行时优先使用当前 feature_dir 的 manifest 列信息。
         self.registry.set_manifest_path(str(self.manifest_path))
         self.storage_backend = storage_backend or self._resolve_storage_backend()
+        # #16：默认在 loader 返回前把特征列压成 float32，直接降低后续拼接与
+        # worker 进程内 DataFrame 常驻内存；同时保留可切回 float64 的开关，
+        # 供数值对照验收复用，避免靠手改代码做一次性实验。
+        self.feature_dtype = self._normalize_feature_dtype(feature_dtype)
         # 记录最近一次 load 的解析结果，供后续 eval_protocol 写 resolved_columns.json。
         self._last_load_info: Dict[str, object] = {}
 
@@ -75,6 +81,23 @@ class FeatureLoader:
             if backend:
                 return str(backend)
         return detect_storage_backend()
+
+    def _normalize_feature_dtype(self, feature_dtype: Optional[str]) -> Optional[np.dtype]:
+        """
+        统一解析特征 dtype 配置。
+
+        约束：
+        - None 表示保持 stage artifact 原始 dtype，不额外强转
+        - 当前只允许 float32 / float64，避免有人误传整数或 object 破坏训练口径
+        """
+        if feature_dtype is None:
+            return None
+        dtype = np.dtype(feature_dtype)
+        if dtype not in (np.dtype("float32"), np.dtype("float64")):
+            raise ValueError(
+                "feature_dtype 仅支持 float32 / float64 / None"
+            )
+        return dtype
 
     def stage_file(self, stage_name: str, date: int) -> Path:
         """返回某个 stage 的单日 artifact 路径。"""
@@ -163,7 +186,17 @@ class FeatureLoader:
                 f"stage={stage_name} 缺少 {len(missing)} 个请求列，"
                 f"例如: {missing[:5]}"
             )
-        return stage_df.loc[:, list(requested_columns)].copy()
+        selected = stage_df.loc[:, list(requested_columns)].copy()
+        if self.feature_dtype is None or selected.empty:
+            return selected
+        # 这里统一在 loader 层做 dtype 收口，而不是等到各训练分支各自 to_numpy 时
+        # 再隐式转换，便于：
+        # 1. 更早释放一半内存；
+        # 2. 让串行 / 并行 / 提交桥接都走同一份口径；
+        # 3. 支持 float32 vs float64 的显式数值对照验收。
+        for col in selected.columns:
+            selected[col] = pd.to_numeric(selected[col], errors="coerce").fillna(0.0).astype(self.feature_dtype)
+        return selected
 
     # -----------------------------------------------------------------
     # 对外接口
@@ -246,6 +279,6 @@ class FeatureLoader:
                 for stage_name in stage_order
             },
             "storage_backend": self.storage_backend,
+            "feature_dtype": None if self.feature_dtype is None else self.feature_dtype.name,
         }
         return xdf, ydf
-
