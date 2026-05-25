@@ -41,7 +41,7 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 
 > **接手须知（无会话上下文也能实施）**：实施总规格 = `docs/specs/开跑前编码指导_评测口径与提速.md`（下称「编码指导」）+ `AGENTS.md`。每项已标：实施指针 / 关键约束 / 验收 / 依赖 / 状态。按 A→E 推进。依赖：#17 须等 #16 通过、#18 须等 #15 就绪。commit 纪律：一条一提交（编码指导总原则 3）。
 >
-> **接手第一步**：① 读 `AGENTS.md` + 本看板；② 验现状健康：`PYTHONPATH=src python tests/test_eval_protocol.py`（8 条应全过）、`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick`（应 exit 0，run 目录含 leaderboard/manifest_snapshot/resolved_columns）；③ 从下一个待办 **#14（B 档）** 开始，按其归档清单逐文件移 `.archive/`，每步跑 quick 冒烟。当前 git 已提交至 `f7a3805`，工作区仅 `meow/`（老师仓库原样克隆，勿动）。
+> **接手第一步**：① 读 `AGENTS.md` + 本看板；② 验现状健康：`PYTHONPATH=src python tests/test_eval_protocol.py`（11 条应全过）、`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick`（应 exit 0，run 目录含 leaderboard/manifest_snapshot/resolved_columns/config）；③ **不要先做 #16**，先做下方新增的 **S1「提交链收口」**，把 `meow/` 纳入主仓库并收成正式提交入口包装层。当前工作区除 `meow/` 外，还包含 **#14、#15 已完成但未提交** 的改动（见下）。
 
 **A 档 评测口径代码化 —— ✅ 已完成（commit `2ebb5fb`）**
 - ✅ #10 make_decision 硬契约 + 单测（编码指导§4 / AGENTS §4.6）
@@ -50,29 +50,63 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 - ✅ #13 manifest_snapshot + resolved_columns.json 写盘
 - 验证：quick suite 端到端冒烟通过 + 8 条单测（`tests/test_eval_protocol.py`）全过
 
-**B 档 PE1 清理与归档 —— #14【决策已定，待实施】**
-- **决策（2026-05-25 本会话定）**：legacy 旧实验脚本不再保留可运行，连同其依赖的旧加载链一起归档。
-- **归档清单（移到 `.archive/`，不是删除）**：
+**B 档 PE1 清理与归档 —— #14【✅ 已完成，待提交】**
+- **完成时间**：2026-05-25 本轮接手已落地。
+- **归档位置**：`.archive/20260525_b14_archive/`
+- **已归档内容**：
   - `src/feat_engine.py`（FeatureBuilder 本体）
-  - `experiments/legacy/run_516v3_*.py`（仅这些依赖旧链的旧脚本）
-  - `src/experiment_runner.py` 内旧加载链：`load_split` / `load_raw_split` / `load_feature_split` / `_filter_features` / `self.builder`（FeatureBuilder 实例）/ 三个 cache dict（`_split_cache`/`_raw_split_cache`/`_daily_feature_cache`）/ `from feat_engine import FeatureBuilder`
-- **保留**：`_load_group_split`（主链路加载入口，走 FeatureLoader）；其「兜底回退旧 load」分支改为明确 `raise`（旧链已归档，不应再回退）。
-- **验收**：① daily suite 冒烟通过 ② `grep -rn feat_engine src/` 无残留 import ③ legacy 脚本已不在 `experiments/legacy/`。
-- ⚠️ 破坏性归档：逐文件移 `.archive/`，每步后跑冒烟，禁止一次性批量删。
+  - `experiments/legacy/run_516v3_norm_only.py`
+  - `experiments/legacy/run_516v3_restricted.py`
+- **代码清理结果**：
+  - `src/experiment_runner.py` 已移除旧加载链：`load_split` / `load_raw_split` / `load_feature_split` / `_filter_features` / `self.builder` / `_split_cache` / `_raw_split_cache` / `_daily_feature_cache`
+  - `_load_group_split` 保留为唯一正式入口；缺少 loader 时改为显式 `raise`
+  - 兼容层仅保留 `self.loader` 属性，供协议层读取 `h5dir`，不再承载旧特征构建逻辑
+- **验收结果**：
+  - `PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick` 已在每次逐文件归档后通过，最近 run_id：`20260525_142943`
+  - `PYTHONPATH=src python tests/test_eval_protocol.py` 8/8 通过
+  - `src/` 内已无 `feat_engine` import；`experiments/legacy/` 仅剩 `p0_rolling_audit.py`
+- **下一步**：进入 #15（winsorize 开关与分位配置）
 
-**C 档 winsorize —— #15**
-- 实施指针：编码指导§6 + AGENTS §7.11；改 `src/experiment_runner.py` 构造 `ytrain` 处（StandardScaler 前）。
-- 关键约束：只裁训练标签 `ytrain`（训练集分位、非对称）；测试/提交永远输出原始 `fret12`；开关 + 分位可配，clip 候选 {P0.5/P99.5, P1/P99, 不裁}。
-- 验收：开关与分位可配，锁定后 P1–P3 不逐 spec 调。依赖：供 #18 扫锁。
+**C 档 winsorize —— #15【✅ 已完成，待提交】**
+- **完成时间**：2026-05-25 本轮接手已落地。
+- **代码结果**：
+  - `src/experiment_runner.py` 已接入 runner 级训练标签 winsorize 配置；默认 `enabled=True, q=(0.005, 0.995)`，且只作用于训练目标
+  - `src/scheduler.py` / `src/eval_protocol.py` / `experiments/p0_eval_protocol.py` 已把该配置贯通到并行 worker 和结果 `config.json`
+  - 新增单测 `tests/test_experiment_runner.py`，锁默认值 / 关闭开关 / 分位裁剪行为
+- **真实数据闭环**：
+  - 开启版：`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick --run-id 20260525_b15_quick_on_v2`
+  - 关闭版：`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick --run-id 20260525_b15_quick_off_v1 --target-winsorize off`
+  - 两轮都已成功跑通；开启版 worker 日志可见实际裁剪边界，关闭版日志明确 `Target winsorize: disabled`
+- **当前观察（仅 quick 冒烟，不作采纳结论）**：
+  - `R02` quick `protocol_corr_mean`：开启 0.032685，关闭 0.032791
+  - 说明开关真实生效，但是否采用默认 `P0.5/P99.5` 仍留待 #18 在 short+medium 正式扫锁
+- **下一步**：进入 #16（float32 验收）
+
+**S 档 提交链收口 —— S1【🔴 立刻执行，优先级高于 #16】**
+- **为什么现在插队**：
+  - 老师最终口令已明确为 `python meow.py`；当前实验 driver 与 `meow/` 入口不是同一条真实执行链
+  - 若先继续做 `#16/#17/#18`，存在“优化的是实验系统，不是老师最终会跑的系统”的风险
+- **任务目标**：把 `meow/` 收成老师正式提交入口包装层，同时保持 `src/` 为唯一核心后端；分叉仅允许发生在 driver 编排与特征物化方式。
+- **实现规格**：详见 `docs/specs/meow提交通道收口规格.md`
+- **验收**：
+  - `meow/` 文件已被主仓库跟踪
+  - `cd meow && python meow.py` 在真实数据上可直接训练 + 预测 + 评测
+  - 提交链和实验链在同一切分上的特征列/训练口径/预测输出一致
+  - `winsorize` 在 `meow.py` 训练链中真实生效，而不是只存在于实验 driver
+- **预估工作量**：
+  - 设计澄清 + 仓库归并：0.5 小时
+  - 薄包装与桥接实现：2~4 小时
+  - `meow.py` 端到端闭环与修 bug：1~3 小时
+  - **合计：半天到 1 天；若出现 train/serve skew 或缓存耦合问题，按 1 天看**
 
 **D 档 expanding 提速**
-- #16 特征 float32（编码指导§2b；改 `src/feature_loader.py`）。**验收（硬）**：同 spec 同 fold，float32 vs float64 `protocol_corr` 差 |Δcorr|<1e-4，不达标不合入。
-- #17 关口提速（编码指导§2a/§2c；改 `src/scheduler.py` + `experiments/p0_eval_protocol.py`）：① 关口只评候选+基线 2 spec ② group 按 fold 序号成本均衡切分（不连续切）③ heavy 批次 2 worker。**硬前提：#16 验收通过才开 2 worker，否则维持串行**。验收：2 spec / 2 worker 无 OOM、~30min。依赖 #16。
+- #16 特征 float32（编码指导§2b；改 `src/feature_loader.py`）。**验收（硬）**：同 spec 同 fold，float32 vs float64 `protocol_corr` 差 |Δcorr|<1e-4，不达标不合入。**注意：S1 完成前暂停。**
+- #17 关口提速（编码指导§2a/§2c；改 `src/scheduler.py` + `experiments/p0_eval_protocol.py`）：① 关口只评候选+基线 2 spec ② group 按 fold 序号成本均衡切分（不连续切）③ heavy 批次 2 worker。**硬前提：#16 验收通过才开 2 worker，否则维持串行**。验收：2 spec / 2 worker 无 OOM、~30min。依赖 #16。**注意：S1 完成前暂停。**
 
 **E 档 跑实验收尾**
 - #18 P0.5 alpha+winsorize 扫锁（AGENTS §7.7）：仅 R02、仅 short+medium；alpha {0.5,1,2,5,10,20} × clip {P0.5/P99.5, P1/P99, 不裁} 一起扫，各取平台中心锁死，固化进标准 ridge 路径；per-fold alpha 留 P4。依赖 #15。~15–20min。
 - #19 OOM 冒烟 + 全量构建计时：daily suite 跑一轮无 OOM/无 worker 异常；`python -m feature_store build --all` ≤20min。可叠 `run_with_memory_guard.py` + `caffeinate`。
-- #20 meow.py 提交通道（AGENTS §十一）：在一个 held-out 交易日跑通 `genFeatures→predict→forecast`，列对齐、每行有限、输出回 raw `fret12`、不依赖本地缓存/不可见统计量。P1 前强制。
+- #20 meow.py 提交通道（AGENTS §十一）：在一个 held-out 交易日跑通 `genFeatures→predict→forecast`，列对齐、每行有限、输出回 raw `fret12`、不依赖本地缓存/不可见统计量。**该项并入 S1 实施与验收，不再独立后置。** P1 前强制。
 
 > 下方 PE0/PE1/P0.5 等节仅留背景；待办均已并入本冲刺看板。
 
@@ -90,7 +124,8 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 
 剩余项（已并入上方冲刺看板，此处不重复列）：
 - #13 manifest/resolved_columns 写盘 → ✅ 已完成
-- #14 清理旧 cache/load 链 + `feat_engine` 归档（含 legacy 脚本，本会话决策）
+- #14 清理旧 cache/load 链 + `feat_engine` 归档（含 legacy 脚本，本会话决策）→ ✅ 已完成，待提交
+- #15 训练目标 winsorize 开关 + 分位配置 + 真实数据闭环 → ✅ 已完成，待提交
 - #19 OOM 冒烟 + 全量构建 ≤20min
 - 「新旧管道 allclose 验证」**取消**：legacy 旧管道按 #14 归档后已无对照对象；新管道已由 P0 基线产出验证可用，无需再比。
 
