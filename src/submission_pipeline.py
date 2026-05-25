@@ -228,6 +228,7 @@ class SubmissionModelPipeline:
         feature_dir: str = DEFAULT_FEATURE_DIR,
         spec: SubmissionSpec = SubmissionSpec(),
         target_winsorize_config: Optional[Dict[str, object]] = None,
+        ridge_alpha: float = 2.0,
     ):
         self.h5dir = h5dir
         self.feature_dir = feature_dir
@@ -236,6 +237,7 @@ class SubmissionModelPipeline:
             h5dir=h5dir,
             feature_dir=feature_dir,
             target_winsorize_config=target_winsorize_config or DEFAULT_TARGET_WINSORIZE,
+            ridge_alpha=ridge_alpha,
         )
         self.model = None
         self.feature_cols: Optional[List[str]] = None

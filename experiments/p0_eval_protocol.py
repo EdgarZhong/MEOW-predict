@@ -91,9 +91,9 @@ def build_arg_parser():
         "--suite",
         type=str,
         default="daily",
-        choices=["quick", "daily", "ridge", "full"],
-        help="daily=日常筛选(short+long 快车道, 默认); quick=2折Ridge调试; "
-             "ridge=Ridge 全四 profile 重建基线; full=全部历史实验",
+        choices=["quick", "daily", "gate", "ridge", "full"],
+        help="daily=日常筛选(short+long 快车道, 默认); gate=关口(expanding 候选+基线 2 spec); "
+             "quick=2折Ridge调试; ridge=Ridge 全四 profile 重建基线; full=全部历史实验",
     )
     parser.add_argument(
         "--profiles",
@@ -152,11 +152,77 @@ def build_arg_parser():
         default=FEATURE_DIR,
         help="特征缓存目录（PE1/M4 起评测主链路依赖该目录）",
     )
+    parser.add_argument(
+        "--candidate-spec-id",
+        type=str,
+        default=None,
+        help="关口模式下要评估的候选 experiment_id；suite=gate 时必填",
+    )
+    parser.add_argument(
+        "--baseline-spec-id",
+        type=str,
+        default=BASELINE_ID,
+        help="关口模式下对照基线 experiment_id（默认当前 baseline）",
+    )
+    parser.add_argument(
+        "--target-winsorize",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="训练标签 winsorize 开关：on=开启（默认，当前工作口径），off=关闭做对照",
+    )
+    parser.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=2.0,
+        help="标准 ridge 主路径的 alpha（默认 2.0；P0.5 扫描时由外部显式覆写）",
+    )
+    parser.add_argument(
+        "--target-winsor-lower-q",
+        type=float,
+        default=0.01,
+        help="训练标签 winsorize 下分位（默认 0.01，对应 P1）",
+    )
+    parser.add_argument(
+        "--target-winsor-upper-q",
+        type=float,
+        default=0.99,
+        help="训练标签 winsorize 上分位（默认 0.99，对应 P99）",
+    )
     return parser
+
+
+def build_target_winsorize_config(args):
+    """
+    把 CLI 参数收敛成一份可直接传给 ExperimentRunner 的配置。
+
+    这里故意不做“自动猜测”：
+    - `on/off` 明确表达用户是否要裁训练标签
+    - 分位数显式透传给 runner / scheduler / worker，保证真实跑数全链路一致
+    """
+    return {
+        "enabled": args.target_winsorize == "on",
+        "lower_quantile": float(args.target_winsor_lower_q),
+        "upper_quantile": float(args.target_winsor_upper_q),
+    }
+
+
+def resolve_specs_by_ids(spec_ids):
+    """
+    按 experiment_id 解析 spec 列表。
+
+    这里优先从 ALL_SPECS 建索引，避免关口模式靠切片猜“第几个 spec 是谁”。
+    """
+    spec_map = {spec["experiment_id"]: spec for spec in ALL_SPECS}
+    missing = [spec_id for spec_id in spec_ids if spec_id not in spec_map]
+    if missing:
+        raise ValueError(f"未找到 experiment_id: {missing}")
+    return [spec_map[spec_id] for spec_id in spec_ids]
 
 
 def main():
     args = build_arg_parser().parse_args()
+    target_winsorize_config = build_target_winsorize_config(args)
 
     # profile 名 → 对象映射，供 daily 选取与 --profiles 覆盖
     profile_map = {p.profile_name: p for p in ROLLING_PROFILES}
@@ -167,21 +233,40 @@ def main():
         specs = RIDGE_SPECS[:3]           # R00/R01/R02，快速验证
         max_folds = args.max_folds or 2   # 默认只跑 2 折
         selected_profiles = ROLLING_PROFILES[:1]  # 只跑 short profile
+        effective_n_workers = args.n_workers
         print("[P0] 快速调试模式：R00-R02，short_8d_2d profile，2 folds")
     elif args.suite == "daily":
         specs = RIDGE_SPECS               # 日常筛选默认 Ridge 系列
         max_folds = args.max_folds        # None = 全部 fold
         selected_profiles = daily_profiles  # 快车道：short + long（medium/expanding 不进日常）
+        effective_n_workers = args.n_workers
         print("[P0] 日常筛选 suite：short + long 快车道（medium 移出日常、expanding 只在关口跑）")
+    elif args.suite == "gate":
+        if not args.candidate_spec_id:
+            raise ValueError("suite=gate 时必须提供 --candidate-spec-id")
+        gate_spec_ids = [args.baseline_spec_id, args.candidate_spec_id]
+        specs = resolve_specs_by_ids(gate_spec_ids)
+        max_folds = args.max_folds
+        selected_profiles = [
+            profile_map["expanding_40d_5d"]
+        ] if "expanding_40d_5d" in profile_map else ROLLING_PROFILES
+        # #17：关口模式默认压到 2 worker；若调用方显式给 1，则保留串行排障能力。
+        effective_n_workers = min(args.n_workers, 2)
+        print(
+            "[P0] 关口 suite：只跑 baseline + candidate 两条 spec，默认 expanding profile，"
+            f"candidate={args.candidate_spec_id}, baseline={args.baseline_spec_id}"
+        )
     elif args.suite == "ridge":
         specs = RIDGE_SPECS               # R00-R04 完整 Ridge 系列
         max_folds = args.max_folds        # None = 全部 fold
         selected_profiles = ROLLING_PROFILES
+        effective_n_workers = args.n_workers
         print("[P0] Ridge 全 profile 重建：R00-R04，四个 profiles，全量 folds")
     else:  # full
         specs = ALL_SPECS
         max_folds = args.max_folds
         selected_profiles = ROLLING_PROFILES
+        effective_n_workers = args.n_workers
         print(f"[P0] 完整评测：{len(specs)} 个历史实验，四个 profiles")
 
     # 按用户指定过滤 profile
@@ -198,11 +283,27 @@ def main():
     print(f"[P0] rolling 区间: {ROLLING_START} ~ {ROLLING_END}")
     print(f"[P0] 实验数: {len(specs)}, profiles: {[p.profile_name for p in selected_profiles]}")
     print(f"[P0] max_folds: {max_folds or '全量'}")
-    print(f"[P0] n_workers: {args.n_workers}{'（串行）' if args.n_workers == 1 else '（并行）'}")
+    print(
+        f"[P0] n_workers: {effective_n_workers}"
+        f"{'（串行）' if effective_n_workers == 1 else '（并行）'}"
+    )
+    print(
+        "[P0] target winsorize: {enabled} q=({lower:.3f}, {upper:.3f})".format(
+            enabled=target_winsorize_config["enabled"],
+            lower=target_winsorize_config["lower_quantile"],
+            upper=target_winsorize_config["upper_quantile"],
+        )
+    )
+    print(f"[P0] ridge alpha: {args.ridge_alpha}")
     if args.resume:
         print(f"[P0] resume 模式：跳过已完成 job")
 
-    runner = ExperimentRunner(args.h5dir, feature_dir=args.feature_dir)
+    runner = ExperimentRunner(
+        args.h5dir,
+        feature_dir=args.feature_dir,
+        target_winsorize_config=target_winsorize_config,
+        ridge_alpha=args.ridge_alpha,
+    )
     protocol = EvaluationProtocolRunner(runner)
 
     result = protocol.run_full_protocol(
@@ -221,8 +322,8 @@ def main():
         final_train_end=FINAL_TRAIN_END,
         final_holdout_start=FINAL_HOLDOUT_START,
         final_holdout_end=FINAL_HOLDOUT_END,
-        baseline_id=BASELINE_ID,
-        n_workers=args.n_workers,
+        baseline_id=args.baseline_spec_id,
+        n_workers=effective_n_workers,
         resume=args.resume,
         output_dir=args.output_dir,
         run_id=args.run_id,

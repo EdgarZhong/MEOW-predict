@@ -1,5 +1,4 @@
 import argparse
-import gc
 import os
 import json
 import time
@@ -34,6 +33,12 @@ except ImportError:  # LightGBM is optional in this workspace.
 
 EPS = 1e-8
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+DEFAULT_TARGET_WINSORIZE = {
+    "enabled": True,
+    "lower_quantile": 0.01,
+    "upper_quantile": 0.99,
+}
+DEFAULT_RIDGE_ALPHA = 2.0
 
 
 @dataclass(frozen=True)
@@ -53,8 +58,6 @@ class RollingFold:
     val_dates: tuple
 
 
-from feat_engine import FeatureBuilder
-
 class ExperimentRunner(object):
     def __init__(
         self,
@@ -63,36 +66,41 @@ class ExperimentRunner(object):
         loader_cls=MeowDataLoader,
         feature_loader=None,
         feature_loader_cls=FeatureLoader,
+        target_winsorize_config=None,
+        feature_dtype="float32",
+        ridge_alpha=DEFAULT_RIDGE_ALPHA,
     ):
         """
         实验执行器。
 
-        M4 开始承担两条职责：
-        1. 保留旧接口，继续提供模型训练/评估逻辑。
-        2. 默认注入 FeatureLoader，让主链路优先走磁盘特征缓存。
-
-        兼容策略：
-        - 旧的 raw/build/cache 逻辑先不删除，便于回归比对和逐步迁移。
-        - 真正的数据加载优先走 `self.feature_loader`；只有显式不给 loader 时，
-          才会回退到旧的 `load_feature_split()`。
+        当前阶段只保留一条正式数据链路：
+        - 训练/评估逻辑继续放在 runner 内部；
+        - 特征加载统一走 FeatureLoader，不再回退旧版 FeatureBuilder/cache。
         """
         self.calendar = Calendar()
         self.h5dir = h5dir
         self.feature_dir = feature_dir
+        # #16：默认特征以 float32 进入训练；保留显式切回 float64 的入口，
+        # 供数值一致性验收和调试使用。
+        self.feature_dtype = feature_dtype
+        # #18：把标准 ridge 主路径的 alpha 收口成 runner 级参数，
+        # 便于 P0.5 扫描 / 锁定，而不是继续靠手改硬编码。
+        self.ridge_alpha = self._normalize_ridge_alpha(ridge_alpha)
+        # 仅保留底层原始数据 loader 引用，供上层读取 h5dir 等环境信息；
+        # 正式特征链路仍统一走 FeatureLoader。
         self.loader = loader_cls(h5dir=h5dir)
         self.feature_loader = feature_loader or feature_loader_cls(
             h5dir=h5dir,
             feature_dir=feature_dir,
             loader_cls=loader_cls,
+            feature_dtype=feature_dtype,
         )
-        self.builder = FeatureBuilder()
-        self._split_cache = {}
-        self._raw_split_cache = {}
-        self._daily_feature_cache = {}
-        self._daily_raw_cache = {}
-
-    def _cache_key(self, dates, max_days=None):
-        return (tuple(dates), max_days)
+        # 训练标签 winsorize 作为统一评测口径挂在 runner 级别，
+        # 这样主进程、串行评测、并行 worker 都会走同一份配置，
+        # 避免“命令行开了，但子进程没生效”的口径漂移。
+        self.target_winsorize_config = self._normalize_target_winsorize_config(
+            target_winsorize_config
+        )
 
     def _normalize_groups(self, groups):
         if groups is None:
@@ -104,11 +112,49 @@ class ExperimentRunner(object):
             return None
         return groups
 
-    def _filter_features(self, xdf, groups):
-        groups = self._normalize_groups(groups)
-        if groups is None:
-            return xdf
-        return self.builder.select_groups(xdf, groups)
+    def _normalize_target_winsorize_config(self, config):
+        """
+        统一清洗训练标签 winsorize 配置。
+
+        约束：
+        - 允许完全关闭（enabled=False）
+        - 打开时必须满足 0 <= lower < upper <= 1
+        - 默认口径在 P0.5 扫描后锁为 P1 / P99
+        """
+        merged = dict(DEFAULT_TARGET_WINSORIZE)
+        if config:
+            merged.update(config)
+        merged["enabled"] = bool(merged.get("enabled", True))
+        merged["lower_quantile"] = float(merged.get("lower_quantile", 0.01))
+        merged["upper_quantile"] = float(merged.get("upper_quantile", 0.99))
+        lower_q = merged["lower_quantile"]
+        upper_q = merged["upper_quantile"]
+        if not (0.0 <= lower_q < upper_q <= 1.0):
+            raise ValueError(
+                "target_winsorize_config 非法：要求 0 <= lower_quantile < upper_quantile <= 1"
+            )
+        return merged
+
+    def get_target_winsorize_config(self):
+        """返回当前 runner 使用的 winsorize 配置副本，供调度层透传给 worker。"""
+        return dict(self.target_winsorize_config)
+
+    def _normalize_ridge_alpha(self, ridge_alpha):
+        """
+        统一校验标准 ridge 主路径的 alpha。
+
+        约束很简单：
+        - 必须能转成 float
+        - 必须严格大于 0，避免把模型推进到非法或退化状态
+        """
+        value = float(ridge_alpha)
+        if value <= 0.0:
+            raise ValueError("ridge_alpha 必须 > 0")
+        return value
+
+    def get_ridge_alpha(self):
+        """返回当前 runner 的标准 ridge alpha，供协议层写盘和 worker 透传。"""
+        return float(self.ridge_alpha)
 
     def _regime_state(self, xdf):
         state_cols = [c for c in ["regime_low", "regime_mid", "regime_high"] if c in xdf.columns]
@@ -165,57 +211,36 @@ class ExperimentRunner(object):
             return merged["fret12_residual"].to_numpy(dtype=np.float32), baseline
         raise ValueError(f"Unknown target mode: {target_mode}")
 
+    def _apply_target_winsorize(self, target_array):
+        """
+        仅对训练目标做 winsorize。
+
+        这里故意只接收已经构造好的训练目标数组，而不是直接改 `ytrain` DataFrame：
+        - 保证测试 / 提交路径完全不受影响，仍然保留原始 `fret12`
+        - 无论 target_mode 是 raw 还是 residual，都是“只改训练时喂给模型的 y”
+        - 返回裁剪后的数组 + 裁剪边界，便于日志和真实跑数审计
+        """
+        cfg = self.target_winsorize_config
+        values = np.asarray(target_array, dtype=np.float32)
+        if not cfg.get("enabled", True) or values.size == 0:
+            return values, None
+        lower_q = cfg["lower_quantile"]
+        upper_q = cfg["upper_quantile"]
+        lower = float(np.quantile(values, lower_q))
+        upper = float(np.quantile(values, upper_q))
+        clipped = np.clip(values, lower, upper).astype(np.float32, copy=False)
+        return clipped, {
+            "lower_quantile": lower_q,
+            "upper_quantile": upper_q,
+            "lower_bound": lower,
+            "upper_bound": upper,
+        }
+
     def split_dates(self, split_config):
         train_dates = self.calendar.range(split_config.train_start, split_config.train_end)
         val_dates = self.calendar.range(split_config.val_start, split_config.val_end)
         test_dates = self.calendar.range(split_config.test_start, split_config.test_end)
         return train_dates, val_dates, test_dates
-
-    def load_split(self, dates, max_days=None):
-        cache_key = self._cache_key(dates, max_days=max_days)
-        if cache_key in self._split_cache:
-            xdf, ydf = self._split_cache[cache_key]
-            return xdf, ydf
-        if max_days is not None:
-            dates = dates[:max_days]
-        x_parts = []
-        y_parts = []
-        for date in dates:
-            if date in self._daily_feature_cache:
-                xdf, ydf = self._daily_feature_cache[date]
-            else:
-                log.inf(f"Loading and featurizing {date}...")
-                raw = self.loader.loadDate(date)
-                xdf, ydf = self.builder.build(raw)
-                self._daily_feature_cache[date] = (xdf, ydf)
-                del raw
-                gc.collect()
-            x_parts.append(xdf)
-            y_parts.append(ydf)
-        xdf = pd.concat(x_parts, ignore_index=True)
-        ydf = pd.concat(y_parts, ignore_index=True)
-        self._split_cache[cache_key] = (xdf, ydf)
-        return xdf, ydf
-
-    def load_raw_split(self, dates, max_days=None):
-        cache_key = self._cache_key(dates, max_days=max_days)
-        if cache_key in self._raw_split_cache:
-            return self._raw_split_cache[cache_key]
-        if max_days is not None:
-            dates = dates[:max_days]
-        parts = []
-        for date in dates:
-            if date in self._daily_raw_cache:
-                parts.append(self._daily_raw_cache[date])
-            else:
-                log.inf(f"Loading raw {date}...")
-                raw = self.loader.loadDate(date)
-                self._daily_raw_cache[date] = raw
-                parts.append(raw)
-                gc.collect()
-        raw = pd.concat(parts, ignore_index=True)
-        self._raw_split_cache[cache_key] = raw
-        return raw
 
     def _build_sequence_features(self, raw_df, lags):
         raw_df = raw_df.copy()
@@ -257,11 +282,6 @@ class ExperimentRunner(object):
         ydf = ydf.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return xdf, ydf
 
-    def load_feature_split(self, dates, max_days=None, groups=None):
-        xdf, ydf = self.load_split(dates, max_days=max_days)
-        xdf = self._filter_features(xdf, groups)
-        return xdf, ydf
-
     def _load_group_split(self, dates, groups=None, max_days=None, loader=None):
         """
         统一的数据加载入口。
@@ -269,16 +289,15 @@ class ExperimentRunner(object):
         优先级：
         1. 调用方显式传入的 loader（供 scheduler / trainer 注入）
         2. runner 自身持有的 FeatureLoader
-        3. 旧版 `load_feature_split()` 兜底
 
-        这样做的目的是把“主链路切到 FeatureLoader”收敛成一处改动，
-        避免每个实验分支各自维护一套加载逻辑。
+        旧版 `feat_engine -> load_feature_split` 链路已经归档；
+        如果这里拿不到 loader，说明调用方绕开了当前正式入口，应立即失败。
         """
         if max_days is not None:
             dates = dates[:max_days]
         active_loader = loader or self.feature_loader
         if active_loader is None:
-            return self.load_feature_split(dates, max_days=None, groups=groups)
+            raise RuntimeError("FeatureLoader is required: 旧版 feat_engine 加载链已归档，不再允许回退。")
         return active_loader.load(dates, groups=groups)
 
     def evaluate_predictions(self, ydf, pred):
@@ -410,7 +429,7 @@ class ExperimentRunner(object):
         else:
             model = Pipeline([
                 ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=2.0, fit_intercept=True, random_state=None)),
+                ("model", Ridge(alpha=self.ridge_alpha, fit_intercept=True, random_state=None)),
             ])
             model.fit(
                 common_df[common_feature_cols].to_numpy(dtype=np.float32),
@@ -508,10 +527,22 @@ class ExperimentRunner(object):
         feature_cols = [c for c in xtrain.columns if c not in ["date", "symbol", "interval"]]
         x = xtrain[feature_cols].to_numpy(dtype=np.float32)
         y, baseline = self._make_target_series(ytrain, target_mode=target_mode)
+        y, winsor_info = self._apply_target_winsorize(y)
+        if winsor_info is None:
+            log.inf("Target winsorize: disabled")
+        else:
+            log.inf(
+                "Target winsorize: q=({lq:.3f}, {uq:.3f}) bounds=({lb:.6f}, {ub:.6f})".format(
+                    lq=winsor_info["lower_quantile"],
+                    uq=winsor_info["upper_quantile"],
+                    lb=winsor_info["lower_bound"],
+                    ub=winsor_info["upper_bound"],
+                )
+            )
         if model_name == "ridge":
             model = Pipeline([
                 ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=2.0, fit_intercept=True, random_state=None)),
+                ("model", Ridge(alpha=self.ridge_alpha, fit_intercept=True, random_state=None)),
             ])
         elif model_name == "elasticnet":
             model = Pipeline([

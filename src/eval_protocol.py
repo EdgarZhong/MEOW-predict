@@ -803,6 +803,9 @@ class EvaluationProtocolRunner:
                 h5dir,
                 feature_dir=feature_dir,
                 n_workers=n_workers,
+                target_winsorize_config=self.runner.get_target_winsorize_config(),
+                feature_dtype=getattr(self.runner, "feature_dtype", "float32"),
+                ridge_alpha=self.runner.get_ridge_alpha(),
             )
             if _fold_metrics_csv:
                 scheduler.set_output_path(_fold_metrics_csv)
@@ -911,6 +914,9 @@ class EvaluationProtocolRunner:
                 "specs": [s["experiment_id"] for s in specs],
                 "max_folds": max_folds,
                 "baseline_id": baseline_id,
+                "target_winsorize_config": self.runner.get_target_winsorize_config(),
+                "feature_dtype": getattr(self.runner, "feature_dtype", "float32"),
+                "ridge_alpha": self.runner.get_ridge_alpha(),
                 "include_review_holdout": include_review_holdout,
                 "include_final_holdout": include_final_holdout,
                 "review_train_start": review_train_start,

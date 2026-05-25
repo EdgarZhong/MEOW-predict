@@ -8,6 +8,10 @@
 
 **当前唯一主线：开跑前债务清零。** 用户硬约束（2026-05-25）：正式开 P1 跑实验前，不允许残留任何工程/口径债务。所有 specs 工程项（`docs/specs/开跑前编码指导_评测口径与提速.md`）+ PE1 收尾 + P0.5 锁超参 + 提交通道，必须全部清完并跑冒烟验证，才能开 P1。冲刺看板见下方「开跑前债务清零冲刺」，A→E 档按序推进。
 
+**本轮新增执行约束（2026-05-25，本会话确认）**：
+- `#17-#19` 全部基于当前特征现状推进，**不重建特征缓存 / 不重跑 feature build 来刷新列集**；仅在 `#19` 验收项里按看板要求执行一次全量构建计时。
+- `#16` 验收已通过后，后续所有跑数默认统一走 `float32` 特征路径；若需要 `float64`，仅允许作为数值对照或排障手段，不能作为正式跑数口径。
+
 ## 当前口径收敛（指针表）
 
 CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 NOTE。
@@ -41,7 +45,7 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 
 > **接手须知（无会话上下文也能实施）**：实施总规格 = `docs/specs/开跑前编码指导_评测口径与提速.md`（下称「编码指导」）+ `AGENTS.md`。每项已标：实施指针 / 关键约束 / 验收 / 依赖 / 状态。按 A→E 推进。依赖：#17 须等 #16 通过、#18 须等 #15 就绪。commit 纪律：一条一提交（编码指导总原则 3）。
 >
-> **接手第一步**：① 读 `AGENTS.md` + 本看板；② 验现状健康：`PYTHONPATH=src python tests/test_eval_protocol.py`（11 条应全过）、`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick`（应 exit 0，run 目录含 leaderboard/manifest_snapshot/resolved_columns/config）；③ **不要先做 #16**，先做下方新增的 **S1「提交链收口」**，把 `meow/` 纳入主仓库并收成正式提交入口包装层。当前工作区除 `meow/` 外，还包含 **#14、#15 已完成但未提交** 的改动（见下）。
+> **接手第一步**：① 读 `AGENTS.md` + 本看板；② 验现状健康：`PYTHONPATH=src python tests/test_eval_protocol.py`、`PYTHONPATH=src python tests/test_experiment_runner.py`、`PYTHONPATH=src python tests/test_submission_pipeline.py`、`PYTHONPATH=src python -m unittest -v tests.test_feature_loader`、`PYTHONPATH=src python -m unittest -v tests.test_scheduler`（当前合计 18 条应全过）、`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick`（应 exit 0，run 目录含 leaderboard/manifest_snapshot/resolved_columns/config）；③ `#16` 已完成，下一步进入 **#17（D 档）**。当前工作区除 `meow/` 外，还包含 **#14、#15、#16 已完成但未提交** 的改动（见下）。
 
 **A 档 评测口径代码化 —— ✅ 已完成（commit `2ebb5fb`）**
 - ✅ #10 make_decision 硬契约 + 单测（编码指导§4 / AGENTS §4.6）
@@ -82,30 +86,58 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
   - 说明开关真实生效，但是否采用默认 `P0.5/P99.5` 仍留待 #18 在 short+medium 正式扫锁
 - **下一步**：进入 #16（float32 验收）
 
-**S 档 提交链收口 —— S1【🔴 立刻执行，优先级高于 #16】**
-- **为什么现在插队**：
-  - 老师最终口令已明确为 `python meow.py`；当前实验 driver 与 `meow/` 入口不是同一条真实执行链
-  - 若先继续做 `#16/#17/#18`，存在“优化的是实验系统，不是老师最终会跑的系统”的风险
-- **任务目标**：把 `meow/` 收成老师正式提交入口包装层，同时保持 `src/` 为唯一核心后端；分叉仅允许发生在 driver 编排与特征物化方式。
-- **实现规格**：详见 `docs/specs/meow提交通道收口规格.md`
-- **验收**：
-  - `meow/` 文件已被主仓库跟踪
-  - `cd meow && python meow.py` 在真实数据上可直接训练 + 预测 + 评测
-  - 提交链和实验链在同一切分上的特征列/训练口径/预测输出一致
-  - `winsorize` 在 `meow.py` 训练链中真实生效，而不是只存在于实验 driver
-- **预估工作量**：
-  - 设计澄清 + 仓库归并：0.5 小时
-  - 薄包装与桥接实现：2~4 小时
-  - `meow.py` 端到端闭环与修 bug：1~3 小时
-  - **合计：半天到 1 天；若出现 train/serve skew 或缓存耦合问题，按 1 天看**
+**S 档 提交链收口 —— S1【✅ 已完成，已提交 `2710a1f`】**
+- **完成时间**：2026-05-25 本轮接手已落地。
+- **结果摘要**：
+  - `meow/` 已移出嵌套仓库状态并纳入主仓库跟踪
+  - `src/submission_pipeline.py` 已落地为正式提交桥接层：原始数据现算正式特征 + 复用 `experiment_runner` 训练/推理核心
+  - `meow.py / feat.py / mdl.py` 已改为正式提交包装层，保持老师 `python meow.py` 入口不变
+  - 提交通道显式不依赖 `data/features/` 持久化缓存；`mdl.py` 内部已把 `feature_dir` 指向不存在路径作为防误用保险丝
+- **验收结果**：
+  - 单测：`tests/test_submission_pipeline.py` 2/2 通过
+  - 真实提交通道闭环：`cd meow && MEOW_TRAIN_START=20230601 MEOW_TRAIN_END=20230605 MEOW_EVAL_START=20230606 MEOW_EVAL_END=20230606 python meow.py` 已通过；本会话已复验通过
+  - 日志可见正式特征现算、训练标签 winsorize、生效后的训练与评测摘要
+- **规格文档**：`docs/specs/meow提交通道收口规格.md`
+- **下一步**：回到 #16（float32 验收）
 
 **D 档 expanding 提速**
-- #16 特征 float32（编码指导§2b；改 `src/feature_loader.py`）。**验收（硬）**：同 spec 同 fold，float32 vs float64 `protocol_corr` 差 |Δcorr|<1e-4，不达标不合入。**注意：S1 完成前暂停。**
-- #17 关口提速（编码指导§2a/§2c；改 `src/scheduler.py` + `experiments/p0_eval_protocol.py`）：① 关口只评候选+基线 2 spec ② group 按 fold 序号成本均衡切分（不连续切）③ heavy 批次 2 worker。**硬前提：#16 验收通过才开 2 worker，否则维持串行**。验收：2 spec / 2 worker 无 OOM、~30min。依赖 #16。**注意：S1 完成前暂停。**
+- #16 特征 float32【✅ 已完成，待提交】（编码指导§2b；`src/feature_loader.py` / `src/experiment_runner.py` / `src/scheduler.py` / `src/eval_protocol.py`）
+  - **完成时间**：2026-05-25 本轮接手已落地。
+  - **代码结果**：
+    - `FeatureLoader` 新增 `feature_dtype` 收口，默认特征列在加载后统一转 `float32`，并保留 `float64/None` 对照入口供数值验收复用
+    - `ExperimentRunner` / `ParallelScheduler` / `EvaluationProtocolRunner` 已把 `feature_dtype` 透传到串行、并行与 `config.json`，避免主进程与 worker 口径漂移
+    - 新增 `tests/test_feature_loader.py`，锁默认 `float32`、显式 `float64`、`None` 原样保留、非法 dtype 早失败四条约束
+  - **硬验收结果**：
+    - 同 spec 同 fold 数值对照：`R02_ridge_legacy_plus_norm_core`，`short_8d_2d` 首折（train `20230601~20230612`，val `20230614~20230615`），`val_corr_float32=0.04146936915522309`，`val_corr_float64=0.04146936915522309`，`|Δcorr|=0.0 < 1e-4`
+    - 端到端冒烟：`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick --run-id 20260525_d16_quick_smoke_v2` 已通过
+    - 回归测试：`PYTHONPATH=src python -m unittest -v tests.test_feature_loader tests.test_experiment_runner tests.test_submission_pipeline` 9/9 通过；`PYTHONPATH=src python tests/test_eval_protocol.py` 8/8 通过
+  - **下一步**：进入 #17（关口提速）
+- #17 关口提速（编码指导§2a/§2c；改 `src/scheduler.py` + `experiments/p0_eval_protocol.py`）：① 关口只评候选+基线 2 spec ② group 按 fold 序号成本均衡切分（不连续切）③ heavy 批次 2 worker。**#16 已验收通过，可开始实施 2 worker 路径。** 验收：2 spec / 2 worker 无 OOM、~30min。依赖 #16。
+  - **本轮执行补充**：实现与验证均基于现有特征产物推进，不触发特征重建；正式关口跑默认 `feature_dtype=float32`。
+  - **代码状态**：已落地 `suite=gate`（候选+基线 2 spec），并把 heavy profile 的 fold 切组改为按训练窗口成本贪心均衡到 2 组；新增 `tests/test_scheduler.py` 锁住“非连续切组 + 成本接近”约束。
+  - **最小验收（已通过）**：`PYTHONPATH=src python -m unittest -v tests.test_scheduler` 1/1 通过；`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite gate --candidate-spec-id R03_ridge_legacy_plus_patch_summary --max-folds 2 --run-id 20260525_d17_gate_smoke_v1` 已通过，2 worker/2 group/4 job 正常完成，墙钟 `214.8s`，无 OOM。
+  - **完整验收（未通过，已推后）**：
+    - 全量 `expanding` 的 `2 spec / 2 worker` 关口验收未通过，当前这台 16GB Mac **不能采纳“双并行 expanding 尾段”** 作为正式关口跑法。
+    - 最重单组（`expanding_40d_5d_g0`，fold `0/3/4/7/8/11`，最大训练窗 `95` 天）已用 `run_with_memory_guard.py` 做定点观测：`logs/memory_guard_20260525_d17_max_group.log` 记录到单组峰值 RSS `8.34 GB`。
+    - 结合当前均衡切组结果，双并行尾段近似对应 `95 + 90 ≈ 185` 个训练日同时在内存中；按单组观测线性外推，当前 16GB Mac 无法稳定承受。
+    - **当前阶段结论**：除“两个 `expanding` heavy group 同时跑、且落在 `90/95` 天尾段”这一最高压力场景外，这台 Mac 对其余已验证场景（如 `long` 双并行、`gate` 小规模 smoke、单个最重 group）基本可承受。
+    - **处理决定**：`#17` 的“full expanding 2-worker 验收”推后，不阻塞其余工作；后续若换 32GB 级别机器，再重开该完整验收。
 
 **E 档 跑实验收尾**
 - #18 P0.5 alpha+winsorize 扫锁（AGENTS §7.7）：仅 R02、仅 short+medium；alpha {0.5,1,2,5,10,20} × clip {P0.5/P99.5, P1/P99, 不裁} 一起扫，各取平台中心锁死，固化进标准 ridge 路径；per-fold alpha 留 P4。依赖 #15。~15–20min。
-- #19 OOM 冒烟 + 全量构建计时：daily suite 跑一轮无 OOM/无 worker 异常；`python -m feature_store build --all` ≤20min。可叠 `run_with_memory_guard.py` + `caffeinate`。
+  - **代码状态**：`ExperimentRunner / ParallelScheduler / EvaluationProtocolRunner / experiments/p0_eval_protocol.py / src/submission_pipeline.py` 已新增 `ridge_alpha` 正式透传，标准 ridge 主路径不再依赖硬编码 `2.0`；新增脚本 `experiments/p05_lock_ridge_alpha_and_winsorize.py` 承接批量扫描。
+  - **最小验收（已通过）**：`PYTHONPATH=src python -m unittest -v tests.test_experiment_runner` 4/4 通过；`PYTHONPATH=src python experiments/p05_lock_ridge_alpha_and_winsorize.py --alphas 2 --winsor-labels clip_p005_p995 --max-folds 1 --run-id 20260525_e18_smoke_v1` 已通过，成功写出 `results/p05_alpha_winsorize/20260525_e18_smoke_v1_summary.csv`。
+  - **正式扫描（已完成）**：
+    - `caffeinate -i env PYTHONPATH=src python experiments/p05_lock_ridge_alpha_and_winsorize.py --run-id 20260525_e18_full_v1`
+    - 汇总：`results/p05_alpha_winsorize/20260525_e18_full_v1_summary.csv`
+  - **锁定结论**：
+    - `winsorize` 正式默认锁为 **开启 + `P1/P99`**
+    - `ridge_alpha` 继续锁为 **`2.0`**（平台区中部）
+    - 依据：`clip_p01_p99` 的最佳 `protocol_corr_mean≈0.054181`，高于 `clip_p005_p995≈0.054123` 与 `clip_off≈0.053483`；而 `clip_p01_p99` 内部 `alpha=0.5~20` 的 `protocol_corr_mean` 波动仅约 `1.0e-5`
+  - **回归验证**：
+    - `PYTHONPATH=src python -m unittest -v tests.test_experiment_runner` 4/4 通过
+    - `PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick --run-id 20260525_e18_postlock_quick_v1` 已通过，日志确认默认 `target winsorize: True q=(0.010, 0.990)`、`ridge alpha: 2.0`
+- #19 OOM 冒烟 + 全量构建计时：daily suite 跑一轮无 OOM/无 worker 异常；`python -m feature_store build --all` ≤20min。可叠 `run_with_memory_guard.py` + `caffeinate`。**除该计时验收本身外，不额外触发 feature build；daily 冒烟默认 `float32`。**
 - #20 meow.py 提交通道（AGENTS §十一）：在一个 held-out 交易日跑通 `genFeatures→predict→forecast`，列对齐、每行有限、输出回 raw `fret12`、不依赖本地缓存/不可见统计量。**该项并入 S1 实施与验收，不再独立后置。** P1 前强制。
 
 > 下方 PE0/PE1/P0.5 等节仅留背景；待办均已并入本冲刺看板。
