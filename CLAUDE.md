@@ -37,25 +37,42 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 
 ## 任务看板
 
-### ⭐ 开跑前债务清零冲刺【当前唯一焦点 · 进行中】
+### ⭐ 开跑前债务清零冲刺【当前唯一焦点】
 
-任务系统 #10–#20。A→E 按序；D 档 #17(2worker) 须等 #16(float32验收) 通过、E 档 #18(P0.5) 须等 #15(winsorize) 就绪。
+> **接手须知（无会话上下文也能实施）**：实施总规格 = `docs/specs/开跑前编码指导_评测口径与提速.md`（下称「编码指导」）+ `AGENTS.md`。每项已标：实施指针 / 关键约束 / 验收 / 依赖 / 状态。按 A→E 推进。依赖：#17 须等 #16 通过、#18 须等 #15 就绪。commit 纪律：一条一提交（编码指导总原则 3）。
 
-| 档 | 任务 | # | 验收 |
-|---|---|---|---|
-| A | make_decision 硬契约 + 3 条单测 | #10 | 3 条断言过(delta=0.004→review / 缺expanding不promote / 强负折不promote) |
-| A | 日常 suite 默认改 short+long | #11 | 日常跑只跑 short+long、~10-15min |
-| A | 每日 IC-IR 并进 leaderboard 主视图 | #12 | leaderboard 含每日 IC 均值 + IC-IR 两列 |
-| A | manifest_snapshot + resolved_columns.json 写盘 | #13 | 运行后磁盘有两文件 |
-| B | 删旧 cache + feat_engine 归档 | #14 | 主链路冒烟通过、feat_engine 入 .archive/ |
-| C | 训练目标 winsorize 实现 | #15 | 开关+分位可配、测试/提交回 raw fret12 |
-| D | 特征 float32 + 同折数值对照验收 | #16 | 同折 \|Δcorr\|<1e-4 |
-| D | expanding 关口:成本均衡切分+候选vs基线+2worker | #17 | 2 spec / 2 worker 无 OOM、~30min |
-| E | P0.5:alpha + winsorize 一次性扫锁 | #18 | 取平台中心锁死，固化进标准 ridge |
-| E | OOM 冒烟 + 全量构建计时 | #19 | 日常 suite 无 OOM、build --all ≤20min |
-| E | meow.py 提交通道在 held-out 日跑通 | #20 | forecast 列对齐、每行有限、回 raw fret12 |
+**A 档 评测口径代码化 —— ✅ 已完成（commit `2ebb5fb`）**
+- ✅ #10 make_decision 硬契约 + 单测（编码指导§4 / AGENTS §4.6）
+- ✅ #11 daily suite（short+long）并设默认（编码指导§1）
+- ✅ #12 每日 IC 均值 + IC-IR 进 leaderboard（编码指导§5）
+- ✅ #13 manifest_snapshot + resolved_columns.json 写盘
+- 验证：quick suite 端到端冒烟通过 + 8 条单测（`tests/test_eval_protocol.py`）全过
 
-> 下方 PE1/P0.5/两速suite/提交通道各节的待办已并入本冲刺看板，原节仅留背景。
+**B 档 PE1 清理与归档 —— #14【决策已定，待实施】**
+- **决策（2026-05-25 本会话定）**：legacy 旧实验脚本不再保留可运行，连同其依赖的旧加载链一起归档。
+- **归档清单（移到 `.archive/`，不是删除）**：
+  - `src/feat_engine.py`（FeatureBuilder 本体）
+  - `experiments/legacy/run_516v3_*.py`（仅这些依赖旧链的旧脚本）
+  - `src/experiment_runner.py` 内旧加载链：`load_split` / `load_raw_split` / `load_feature_split` / `_filter_features` / `self.builder`（FeatureBuilder 实例）/ 三个 cache dict（`_split_cache`/`_raw_split_cache`/`_daily_feature_cache`）/ `from feat_engine import FeatureBuilder`
+- **保留**：`_load_group_split`（主链路加载入口，走 FeatureLoader）；其「兜底回退旧 load」分支改为明确 `raise`（旧链已归档，不应再回退）。
+- **验收**：① daily suite 冒烟通过 ② `grep -rn feat_engine src/` 无残留 import ③ legacy 脚本已不在 `experiments/legacy/`。
+- ⚠️ 破坏性归档：逐文件移 `.archive/`，每步后跑冒烟，禁止一次性批量删。
+
+**C 档 winsorize —— #15**
+- 实施指针：编码指导§6 + AGENTS §7.11；改 `src/experiment_runner.py` 构造 `ytrain` 处（StandardScaler 前）。
+- 关键约束：只裁训练标签 `ytrain`（训练集分位、非对称）；测试/提交永远输出原始 `fret12`；开关 + 分位可配，clip 候选 {P0.5/P99.5, P1/P99, 不裁}。
+- 验收：开关与分位可配，锁定后 P1–P3 不逐 spec 调。依赖：供 #18 扫锁。
+
+**D 档 expanding 提速**
+- #16 特征 float32（编码指导§2b；改 `src/feature_loader.py`）。**验收（硬）**：同 spec 同 fold，float32 vs float64 `protocol_corr` 差 |Δcorr|<1e-4，不达标不合入。
+- #17 关口提速（编码指导§2a/§2c；改 `src/scheduler.py` + `experiments/p0_eval_protocol.py`）：① 关口只评候选+基线 2 spec ② group 按 fold 序号成本均衡切分（不连续切）③ heavy 批次 2 worker。**硬前提：#16 验收通过才开 2 worker，否则维持串行**。验收：2 spec / 2 worker 无 OOM、~30min。依赖 #16。
+
+**E 档 跑实验收尾**
+- #18 P0.5 alpha+winsorize 扫锁（AGENTS §7.7）：仅 R02、仅 short+medium；alpha {0.5,1,2,5,10,20} × clip {P0.5/P99.5, P1/P99, 不裁} 一起扫，各取平台中心锁死，固化进标准 ridge 路径；per-fold alpha 留 P4。依赖 #15。~15–20min。
+- #19 OOM 冒烟 + 全量构建计时：daily suite 跑一轮无 OOM/无 worker 异常；`python -m feature_store build --all` ≤20min。可叠 `run_with_memory_guard.py` + `caffeinate`。
+- #20 meow.py 提交通道（AGENTS §十一）：在一个 held-out 交易日跑通 `genFeatures→predict→forecast`，列对齐、每行有限、输出回 raw `fret12`、不依赖本地缓存/不可见统计量。P1 前强制。
+
+> 下方 PE0/PE1/P0.5 等节仅留背景；待办均已并入本冲刺看板。
 
 ### PE0 实验平台并发改造【已完成】
 
@@ -69,39 +86,18 @@ CLAUDE 不复述规则，只给指针；规则正文在 AGENTS，"为什么"在 
 - 当前状态：FeatureRegistry / FeatureStore / FeatureLoader 三件套首版 + 单测均通过（M1–M4）；主链路（trainer / scheduler / eval_protocol）已切到 FeatureLoader；9 个 stage 合并 462 列与旧管道一致。
 - 调度与内存（已落地）：scheduler 改 light/heavy 两批（light 沿用 4 worker，heavy 降到 2）；`experiments/run_with_memory_guard.py` RSS 看门狗（软 12GB/30s + 硬 13GB 击杀）。16GB Mac 上 heavy 批次并发 ≤ 2。
 
-剩余项：
-- [ ] `experiment_runner.py` 瘦身：删旧 cache dict + load 系列方法（现暂留作回归基准）
-- [ ] `eval_protocol.py`：运行时保存 manifest_snapshot + resolved_columns.json
-- [ ] `feat_engine.py` builder 迁入 registry，旧文件归档 `.archive/`
-- [ ] 正确性验证：新旧管道同 spec 同日期特征输出 allclose
-- [ ] OOM 验证：日常 suite 完成无异常
-- [ ] 全量构建 `python -m feature_store build --all` ≤ 20 min
+剩余项（已并入上方冲刺看板，此处不重复列）：
+- #13 manifest/resolved_columns 写盘 → ✅ 已完成
+- #14 清理旧 cache/load 链 + `feat_engine` 归档（含 legacy 脚本，本会话决策）
+- #19 OOM 冒烟 + 全量构建 ≤20min
+- 「新旧管道 allclose 验证」**取消**：legacy 旧管道按 #14 归档后已无对照对象；新管道已由 P0 基线产出验证可用，无需再比。
 
 ### P0 扩展 rolling 评测体系【工程完成，基线已产出】
 
 - 三层协议 + 4 profiles + 输出结构（fold_manifest / fold_metrics / profile_summary / leaderboard）+ baseline delta + make_decision + 主入口均完成。
-- `--suite ridge` 已分段跑通（见上"当前最优基线"）。
+- `daily` / `ridge` / `full` suite 可跑（基线见上"当前最优基线"）。
 
-### P0.5 alpha + winsorize 一次性扫描与锁定【下一步即时任务】
-
-进 P1 前一次性扫定、然后锁死（P1–P3 不再逐 spec 调）：
-- [ ] 轻量扫描入口：仅 R02、仅 short+medium（标定刻意用 medium 折多，AGENTS §7.7 有意例外）
-- [ ] alpha 扫 `{0.5,1,2,5,10,20}`、winsorize clip 扫 `{P0.5/P99.5, P1/P99, 不裁}`，一起扫
-- [ ] 各取平台中心锁定，固化进标准 ridge 路径；per-fold alpha 留 P4
-- 预算：~15–20 min
-
-### 落地两速 suite + expanding 提速【与 P0.5 并行，编码】
-
-实施规格见 `docs/specs/开跑前编码指导_评测口径与提速.md`（两边都不直接改代码，由 coding agent 实施）：
-- [ ] 日常 suite 默认 profiles = short + long（medium 移出日常，可 ad-hoc 单跑）
-- [ ] expanding 关口跑法：候选 vs 基线 2 spec + float32 + 2 worker 成本均衡切分（**2 worker 须 float32 数值验收通过后才开，否则维持串行**；明确不做增量正规方程）
-- [ ] make_decision 硬契约 + 3 条单测（AGENTS §4.6）
-- [ ] 每日 IC、IC-IR 并进 leaderboard 主视图（零额外成本）
-- [ ] 训练目标 winsorize 实现（AGENTS §7.11，与 P0.5 一起扫锁）
-
-### 提交通道打通【P1 前强制】
-
-- [ ] 在一个 held-out 交易日跑通 `meow.py`：`genFeatures → predict → forecast` 列对齐、每行有限（AGENTS §十一）
+> P0.5（#18）、两速 suite 与 expanding 提速（#10 / #11 / #12 ✅ + #15 / #16 / #17）、提交通道（#20）的待办均已并入上方「开跑前债务清零冲刺」，此处不再重复，避免文档矛盾。
 
 ### P1 / P2 / P3 特征组验证【等上面就绪】
 
