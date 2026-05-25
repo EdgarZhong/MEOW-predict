@@ -57,24 +57,22 @@ MSE / R²             不明显恶化
 
 如果某一类特征只让一个 fold 变好，其他 fold 变差，则放弃。
 
-### 4.2 Per-profile 一致性检查（protocol 分数通过后必做）
+### 4.2 两速评测结构与 profile 分工
 
-`protocol_stability_score` 只是第一道筛选器，通过后必须手动检查 per-profile 明细：
+四个 rolling profile 本质是同一根轴上的四个采样点——"训练用多少历史"：short(8天) → medium(20天) → long(40天) → expanding(40天起步、滚动累积到约95天)。medium、long 是这根轴的中间插值，信息冗余；真正互补的是两端——short 折最多、最便宜，expanding 唯一模拟"用到目前为止的全部历史、往前预测"，最像老师那场隐藏测试。
 
-**必须核查的项目：**
-- 4 个 profile 中至少 3 个的 `delta_corr > 0`（跨窗口长度一致性）
-- 各 profile 的 `rolling_corr_min` 不出现强负值
-- short 与 expanding 的结论方向一致（两者相反则信号对训练历史长度敏感，标记为 review）
+据此把评测分成两速。**核心原则：搜索用便宜的快车道，提交用昂贵的慢车道；最可信的那个判官（expanding）要少看——同一窗口看多了会被过拟合，不再可信（见 §4.3）。**
 
-**信号强度分级（基于 105 天数据的置信度）：**
+| 车道 | 跑什么 | 任务 | 频率 |
+|---|---|---|---|
+| 快车道（筛选） | short + long + 每日 IC | 便宜地否决；靠 short→long 斜率抓"见效快但靠近期"的信号 | 每个候选都跑 |
+| 慢车道（提交关口） | expanding + 每日 IC 拆解 + 11月 Review Holdout | 只用于不可逆的"并入 backbone"决策 | 每批候选定死后只跑一次 |
 
-| 情况 | 结论 |
-|---|---|
-| delta_corr ≥ 0.005，short + medium + expanding 三个 profile 一致 | 有信心，可 promote |
-| delta_corr = 0.003～0.005，2 个以上 profile 一致 | 边界，进 Review Holdout 验证后决策 |
-| delta_corr ≤ 0.003，或仅 1 个 profile 支持 | 不接受 |
-
-**关于 long_40d_5d：** 只有 ~6 折，方差极大。它的负结论（信号在长窗口下明确有害）是有效信息；正结论不单独作为 promote 依据。
+- **快车道为什么是 short + long**：short 出统计功效（折最多），long 出"训练历史拉长后信号还在不在"。一个特征在 short 上涨、到 long 衰减或翻负，就是最危险的"靠近期"信号，当场标记。long 只有 ~6 折、方差大，所以只读它的**方向/是否破**（否决票），不读精确量级。
+- **medium 移出日常**：它是 short 与 long 中间的冗余插值，有了两端的斜率就用不上；需要时可临时单跑，不进日常 suite。
+- **每日 IC 是正交视角**：池化 corr 只说"总分"，每日截面 IC 说"是不是真在同一时刻把股票排对了"。两者一起看才能分清赚的是"大盘的钱"还是"选股的钱"（§4.7 第 4 步）；它从现成预测里就能算，零成本，应与池化 corr 并列看其"均值 ÷ 波动"。
+- **expanding 是慢车道的判官，不进快车道**：它最像真实考试，但慢、要单独跑（与日常 suite 分开、配 memory guard）、且看多了会被过拟合，所以留给提交关口、每批只看一次。
+- 具体采纳阈值见 §4.6（make_decision 机器判定），人工逐 profile 复核方法见 §4.7。
 
 ### 4.3 多重比较与边界增益纪律
 
@@ -86,22 +84,23 @@ Dev Rolling 只有 ~105 个交易日，short profile 实际仅 ~5–6 个独立�
 - 每个阶段开跑前**先固定候选 spec 集合**，一次性跑完一起看；禁止"边加 spec 边重筛"——反复试探等于把 Dev 窗口磨成被过拟合的调参集（garden of forking paths）
 - 对同一份 Dev Rolling 比较的 spec 越多，纯靠运气过线的越多：候选集越大，promote 的一致性与门槛要求越要从严
 
-**口径补充（2026-05-24）：真正的关卡是“跨视角一致性”，不是数字本身。** `0.003~0.005` 这个区间只是一条**安全地板**（低于它别想直接采纳），不是采纳标准。决定采不采纳的，是同一增益有没有被多个互相独立的视角同时印证：4 个 profile 是否同向、每日 IC 是否也改善、11 月 Review Holdout 是否对得上。在测试集完全未知的前提下，宁可保守——这条规则不算太严，是恰当的。
+**口径补充（2026-05-24）：真正的关卡是“跨视角一致性”，不是数字本身。** `0.003~0.005` 这个区间只是一条**安全地板**（低于它别想直接采纳），不是采纳标准。决定采不采纳的，是同一增益有没有被多个互相独立的视角同时印证：short / long / expanding 是否同向、每日 IC 是否也改善、11 月 Review Holdout 是否对得上。在测试集完全未知的前提下，宁可保守——这条规则不算太严，是恰当的。
 
-### 4.4 Profile 分层执行与 expanding 硬门槛
+### 4.4 各阶段评测口径（P1–P5）
 
-隐藏测试是时间外推，`expanding_40d_5d` 最接近真实部署（累积全历史 → 向前预测），是泛化判断里最有代表性的 profile；而日常筛选用的 short/medium 是滑窗，最便宜也最不像真实任务。为同时兼顾成本与代表性，按层执行：
+§4.2 的两速结构落到每个阶段：
 
-| 层 | profiles | 用途 | 频率 |
-|---|---|---|---|
-| 内层筛选 | short + medium | P1–P3 日常换特征筛选 | 随意，目标 ~15–20 min |
-| 负向 veto | long | 候选通过内层后，确认无"长窗口明确有害" | 候选过内层才跑 |
-| promote 硬门槛 | expanding（串行 + memory guard） | 确认时间外推下信号仍成立 | promote 关口**必跑** |
+| 阶段 | 这一步在决策什么 | 评测口径 | 关键诊断 | 频率/成本 |
+|---|---|---|---|---|
+| P1–P3 筛选 | 这个特征组有没有用、稳不稳 | 快车道：short + long + 每日 IC | short→long 斜率；每日 IC | 每候选，~10–15 min |
+| P1–P3 提交关口 | 把候选并入 backbone？ | 慢车道：expanding（候选 vs 基线）+ 每日 IC + 11月 Review | §4.7 六步；§4.6 硬契约 | 每批一次，~30 min |
+| P3.5 交互 | 交互项收不收 | 同筛选，**额外看系数符号稳定性** | 交互极易过拟合 → §4.6 门槛比 P1–P3 更严 | 每候选 |
+| P4 选模型 | 用哪个模型 | short+long 初筛；expanding 只在 2–3 个决赛模型上跑 | 树吃数据、short 对树不公平 → 加权 long/expanding；**minimax：选最差折最好的，不是均值最高的** | 决赛才上 expanding |
+| P5 融合 | 融合 vs 单 backbone | **expanding 为主** + 11月 Review + OOF 预测 | 不比 backbone 更稳就交 backbone；融合在 short 上的增益最像噪声 | 最少次，最高规格 |
 
-- long 的正向结论不单独采信（仅 6 折），故内层**不必每轮跑 long**，避免为否决票付固定大成本
-- **expanding 是 promote 的硬门槛**：任何候选 promote 前必须单独串行跑过 expanding，expanding 上不成立则不得 promote，**不得因为它慢而跳过**
-
-**复核重心（2026-05-24）：** short / medium / long 这三个主要都在测同一件事——“你需要多少训练历史”，信息重复；只有 expanding（用到目前为止的全部历史、往前预测）最像老师那场真实考试。所以复核一个候选时，**以 expanding + 每日 IC 序列为主依据，short / long 退为佐证**。现阶段**不新增 profile**（如按行情分段那种），那是没必要的复杂度。
+- **筛选只产出”候选”，不产出”采纳”**：过了快车道只进候选池，真正并入 backbone 必须过慢车道。
+- **expanding 是 promote 的硬门槛**：任何候选 promote 前必须单独跑过 expanding（与日常 suite 分开、配 memory guard；worker 数等提速口径见 `docs/specs/开跑前编码指导_评测口径与提速.md`），expanding 上不成立则不得 promote，**不得因为它慢而跳过**。这是 §4.6”缺 expanding 最高只能 review”的来源。
+- **P4 起 expanding 更贵**：上树后训练成本高、且无法用线性增量技巧加速，所以只在少数决赛模型上跑，候选集要小。
 
 ### 4.5 组合不可加：叠加后必须重跑
 
@@ -123,10 +122,10 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 |---|---|
 | `delta_corr < 0.003` | `reject` |
 | `0.003 ≤ delta_corr < 0.005` | `review`（送 11 月复核，**禁止直接 promote**） |
-| `delta_corr ≥ 0.005`，且 expanding 已单独跑过且不为负，且 4 个 profile 至少 3 个 `delta_corr>0`，且 `stability_score` 不降，且没有新的强负折 | `promote` |
+| `delta_corr ≥ 0.005`，且 expanding 已单独跑过且不为负，且 short 与 expanding 同向为正、long 不显著翻负，且每日 IC 不恶化，且 `stability_score` 不降，且没有新的强负折 | `promote` |
 | 其它 | `review` |
 
-- **没跑 expanding 就不准 promote**：如果结果里没有 expanding（比如只跑了 short+medium 的 light 批次），`make_decision` 最高只能返回 `review`，不得 `promote`。
+- **没跑 expanding 就不准 promote**：如果结果里没有 expanding（比如只跑了 short+long 的快车道批次），`make_decision` 最高只能返回 `review`，不得 `promote`。
 - **排行榜排序键要改**：头条按 `protocol_corr_mean` 排（这才对齐老师评分，回答“这个大概能打多少分”），`stability_score` 作为并排展示的守门指标——**不要再拿 stability 当第一排序键**。但“采纳”与否仍走上表的鲁棒性门槛，不能因为排在前面就采纳。
 - **必须有单测**：至少覆盖三条断言——“`delta_corr=0.004` 必须返回 `review`”、“缺 expanding 必须不能 promote”、“出现强负折必须不能 promote”。
 
@@ -134,7 +133,7 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 `make_decision` 只是自动初筛。一个候选要 promote，必须人工（或 agent 按固定脚本）按下面的顺序钻进 per-profile 明细，从最能一票否决的看起：
 
-1. **符号一致性**：数一下 4 个 profile 里几个 `delta_corr>0`，重点看形态。四个都正、量级接近 = 结构性信号，最稳；**short/medium 正、long/expanding 负 = 这个信号“见效快但靠近期”，训练历史一拉长就失效——对“预测未知的未来”这是最危险的一类**。
+1. **符号一致性**：看 short / long / expanding 三个的 `delta_corr` 方向与形态。三个都正、量级接近 = 结构性信号，最稳；**short 正、long/expanding 转负 = 这个信号“见效快但靠近期”，训练历史一拉长就失效——对“预测未知的未来”这是最危险的一类**。
 2. **最差那一折**：新特征有没有制造出一个**新的强负折**（`corr_min` 明显变差）？均值升上去、最差折反而更烂，存疑。
 3. **增益在时间上的分布**：把每一折的 corr 按日期排开看，增益是均匀分布，还是集中在某一段（比如只有 8 月那几折在涨）？集中 = 撞上了某段特定行情 = 脆；均匀 = 真。
 4. **拆开看是“大盘的钱”还是“选股的钱”**：对比池化 corr 和每日截面 IC 的变化。池化 corr 涨、每日 IC 没涨 → 增益来自猜大盘方向，脆；每日 IC 也涨 → 真选股能力，稳。
@@ -281,6 +280,7 @@ P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执�
 
 - 标准 ridge 路径当前固定 `alpha=2.0`（前接 StandardScaler，见 `src/experiment_runner.py` 的 `fit_model`）
 - 进 P1 前先做一次性扫描：**仅用 R02 baseline、仅 short+medium**，在 `{0.5,1,2,5,10,20}` 上确认 2.0 落在平台区（或取平台中心），随后 **P1–P3 全程锁定该 alpha**，不逐 spec 调
+  - 这次标定刻意用 short+medium、而非日常筛选的 short+long：扫平台区要的是折数多、曲线平滑，medium 的 ~16 折在这里有用。属于 §4.2"medium 移出日常"的**有意例外**，仅限这次一次性标定
 - 锁定理由：P1–P3 是单变量换特征对比，alpha 若随特征集大小变动，会把”特征是否有效”和”alpha 是否合适”混在一起，污染对比
 - per-fold / per-spec 的 alpha 调参属于 **P4**，禁止提前在 P1–P3 做
 - promote 关口可对候选做一次 3–4 点 alpha 敏感性抽查，确认增益不是 alpha 设错造成的假象
@@ -298,7 +298,7 @@ P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执�
 - `protocol_stability_score` 不下降
 - `protocol_corr_min` 不明显变差
 - 不出现新的强负 fold
-- profile 结论尽量一致；在 long / expanding 未齐时，至少 `short + medium` 同向为正
+- profile 结论尽量一致；在 expanding 未齐时，至少 `short + long` 同向为正
 
 设计原因：
 

@@ -84,4 +84,5 @@ PYTHONPATH=src python experiments/legacy/run_516v3_restricted.py
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
 | `docs/specs/MEOW金融时序预测V3.3_论文启发稳健冲10_AI执行版.md` | V3.3 执行方案 |
 | `docs/specs/实验平台架构设计.md` | 并发实验平台架构（trainer/scheduler/resume） |
+| `docs/specs/开跑前编码指导_评测口径与提速.md` | 两速评测口径落地 + expanding 提速的编码实施清单（面向 coding agent） |
 | `experiments/run_with_memory_guard.py` | 通用内存看门狗包装器，超过 RSS 阈值自动终止任务 |
