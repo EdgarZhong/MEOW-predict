@@ -11,14 +11,14 @@
 | ✅Q1 | P3 条件动量（C1 本体 / C2 交互）— **判负**：C1 过拟合、C2 小而真但低于地板；C2 交互信号留作 Q3/Q4 抓手（详见 P3 结论） | run `20260526_p3_condmom_daily_v1` 完成 |
 | ✅Q2 | alpha 敏感性 — **否决**：alpha 不是杠杆，O4 跨 10× alpha 纹丝不动、T1 short 崩塌 shrinkage 救不了；alpha=2 锁定（详见 Q2 结论） | runs `20260526_q2_alpha5/20_daily_v1` 完成 |
 | ✅Q3 | P3.5 高先验交互（新建 4 项）— **判负零增益**；C2(lagret×X) 仍是唯一有戏交互（详见 Q3 结论） | run `20260526_q3_p35int_daily_v1` 完成 |
-| Q4 | 跨族组合（§4.5：各族最好的并成新 spec 重跑，组合不可加） | 下一步；只并 C2(conditional_momentum_interaction) + O4(ofi_safe) 两个小而真信号，I1 不进；新 spec 走同套 daily 重跑 |
-| Q5 | 综合 P1–P3.5 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档 |
+| 🔵Q4 | 跨族组合 X1=ofi_safe+cond_mom交互 — **daily 首破地板 Δ+0.00305（review）**；expanding 关口验证中（详见 Q4 结论） | daily `20260526_q4_combo_daily_v1` 完成；gate `20260526_q4_gate_v1` 进行中 |
+| Q5 | 综合 P1–Q4 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档；X1 若 expanding 也成立，交回用户定夺是否进 11 月 Review Holdout |
 
 ## 当前阶段目标
 
 **方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；P1（OFI）、P2（成交冲击）、P3（条件动量）均已跑完判负。**
 
-当前主线：**特征侧穷尽（P3 条件动量✅ → alpha 敏感性✅ → P3.5 交互✅ → 跨族组合），做完停在 P4 前。** 队列见上，下一步 Q4。P1/P2/P3-C1 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方各阶段结论）。**P3 新增信号**：C2 交互列（lagret×{ofi/spread/…}）是 P1 以来最干净候选——小而真（Δ+0.0019、跨 profile 同向、daily IC 双升），证明交互项比单族线性追加更有戏，已转为 Q3/Q4 抓手。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
+当前主线：**特征侧穷尽（P3 条件动量✅ → alpha 敏感性✅ → P3.5 交互✅ → 跨族组合🔵），做完停在 P4 前。** Q4 跨族组合 X1 **首次破地板（Δ+0.00305，review）**——P1–Q4 唯一站得住的候选；expanding 关口验证中。下一步 Q5 综合 + 交回。P1/P2/P3-C1 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方各阶段结论）。**P3 新增信号**：C2 交互列（lagret×{ofi/spread/…}）是 P1 以来最干净候选——小而真（Δ+0.0019、跨 profile 同向、daily IC 双升），证明交互项比单族线性追加更有戏，已转为 Q3/Q4 抓手。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
 
 ## 当前口径收敛（指针表）
 
@@ -115,6 +115,18 @@ A–E 档 + S 档全部落地并验收；详细实施与验收留在 git 历史�
 - 决定 Q4：跨族组合只并 **C2(conditional_momentum_interaction) + O4(ofi_safe)** 两个"小而真"信号，I1 不进。
 - ⚠️ 待清理（Q5 收口时）：`p35_interactions` 是失败 candidate，零增益，Q5 阶段收口时按 §7.3 归档（builder 移 `.archive`、registry 移除、spec I1 删）。当前留作实验记录。
 - 运行口径：`feature_store build --all --stages p35_interactions`（144 天 4 列，peak 0.85GB）→ daily（peak 6.37GB）串成一个后台任务，各带看门狗 + `--n-workers 1`，exit 0。
+
+### Q4 跨族组合【§4.5 组合不可加，当新 spec 重跑】
+
+- [x] **Q4-daily：X1 = R02 + ofi_safe + conditional_momentum_interaction — 第一个破 +0.003 地板的候选（Δ=+0.00305，review）。** expanding 关口验证中。
+- [ ] Q4-gate：X1 的 expanding 慢车道关口（run `20260526_q4_gate_v1` 进行中，结果待补）。
+
+**Q4 结论（daily run `20260526_q4_combo_daily_v1`，2026-05-26）：** 把两个唯一"小而真"的干净信号叠加——O4 的 `ofi_safe`（OFI 长窗 +0.0027 干净）+ C2 的 `conditional_momentum_interaction`（lagret×X，+0.0019 干净）——**首次破地板**。
+- 结果路径：`results/eval_protocol/20260526_q4_combo_daily_v1/`。Δcorr=**+0.00305**（make_decision=review，边界区 [0.003,0.005)）；protocol stability 0.0441↑（基线 0.0397）、corr_min 0.0252↑（基线 0.0194）。
+- per-profile（§4.7，全镜一致）：short Δ+0.0025 / t=1.91 / 15+4− / corr_min**+0.0035↑** / dailyIC+0.0037 / gap+0.0070（中等，来自 ofi_safe 列在 8d 窗的数据饥渴，但未造负折）；long Δ+0.0036 / t=3.46 / **6+0−** / corr_min**+0.0081↑** / dailyIC+0.0050 / gap+0.0015。
+- **一句话洞察**：①**几乎可加**——O4 单(+0.0016)+C2 单(+0.0019)=+0.0035，组合实测 +0.00305，略低于和=§4.5 预言的 OFI 信息重叠造成的轻微次可加，但大部分信号叠上了；②质量与 T1"虚涨真伤"相反：stability 升、两 profile corr_min 双升、daily IC 双升、两 profile 同向正——**这是整个 P1–Q4 第一个、也是唯一一个站得住的候选**。
+- 下一步（自动作业范围内）：已启动 expanding 慢车道关口（§4.4 promote 硬门槛、不碰 holdout）作第三视角验证；expanding 也成立则交回用户由其决定是否进 11 月 Review Holdout（holdout 红线，我不跑）。
+- 运行口径：daily 看门狗 + `--n-workers 1` 串行，exit 0。
 
 ### P4 稳健模型比较【P3.5 后】
 
