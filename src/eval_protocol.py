@@ -163,6 +163,8 @@ ALL_SPECS: List[Dict] = [
     # C 系列：条件动量/反转（C1 = 条件动量最大集）
     {"experiment_id": "C1_R02_plus_conditional_momentum", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum"], "notes": "R02 plus 全部条件动量（默认取 stage 全列，最大集）"},
     {"experiment_id": "C2_R02_plus_conditional_momentum_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_interaction"], "notes": "R02 plus conditional momentum interactions"},
+    # I 系列：P3.5 高先验跨族交互（§7.10 中尚未建过的 4 项：ofi×spread / ofi×trade_activity / lagret12×order_pressure / trade_pressure×regime）
+    {"experiment_id": "I1_R02_plus_p35_interactions", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "p35_interactions"], "notes": "R02 plus P3.5 high-prior cross-family interactions (§7.10 remaining 4)"},
 ]
 
 # Ridge baseline 子集（快速复现用）

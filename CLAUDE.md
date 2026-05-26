@@ -10,15 +10,15 @@
 |---|---|---|
 | ✅Q1 | P3 条件动量（C1 本体 / C2 交互）— **判负**：C1 过拟合、C2 小而真但低于地板；C2 交互信号留作 Q3/Q4 抓手（详见 P3 结论） | run `20260526_p3_condmom_daily_v1` 完成 |
 | ✅Q2 | alpha 敏感性 — **否决**：alpha 不是杠杆，O4 跨 10× alpha 纹丝不动、T1 short 崩塌 shrinkage 救不了；alpha=2 锁定（详见 Q2 结论） | runs `20260526_q2_alpha5/20_daily_v1` 完成 |
-| Q3 | P3.5 高先验交互（§7.10）：缺的交互特征/group 先建（scratch vs 注册自定） | 下一步；C2 已证 lagret×X 子集干净，§7.10 还差 ofi×spread/trade_pressure×spread/×regime/lagret×order_pressure 等非 lagret 交互 |
-| Q4 | 跨族组合（§4.5：各族最好的并成新 spec 重跑，组合不可加） | — |
+| ✅Q3 | P3.5 高先验交互（新建 4 项）— **判负零增益**；C2(lagret×X) 仍是唯一有戏交互（详见 Q3 结论） | run `20260526_q3_p35int_daily_v1` 完成 |
+| Q4 | 跨族组合（§4.5：各族最好的并成新 spec 重跑，组合不可加） | 下一步；只并 C2(conditional_momentum_interaction) + O4(ofi_safe) 两个小而真信号，I1 不进；新 spec 走同套 daily 重跑 |
 | Q5 | 综合 P1–P3.5 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档 |
 
 ## 当前阶段目标
 
 **方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；P1（OFI）、P2（成交冲击）、P3（条件动量）均已跑完判负。**
 
-当前主线：**特征侧穷尽（P3 条件动量✅ → alpha 敏感性✅ → P3.5 交互 → 跨族组合），做完停在 P4 前。** 队列见上，下一步 Q3。P1/P2/P3-C1 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方各阶段结论）。**P3 新增信号**：C2 交互列（lagret×{ofi/spread/…}）是 P1 以来最干净候选——小而真（Δ+0.0019、跨 profile 同向、daily IC 双升），证明交互项比单族线性追加更有戏，已转为 Q3/Q4 抓手。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
+当前主线：**特征侧穷尽（P3 条件动量✅ → alpha 敏感性✅ → P3.5 交互✅ → 跨族组合），做完停在 P4 前。** 队列见上，下一步 Q4。P1/P2/P3-C1 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方各阶段结论）。**P3 新增信号**：C2 交互列（lagret×{ofi/spread/…}）是 P1 以来最干净候选——小而真（Δ+0.0019、跨 profile 同向、daily IC 双升），证明交互项比单族线性追加更有戏，已转为 Q3/Q4 抓手。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
 
 ## 当前口径收敛（指针表）
 
@@ -106,7 +106,15 @@ A–E 档 + S 档全部落地并验收；详细实施与验收留在 git 历史�
 
 ### P3.5 少量交互项冲刺【P1–P3 有初步结论后】
 
-- [ ] 仅高先验交互（`ofi_total×spread` 等 6 项，AGENTS §7.10）；scratch 起步，复用才进 registry
+- [x] **Q3：§7.10 高先验交互（新建 4 项）— 判负，零增益。** C2(lagret×X) 仍是唯一有戏交互，且仍低于地板。
+
+**Q3 结论（daily run `20260526_q3_p35int_daily_v1`，2026-05-26）：** 新建 stage `p35_interactions`（status=candidate）测 §7.10 中尚未建过的 4 个交互，合并 spec `I1_R02_plus_p35_interactions` 相对 R02 **reject，基本零增益**。
+- §7.10 六项映射：`trade_pressure×spread`=trade_impact 的 `trade_pressure_x_spread`（P2/T3 已测零增益）；`lagret12×ofi_total`=cond_mom 的 `lagret12_x_ofi`（C2 已测干净）；故新建只补剩 4 项：`i_ofi_x_spread`/`i_ofi_x_trade_activity`/`i_lagret12_x_order_pressure`/`i_trade_pressure_x_regime`。
+- 结果路径：`results/eval_protocol/20260526_q3_p35int_daily_v1/`。Δcorr=+0.0002；short Δ+0.0002（t=0.95、gap+0.0002）、long Δ+0.0001（t=1.16、gap≈0）。干净的零，不过拟合也不伤害。
+- **一句话洞察**：否决"交互普遍有用"。C2 的 +0.0019 是特指**动量×微结构族**（lagret×{ofi,spread,trade_pressure,vol} 跨 5 窗口 20 列）；我新建的跨族交互（OFI×流动性、成交压力×regime、单窗口 lagret×order_pressure）线性下全空——源特征基线已有 cross-z 线性项，乘积无独立信号；trade_pressure 本就无用(P2)×regime 救不回。**§7.10 高先验清单大部分在线性模型下是空的，唯一有戏是 C2。**
+- 决定 Q4：跨族组合只并 **C2(conditional_momentum_interaction) + O4(ofi_safe)** 两个"小而真"信号，I1 不进。
+- ⚠️ 待清理（Q5 收口时）：`p35_interactions` 是失败 candidate，零增益，Q5 阶段收口时按 §7.3 归档（builder 移 `.archive`、registry 移除、spec I1 删）。当前留作实验记录。
+- 运行口径：`feature_store build --all --stages p35_interactions`（144 天 4 列，peak 0.85GB）→ daily（peak 6.37GB）串成一个后台任务，各带看门狗 + `--n-workers 1`，exit 0。
 
 ### P4 稳健模型比较【P3.5 后】
 
