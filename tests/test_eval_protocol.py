@@ -16,8 +16,10 @@ import os
 import sys
 import unittest
 
-# 把 src/ 注入路径，保证可直接 import 评测模块
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# 把 src/ 与仓库根注入路径：src 供评测模块直接 import，仓库根供 experiments 命名空间包 import
+_REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
+sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -26,6 +28,11 @@ from eval_protocol import (  # noqa: E402
     EvaluationProtocolRunner,
     BASELINE_ID,
     make_decision,
+)
+
+from experiments.p0_eval_protocol import (  # noqa: E402
+    build_daily_specs,
+    RIDGE_SPECS,
 )
 
 
@@ -148,6 +155,40 @@ class TestMakeDecision(unittest.TestCase):
         # 正例：全门槛通过 → promote
         decision, _ = make_decision(_good_candidate(), _decision_baseline())
         self.assertEqual(decision, "promote")
+
+
+class TestBuildDailySpecs(unittest.TestCase):
+    """--spec-ids：daily 快车道候选选择（P1–P3 候选入口）"""
+
+    def test_default_falls_back_to_ridge(self):
+        # 不给 spec_ids → 回退默认 RIDGE_SPECS，历史行为不变
+        specs = build_daily_specs(None, BASELINE_ID)
+        self.assertEqual(
+            [s["experiment_id"] for s in specs],
+            [s["experiment_id"] for s in RIDGE_SPECS],
+        )
+
+    def test_candidates_include_baseline_first(self):
+        # 给候选 → baseline 置首位，候选随后，用于同表算 delta
+        specs = build_daily_specs(
+            ["O1_R02_plus_ofi_raw", "O2_R02_plus_ofi_dynamic"], BASELINE_ID
+        )
+        ids = [s["experiment_id"] for s in specs]
+        self.assertEqual(ids[0], BASELINE_ID)
+        self.assertEqual(
+            ids, [BASELINE_ID, "O1_R02_plus_ofi_raw", "O2_R02_plus_ofi_dynamic"]
+        )
+
+    def test_baseline_not_duplicated(self):
+        # 候选里已含 baseline → 不重复
+        specs = build_daily_specs([BASELINE_ID, "O1_R02_plus_ofi_raw"], BASELINE_ID)
+        ids = [s["experiment_id"] for s in specs]
+        self.assertEqual(ids, [BASELINE_ID, "O1_R02_plus_ofi_raw"])
+
+    def test_unknown_id_raises(self):
+        # 未知 id → 直接报错，不静默吞
+        with self.assertRaises(ValueError):
+            build_daily_specs(["NOT_A_REAL_SPEC"], BASELINE_ID)
 
 
 if __name__ == "__main__":

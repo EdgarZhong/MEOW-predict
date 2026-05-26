@@ -11,6 +11,10 @@ P0：建立统一评测基准
   cd MEOW--predict
   PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily
 
+  # P1–P3 候选筛选：daily 快车道 + 指定候选（baseline 自动并入算 delta）
+  PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily \\
+    --spec-ids O1_R02_plus_ofi_raw O2_R02_plus_ofi_dynamic
+
   # 快速验证（每个 profile 只跑 2 个 fold，只跑 Ridge 系列）
   PYTHONPATH=src python experiments/p0_eval_protocol.py --suite quick
 
@@ -159,6 +163,13 @@ def build_arg_parser():
         help="关口模式下要评估的候选 experiment_id；suite=gate 时必填",
     )
     parser.add_argument(
+        "--spec-ids",
+        nargs="*",
+        default=None,
+        help="daily 模式下显式指定本批候选 experiment_id（如 P1 的 O1..O6）；"
+             "会自动并入 baseline 以在同表算 delta。不给则跑默认 RIDGE_SPECS。",
+    )
+    parser.add_argument(
         "--baseline-spec-id",
         type=str,
         default=BASELINE_ID,
@@ -220,6 +231,21 @@ def resolve_specs_by_ids(spec_ids):
     return [spec_map[spec_id] for spec_id in spec_ids]
 
 
+def build_daily_specs(spec_ids, baseline_id, default_specs=None):
+    """
+    daily 快车道的候选选择。
+
+    - 未显式给 spec_ids（None / 空）：回退默认（RIDGE_SPECS），保持历史行为不变。
+    - 显式给 spec_ids：把 baseline 放在首位后并入候选（去重、保序），交给
+      resolve_specs_by_ids 解析；这样 P1–P3 的 O/T/C 候选才能在 short+long 快车道上
+      与同口径 baseline 同批跑、同表算 delta（§4.4 / §5.1）。
+    """
+    if not spec_ids:
+        return list(default_specs if default_specs is not None else RIDGE_SPECS)
+    ids = [baseline_id] + [sid for sid in spec_ids if sid != baseline_id]
+    return resolve_specs_by_ids(ids)
+
+
 def main():
     args = build_arg_parser().parse_args()
     target_winsorize_config = build_target_winsorize_config(args)
@@ -236,11 +262,15 @@ def main():
         effective_n_workers = args.n_workers
         print("[P0] 快速调试模式：R00-R02，short_8d_2d profile，2 folds")
     elif args.suite == "daily":
-        specs = RIDGE_SPECS               # 日常筛选默认 Ridge 系列
+        # 给了 --spec-ids 就跑指定候选 + baseline，否则默认 Ridge 系列
+        specs = build_daily_specs(args.spec_ids, args.baseline_spec_id)
         max_folds = args.max_folds        # None = 全部 fold
         selected_profiles = daily_profiles  # 快车道：short + long（medium/expanding 不进日常）
         effective_n_workers = args.n_workers
-        print("[P0] 日常筛选 suite：short + long 快车道（medium 移出日常、expanding 只在关口跑）")
+        if args.spec_ids:
+            print(f"[P0] 日常筛选 suite：指定候选 {args.spec_ids} + baseline {args.baseline_spec_id}，short + long 快车道")
+        else:
+            print("[P0] 日常筛选 suite：short + long 快车道（medium 移出日常、expanding 只在关口跑）")
     elif args.suite == "gate":
         if not args.candidate_spec_id:
             raise ValueError("suite=gate 时必须提供 --candidate-spec-id")

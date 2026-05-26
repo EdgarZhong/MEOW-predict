@@ -162,13 +162,13 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
 2. 在 `src/eval_protocol.py` 的 `ALL_SPECS` 里固定本轮候选 spec（§7.1）
-3. 先过快车道筛选（`--suite daily`），过线候选再进慢车道关口（`--suite gate`），按 §4.4 口径评测
+3. 先过快车道筛选（`--suite daily --spec-ids <本轮候选...>`，baseline 自动并入、同表算 delta；不带 `--spec-ids` 则跑默认 R 系列），过线候选再进慢车道关口（`--suite gate --candidate-spec-id <ID>`），按 §4.4 口径评测
 4. 把结果写入 `docs/实验记录.md`，标注 `experiment_id / date / feature_set / model / split / seed / metrics / notes`（§九 必录字段）
 5. 与基线比较，只改一个变量；提交遵循 §八 commit 规范
 
 ### 5.1 跑命令前自查清单（每次执行 `experiments/*.py` 前逐条过）
 
-1. **suite 选对了吗**：日常筛选 `--suite daily`（short+long+每日IC）；提交关口 `--suite gate --candidate-spec-id <ID>`（候选 vs 基线、只跑 expanding）。别拿 `full`/`ridge` 当日常。
+1. **suite 选对了吗**：日常筛选 `--suite daily`（short+long+每日IC）；筛 P1–P3 候选用 `--suite daily --spec-ids O1_... O6_...`（baseline 自动并入、同表算 delta，不给 `--spec-ids` 才跑默认 R 系列）；提交关口 `--suite gate --candidate-spec-id <ID>`（候选 vs 基线、只跑 expanding）。别拿 `full`/`ridge` 当日常。
 2. **macOS 跑 expanding / gate 必须显式 `--n-workers 1`**：`gate` 入口默认会压到 2 worker，在这台 16GB Mac 上会撞「双并行 expanding 尾段」OOM 风险；标准跑法是单 worker 串行，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c。只有迁到 20GB+ 空闲内存机器才开 2 worker。
 3. **候选 spec 已一次性固定**：禁止边加 spec 边重筛（§4.3 多重比较）。本轮要比的全集先定死、一起跑、一起看。
 4. **已锁默认别手改**：训练标签 winsorize = 开启 + P1/P99，ridge alpha = 2.0，特征 dtype = float32，都是 P0.5 扫锁结论（§7.11 / §7.7）。要做对照才显式覆写，且记录在案。
