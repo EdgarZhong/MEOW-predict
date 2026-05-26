@@ -2,6 +2,34 @@
 
 更新日期：2026-05-26
 
+## 全自动执行流水线（2026-05-26 用户离开期间 / 控制器状态）
+
+> 用户离开，要求全自动推进。状态全部落在**文件系统 + 本节队列**里（不依赖对话记忆）；一个 durable cron 心跳（每 ~15 分钟）反复唤醒我，按下面的「控制器procedure」推进。冷启动也能接上。
+
+**执行队列（按序，run-id 即状态锚点）：**
+
+| # | 任务 | run-id | 状态判定锚点 | 状态 |
+|---|---|---|---|---|
+| Q1 | P3 条件动量 C1–C3 | `20260526_p3_condmom_daily_v1` | 该目录下有 `leaderboard.csv`=完成 | 进行中（已启动） |
+| Q2a | alpha 敏感性 α=5（O4+T1，验欠正则假设） | `20260526_alpha5_o4t1_daily_v1` | 同上 | 待启动 |
+| Q2b | alpha 敏感性 α=20（O4+T1） | `20260526_alpha20_o4t1_daily_v1` | 同上 | 待启动 |
+| Q3 | 综合结论：P1/P2/P3 + alpha 发现 + 对 P4 的建议，写回本文件，给用户回来看 | —（无 run，纯分析+落档） | 本节出现「Q3 已完成」 | 待执行 |
+
+**每项的标准启动命令（看门狗+串行，模板见 AGENTS §5.1 item 5）：**
+- Q1：`... -- python experiments/p0_eval_protocol.py --suite daily --spec-ids C1_R02_plus_conditional_momentum C2_R02_plus_conditional_momentum_interaction --run-id 20260526_p3_condmom_daily_v1 --n-workers 1 > /tmp/p3.log 2>&1`（C3 已删除：与 C1 重复，见 §遗留清理）
+- Q2a：`... --spec-ids O4_R02_plus_ofi_safe T1_R02_plus_trade_impact --run-id 20260526_alpha5_o4t1_daily_v1 --ridge-alpha 5 --n-workers 1 > /tmp/alpha5.log 2>&1`
+- Q2b：同 Q2a，改 `--run-id 20260526_alpha20_o4t1_daily_v1 --ridge-alpha 20`，日志 `/tmp/alpha20.log`
+
+**控制器 procedure（每次 cron 心跳执行）：**
+1. **冷启动安全**：先读本节 + AGENTS §4.6/§4.7（分诊≠判决、每次必多角度看）。
+2. 按队列顺序找"当前项"：逐个查 `results/eval_protocol/<run-id>/leaderboard.csv` 是否存在。
+3. 判定 + 动作：
+   - **有 run 在跑**（进程在 / 无 leaderboard）→ 一句话状态，保留 cron，结束本次。
+   - **当前项刚完成**（有 leaderboard）→ 跑 `PYTHONPATH=src python experiments/analyze_run.py --run-id <id>` 多角度看，**带专业判断**（不只看 decision 标签），按 §一「CLAUDE.md 实验记录维护规范」落档本文件；然后**启动下一项**（标准命令），更新上表状态。
+   - **当前项死了**（无进程 + 无 leaderboard + 目录残留）→ `tail /tmp/<id>.log` 与 guard 日志诊断；若像偶发（看门狗触发/外部干扰）重启一次，否则落档失败原因、跳过、继续下一项。
+   - **全部完成**→ 执行 Q3（综合 P1/P2/P3 + alpha 发现 + 我对"是否进 P4 / 特征族是否挖尽"的建议，写回本节），然后 `CronList`+`CronDelete` 删本 job、停。
+4. **纪律**：中止任务用 `TaskStop`；绝不只认标签自动判卷；泛化性第一（测试集未知）。
+
 ## 当前阶段目标
 
 **方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；开跑前债务清零（#10–#20）已全部完成；基线已用锁定口径 relock 并锁定为单一 R02。**
@@ -53,14 +81,29 @@ A–E 档 + S 档全部落地并验收；详细实施与验收留在 git 历史�
 - **expanding 提速**：gate suite（候选 vs 基线）+ 成本均衡切组；**macOS 标准跑法 = 单 worker 串行**（编码指导 §2c / AGENTS §5.1）。
 - 当前 23 条单测全过（`test_eval_protocol` 12 + `test_experiment_runner` 4 + `test_feature_loader` 4 + `test_scheduler` 1 + `test_submission_pipeline` 2）；另 `tests/test_feature_store.py`（PE1 M2 FeatureStore 回归，脚本式，`PYTHONPATH=src python` 单独跑）由根目录搬入归位。
 
-### P1 / P2 / P3 特征组验证【就绪，可启动】
+### P1 / P2 / P3 特征组验证
 
-- [ ] P1：O1–O6（OFI）｜P2：T1–T4（trade impact）｜P3：C1–C3（条件动量/反转）
+- [x] **P1：O1–O6（OFI）— 判负，无候选进 expanding。**
+- [x] **P2：T1–T4（trade impact）— 判负，无候选进 expanding。**
+- [ ] P3：C1–C3（条件动量/反转）【下一步，待运行】
 - 候选 spec 已写死在 `src/eval_protocol.py`（O 系 145–150 / T 系 152–155 / C 系 157–159），均为 R02 + 新 group
 - daily 已支持 `--spec-ids` 选候选（baseline 自动并入算 delta，AGENTS §5/§5.1）
-- P1 启动命令（**待运行**，run-id `20260526_p1_ofi_daily_v1`）：
-  `--suite daily --spec-ids O1_R02_plus_ofi_raw O2_R02_plus_ofi_dynamic O3_R02_plus_ofi_rank O4_R02_plus_ofi_safe O5_R02_plus_ofi_raw_dynamic O6_R02_plus_all_ofi`
 - 口径：快车道 short+long+每日IC 筛 → 过线候选再逐个进 expanding 关口（`--suite gate --candidate-spec-id <ID> --n-workers 1`，AGENTS §4.4）；采纳门槛见 §4.6
+
+**P1 结论（daily run `20260526_p1_ofi_daily_v1`，2026-05-26）：** 6 个 OFI 候选相对 R02 全部 reject，最佳仅 O4 `ofi_safe` 的 Δcorr=+0.0016（< +0.003 地板），无候选进 expanding。
+- 结果路径：`results/eval_protocol/20260526_p1_ofi_daily_v1/`（leaderboard.csv 全指标）。
+- 根因：基线 R02 的 `norm_core` 已含横截面标准化 OFI（`ofi_*_cs_z`，来自 cross_z）——OFI 中最稳健可外推的部分基线已吃掉；O 系仅再加原始/动态/depth 等更噪变体，边际≈0。
+- ⚠️ 待清理：O6 `all_ofi`（groups=`ofi_safe+ofi_rank`）与 O4 逐位相同，因 `ofi_safe` 已是 OFI 列全集（ofi stage 全列 + cross 的 ofi cs_z/cs_rank），`ofi_rank` 冗余。O6 命名"all OFI"误导，建议后续修正或删除。
+
+**P2 结论（daily run `20260526_p2_trade_daily_v2`，2026-05-26）：** T1–T4 成交冲击候选相对 R02 全部 reject，无候选进 expanding。
+- 结果路径：`results/eval_protocol/20260526_p2_trade_daily_v2/`（leaderboard.csv 全指标）。
+- **T1/T2/T4（原始+动态成交冲击）= 虚涨真伤**：corr_mean +0.001，但制造新强负折（corr_min 从 +0.019 → −0.004，short 最差折 −0.040）、全折正率 100%→84%、stability −0.0048。撞 §4.7「新强负折」红线，即便不卡地板也该毙。
+- **T3（交互项 `trade_pressure×spread/×order_pressure/×ofi`）= 零增益**（Δ=+0.00003）。线性 Ridge 下这三个乘积项对基线无贡献。
+- 根因（同 P1）：基线 `norm_core` 已含横截面标准化成交冲击（`trade_pressure_*_cs_z` 等）；原始/动态版本只加噪、交互版本无新信息。
+- ⚠️ 待清理：T4 `trade_impact_safe` 与 T1 `trade_impact` 逐位相同（同 O4≡O6，`*_safe` 即全集），冗余待清。
+- 运行口径：看门狗(软9/硬11GB) + `--n-workers 1` 串行，峰值 ~8.7GB 压住，exit 0；daily 在 16GB Mac 必须串行（AGENTS §5.1）。
+
+**P1+P2 合并启示**：OFI 与成交冲击两族,最稳健可外推的横截面标准化版本基线(R02 norm_core)已纳入;追加原始/动态/交互变体要么零增益、要么伤稳定性。**P3 之前的预期应据此下调**——单族线性追加大概率难破 +0.003。
 
 ### P3.5 少量交互项冲刺【P1–P3 有初步结论后】
 

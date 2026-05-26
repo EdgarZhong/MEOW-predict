@@ -141,22 +141,28 @@ ALL_SPECS: List[Dict] = [
     {"experiment_id": "B6_common_residual", "type": "common_residual", "notes": "formal common residual branch"},
     {"experiment_id": "B7_soft_regime", "type": "soft_regime", "notes": "formal soft regime ensemble"},
     {"experiment_id": "B8_ridge_legacy_plus_core", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "base", "lag", "roll", "cross"], "notes": "formal ridge legacy plus core"},
-    # O 系列：OFI 动态订单流
+    # 注（2026-05-26 清理）：各族 `_safe` group 当前在 registry 里 = 该 stage 的“全部列”，
+    # “safe” 命名有误导（实为 “all/full”）。原 O6 / T4 / C3 三个 spec 已删除，因为它们与
+    # O4 / T1 / C1 逐位重复：
+    #   - ofi_safe ⊇ ofi_rank，故 O6(ofi_safe+ofi_rank) ≡ O4(ofi_safe)；
+    #   - trade_impact_safe ≡ trade_impact（同为 stage 全列），故 T4 ≡ T1；
+    #   - conditional_momentum 未在 group_columns 显式声明→默认取 stage 全列，等于
+    #     conditional_momentum_safe，故 C3 ≡ C1。
+    # 后续若要测“全族最大集”，直接用 O4 / T1 / C1，别再加 *_safe / *_all 重复 spec。
+    # （group 重命名 _safe→_all 属更大的 registry 重构，留待单独处理。）
+    # O 系列：OFI 动态订单流（O4 = OFI 最大集）
     {"experiment_id": "O1_R02_plus_ofi_raw", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_raw"], "notes": "R02 plus raw OFI"},
     {"experiment_id": "O2_R02_plus_ofi_dynamic", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_dynamic"], "notes": "R02 plus dynamic OFI"},
     {"experiment_id": "O3_R02_plus_ofi_rank", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_rank", "ofi_raw"], "notes": "R02 plus OFI cross ranks"},
-    {"experiment_id": "O4_R02_plus_ofi_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe"], "notes": "R02 plus all safe OFI"},
+    {"experiment_id": "O4_R02_plus_ofi_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe"], "notes": "R02 plus 全部 OFI（ofi_safe=ofi stage 全列+cross ofi cs_z/cs_rank，OFI 最大集）"},
     {"experiment_id": "O5_R02_plus_ofi_raw_dynamic", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_raw", "ofi_dynamic"], "notes": "R02 plus raw and dynamic OFI"},
-    {"experiment_id": "O6_R02_plus_all_ofi", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe", "ofi_rank"], "notes": "R02 plus all OFI groups"},
-    # T 系列：成交冲击
-    {"experiment_id": "T1_R02_plus_trade_impact", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact"], "notes": "R02 plus trade impact base"},
+    # T 系列：成交冲击（T1 = 成交冲击最大集）
+    {"experiment_id": "T1_R02_plus_trade_impact", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact"], "notes": "R02 plus 全部成交冲击（trade_impact=stage 全列，最大集）"},
     {"experiment_id": "T2_R02_plus_trade_impact_dyn", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_dyn"], "notes": "R02 plus trade impact dynamic"},
     {"experiment_id": "T3_R02_plus_trade_impact_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_interaction"], "notes": "R02 plus trade impact interactions"},
-    {"experiment_id": "T4_R02_plus_trade_impact_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "trade_impact_safe"], "notes": "R02 plus all safe trade impact"},
-    # C 系列：条件动量/反转
-    {"experiment_id": "C1_R02_plus_conditional_momentum", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum"], "notes": "R02 plus conditional momentum base"},
+    # C 系列：条件动量/反转（C1 = 条件动量最大集）
+    {"experiment_id": "C1_R02_plus_conditional_momentum", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum"], "notes": "R02 plus 全部条件动量（默认取 stage 全列，最大集）"},
     {"experiment_id": "C2_R02_plus_conditional_momentum_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_interaction"], "notes": "R02 plus conditional momentum interactions"},
-    {"experiment_id": "C3_R02_plus_conditional_momentum_safe", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_safe"], "notes": "R02 plus all safe conditional momentum"},
 ]
 
 # Ridge baseline 子集（快速复现用）

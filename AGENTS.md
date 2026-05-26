@@ -6,9 +6,9 @@
 |---|---|---|
 | `README.md` | 所有人 | 稳定事实：项目定位、目录结构、运行方式、关键文档入口 |
 | `AGENTS.md` | Agent | 规则、流程、原则、协作约束（本文件） |
-| `CLAUDE.md` | Agent | 动态：当前阶段任务看板、进度、决策 |
+| `CLAUDE.md` | Agent | 动态：当前阶段任务看板、进度、决策、**实验记录（当前阶段、决策导向）** |
 | `NOTE.md` | **用户** | 实验笔记：策略讨论、概念解释、敲定方向、待决问题 |
-| `docs/实验记录.md` | 所有人 | 所有实验结果的唯一历史记录 |
+| `docs/实验记录.md` | 所有人 | 实验结果**永久全量档案**（命令 + 全指标明细）；当前阶段实时记录见 CLAUDE.md，阶段收口时沉淀至此 |
 
 ### NOTE.md 维护规范
 
@@ -19,6 +19,23 @@
 - **不写入**：代码细节、任务状态（那是 CLAUDE.md 的职责）、已有文档能查到的内容
 - **格式**：按主题分节，每节末尾可附"待讨论/未决问题"列表；底部维护版本记录表
 - **agent 行为**：每次讨论出值得记录的结论后，主动追问"要落实到 NOTE.md 吗"，或直接写入后告知用户
+
+### CLAUDE.md 实验记录维护规范
+
+实验记录采用**分层**：CLAUDE.md 记「当前阶段」的实时实验记录（给用户日常看、决策导向、精简），`docs/实验记录.md` 是永久全量档案（命令 + 全指标明细）。两者不混写，靠"收口沉淀"衔接。
+
+- **写入时机**：每个 run 跑完、解读完，**立即**在 CLAUDE.md 对应 P 阶段下补一条；不留过夜、不攒批。
+- **CLAUDE.md 单条必含字段**（精简、决策导向）：
+  1. `run_id` + 绝对日期 + suite（daily / gate / …）
+  2. 候选 vs 基线，每候选的 `make_decision` 决策（promote / review / reject；门槛**引用** §4.6，不复述规则）
+  3. 关键数字：最佳候选的 `delta_corr`、是否过 +0.003 地板；`corr_min` / `stability_score` 仅在异常时才列
+  4. **一句话洞察**：本条记录里最不显然、未来重推代价最高的"为什么"（如"基线 `norm_core` 已含 `ofi_*_cs_z`，所以 OFI 增量≈0"）——这是 leaderboard CSV 里没有、必须人写的部分，是整条记录最值钱的地方
+  5. 结果路径指针（`results/eval_protocol/<run_id>/`）
+  6. 遗留 / 清理 flag、下一步命令（若有）
+- **不抄全 leaderboard**：完整指标指向 CSV，CLAUDE.md 只留"可复算的指针 + 不可复算的洞察"。
+- **日期一律绝对化**："今天"→ `2026-05-26`，便于日后回读。
+- **失败结论同等重要**：reject 的候选也要记（含洞察），否则后人会重复试已知无效的方向。
+- **阶段收口时沉淀**：某 P 阶段彻底定案、进入下一阶段后，把该阶段在 CLAUDE.md 的多条 run 记录**补全为明细**（命令 + 全 profile 指标 + per-fold，按 §8.4 必录字段）写入 `docs/实验记录.md`，CLAUDE.md 内压成一行"阶段结论 + 档案指针"。这样 CLAUDE.md 始终只聚焦当前阶段、不随实验累积而膨胀。
 
 ## 二、设计宪法
 
@@ -113,27 +130,29 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 **规则：任何把多个特征组叠加使用的方案，必须作为一个新 spec、走同一套 rolling 重新验收，禁止用各组单独 delta 推算合并分数。** 这是 P1–P3（单组筛选）通向 P3.5/P4/P5（组合/融合）的强制关卡。
 
-### 4.6 promote 自动判定的硬契约（make_decision 必须满足）
+### 4.6 make_decision 的定位：分诊信号，不是判决
 
-§4.2 / §4.3 / §4.4 写的是判定逻辑，但 coding agent 在循环里只认 `make_decision` 返回的标签，不会回头读这些散文。凡是“散文比代码严”的地方，agent 就会往松的那头漂。所以把上面的判定固化成 `make_decision` 的硬契约，并**配单元测试**锁住：
+**事实锚点**：老师的最终分 = 评测窗口内所有行的一个 pooled Pearson（`meow/eval.py`：`ydf[["forecast","fret12"]].corr()`，inf/nan→0 计入），和我们每折的 `val_corr` 同算法。因此 `protocol_corr_mean`（多折 pooled corr 的平均）是"期望老师分"的对齐代理；而 `stability_score` / `corr_min` / 每日 IC / `delta_corr` 阈值都是我们因**"测试集未知、必须保泛化"**自加的**先验**——老师不看、也从未用真实分校准过，本质是主观预估。
 
-**采纳标签判定表（make_decision 必须照此返回）：**
+**所以 `make_decision` 只是一个便宜的分诊信号（triage），不是判决。** 它帮我们快速标出"明显噪声"与"值得细看"；但任何 accept / reject / 继续看 的真实判断，**必须先按 §4.7 从多个角度扒过细节、带专业思考下结论，并讲清为什么**，绝不能只凭它返回的标签自动判卷。指标当仪表盘多镜头用，不当自动闸刀。一切从实际数据出发。（强制行为，见 memory「禁止自动判卷」。）
 
-| 条件 | 返回 |
-|---|---|
-| `delta_corr < 0.003` | `reject` |
-| `0.003 ≤ delta_corr < 0.005` | `review`（送 11 月复核，**禁止直接 promote**） |
-| `delta_corr ≥ 0.005`，且 expanding 已单独跑过且不为负，且 short 与 expanding 同向为正、long 不显著翻负，且每日 IC 不恶化，且 `stability_score` 不降，且没有新的强负折 | `promote` |
-| 其它 | `review` |
+**分诊先验参考分档（make_decision 据此给提示标签，仅供分诊起点，非最终判决）：**
 
-- **没跑 expanding 就不准 promote**：如果结果里没有 expanding（比如只跑了 short+long 的快车道批次），`make_decision` 最高只能返回 `review`，不得 `promote`。
-- **排行榜排序键要改**：头条按 `protocol_corr_mean` 排（这才对齐老师评分，回答“这个大概能打多少分”），`stability_score` 作为并排展示的守门指标——**不要再拿 stability 当第一排序键**。但“采纳”与否仍走上表的鲁棒性门槛，不能因为排在前面就采纳。
-- **量化口径（供单测落地，P0.5 可按基线 std 复核校准）**：`long 不显著翻负` = long 的 `delta_corr ≥ −0.006`（约一个均值标准误，见 §4.3）；`新的强负折` = 候选使某折 corr 由非负转负（基线该折 ≥ 0、候选该折 < 0），或某折 corr < −0.01。没有量化定义，单测断言无法落地。
-- **必须有单测**：至少覆盖三条断言——“`delta_corr=0.004` 必须返回 `review`”、“缺 expanding 必须不能 promote”、“出现强负折（按上面定义）必须不能 promote”。
+| delta_corr | 分诊提示 | 含义（仍须看细节确认） |
+|---|---|---|
+| `< 0.003` | `reject` | 低于约半个标准误（§4.3），在 dev 窗口多半与噪声不可分——**默认怀疑，但要确认它是真噪声，还是被欠正则/合并 metric 掩盖的小真信号**（如 T1 案例：corr_mean 显示更好，实为 short 更差+过拟合） |
+| `0.003 ≤ < 0.005` | `review` | 边界，须进 11 月复核 |
+| `≥ 0.005` 且鲁棒诸条满足 | `promote` | 强候选，但仍走 §4.7 + holdout 才定 |
 
-### 4.7 单候选 per-profile 复核方法论（promote 前必做）
+- **分诊与判决分离**：上表是分诊起点的先验，不是"必须照此 promote/reject"的契约。标签是建议，最终由观察者（现在是我，带判断）拍板并向用户讲清理由。
+- **没跑 expanding 就不准 promote**：快车道（short+long）缺 expanding 时，分诊最高给到 `review`、不得 `promote`。这条仍是硬约束（§4.4 慢车道关口纪律）。
+- **排行榜排序键**：头条按 `protocol_corr_mean` 排（对齐老师评分，回答"大概能打多少分"），`stability_score` 等并排展示作守门镜头——不要拿 stability 当第一排序键，也不要因为排在前面就采纳。
+- **诊断量化口径**：`long 不显著翻负` = long `delta_corr ≥ −0.006`（约一个标准误，§4.3）；`新的强负折` = 候选使某折 corr 由非负转负（基线该折 ≥ 0、候选该折 < 0），或某折 corr < −0.01。
+- **单测锁的是分诊一致性，不是判决权**：保留 make_decision 单测（`delta_corr=0.004→review`、缺 expanding 不得给 `promote`、强负折不得给 `promote`），锁住分诊信号稳定，但它从不替代人工观察。
 
-`make_decision` 只是自动初筛。一个候选要 promote，必须人工（或 agent 按固定脚本）按下面的顺序钻进 per-profile 明细，从最能一票否决的看起：
+### 4.7 单候选 per-profile 复核方法论（每次出结果必做，不止 promote 前）
+
+`make_decision` 只是分诊信号（§4.6）。**每个 run 出结果后，都要**按下面的顺序钻进 per-profile 明细深扒一遍（不是只在临 promote 前才看），从最能一票否决的看起；reject 的候选也要看，确认它是真噪声还是被掩盖的真信号：
 
 1. **符号一致性**：看 short / long / expanding 三个的 `delta_corr` 方向与形态。三个都正、量级接近 = 结构性信号，最稳；**short 正、long/expanding 转负 = 这个信号“见效快但靠近期”，训练历史一拉长就失效——对“预测未知的未来”这是最危险的一类**。
 2. **最差那一折**：新特征有没有制造出一个**新的强负折**（`corr_min` 明显变差）？均值升上去、最差折反而更烂，存疑。
@@ -163,16 +182,25 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
 2. 在 `src/eval_protocol.py` 的 `ALL_SPECS` 里固定本轮候选 spec（§7.1）
 3. 先过快车道筛选（`--suite daily --spec-ids <本轮候选...>`，baseline 自动并入、同表算 delta；不带 `--spec-ids` 则跑默认 R 系列），过线候选再进慢车道关口（`--suite gate --candidate-spec-id <ID>`），按 §4.4 口径评测
-4. 把结果写入 `docs/实验记录.md`，标注 `experiment_id / date / feature_set / model / split / seed / metrics / notes`（§九 必录字段）
+4. 每个 run 跑完立即在 CLAUDE.md 当前阶段记一条实时记录（字段见 §一「CLAUDE.md 实验记录维护规范」）；阶段收口时把明细（§8.4 必录字段）沉淀进 `docs/实验记录.md`
 5. 与基线比较，只改一个变量；提交遵循 §八 commit 规范
 
 ### 5.1 跑命令前自查清单（每次执行 `experiments/*.py` 前逐条过）
 
 1. **suite 选对了吗**：日常筛选 `--suite daily`（short+long+每日IC）；筛 P1–P3 候选用 `--suite daily --spec-ids O1_... O6_...`（baseline 自动并入、同表算 delta，不给 `--spec-ids` 才跑默认 R 系列）；提交关口 `--suite gate --candidate-spec-id <ID>`（候选 vs 基线、只跑 expanding）。别拿 `full`/`ridge` 当日常。
-2. **macOS 跑 expanding / gate 必须显式 `--n-workers 1`**：`gate` 入口默认会压到 2 worker，在这台 16GB Mac 上会撞「双并行 expanding 尾段」OOM 风险；标准跑法是单 worker 串行，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c。只有迁到 20GB+ 空闲内存机器才开 2 worker。
+2. **macOS 并行度上限（16GB）**：`gate` / `expanding` 必须显式 `--n-workers 1`（`gate` 默认压到 2 worker，会撞「双并行 expanding 尾段」OOM，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c）。**`daily` 默认 `n_workers=4`，在这台 16GB Mac 上同样过猛**——`long_40d_5d` 长窗 heavy 组并行时实测会被杀（2026-05-26 P2 事故），daily 也必须显式 `--n-workers 1` 串行跑。只有迁到 20GB+ 空闲内存机器才考虑放开。
 3. **候选 spec 已一次性固定**：禁止边加 spec 边重筛（§4.3 多重比较）。本轮要比的全集先定死、一起跑、一起看。
 4. **已锁默认别手改**：训练标签 winsorize = 开启 + P1/P99，ridge alpha = 2.0，特征 dtype = float32，都是 P0.5 扫锁结论（§7.11 / §7.7）。要做对照才显式覆写，且记录在案。
-5. **长任务挂保护**：`caffeinate -i` 防休眠 + `experiments/run_with_memory_guard.py` 兜 RSS；长跑用 `--run-id` 固定、`--resume` 可续。
+5. **【硬约束】每个 run 必须挂内存看门狗，无一例外**：凡执行 `experiments/p0_eval_protocol.py`（daily / gate / full / ridge / quick 任意 suite），必须经 `experiments/run_with_memory_guard.py` 包装，禁止裸跑。原因：被强杀（OOM）时后台任务不发完成通知、会无声消失（2026-05-26 P2 两次事故）。标准跑法：
+   ```bash
+   PYTHONPATH=src caffeinate -i python experiments/run_with_memory_guard.py \
+     --rss-limit-gb 9 --rss-hard-limit-gb 11 --log-file /tmp/<run>_guard.log \
+     -- python experiments/p0_eval_protocol.py --suite daily --spec-ids ... \
+        --run-id <run> --n-workers 1 > /tmp/<run>.log 2>&1
+   ```
+   - `caffeinate -i` 防休眠；看门狗软阈值 9GB / 硬阈值 11GB（16GB Mac 留 OS 余量）；输出**重定向到日志文件**（禁止 `| tail`，强杀时缓冲全丢）。
+   - 长跑用 `--run-id` 固定、`--resume` 可续。
+6. **后台运行 + 定时盯岗**：长 run 用后台执行；中止任务一律 `TaskStop`（不要用 Bash `kill`，harness 不认）；离开期间靠 `CronCreate` 定时（≤1 小时间隔）自动回来查任务最新状态（看 leaderboard 产出 / `TaskList` / 日志尾部），覆盖「完成 / 静默死亡 / 卡死」三种终态，不依赖完成通知。
 6. **目标与输出回 raw `fret12`**：winsorize 只作用于训练标签，评测/提交一律原始 `fret12`；提交通道不依赖 `data/features/` 缓存、不依赖任何不可见统计量（§十 推理契约）。
 
 ## 六、模型优先级
