@@ -2,39 +2,23 @@
 
 更新日期：2026-05-26
 
-## 全自动执行流水线（2026-05-26 用户离开期间 / 控制器状态）
+## 待办队列（下一会话执行）
 
-> 用户离开，要求全自动推进。状态全部落在**文件系统 + 本节队列**里（不依赖对话记忆）；一个 durable cron 心跳（每 ~15 分钟）反复唤醒我，按下面的「控制器procedure」推进。冷启动也能接上。
+> 真正跑实验在**新会话**。每项流程：看门狗+串行启动（命令模板 AGENTS §5.1 item5）→ `PYTHONPATH=src python experiments/analyze_run.py --run-id <id>` 多角度看 + 带专业判断（**不只认 decision 标签**，§4.6/§4.7）→ 落档本文件（§一记录规范）→ 测好就 commit + 同步必要文档。状态锚点：`results/eval_protocol/<run-id>/leaderboard.csv` 存在=该项完成。**自动作业止于 P4（模型选型）前**，holdout 不碰。缺的脚本/group/特征实现按需自行编码（已授权）。
 
-**执行队列（按序，run-id 即状态锚点）：**
-
-| # | 任务 | run-id | 状态判定锚点 | 状态 |
-|---|---|---|---|---|
-| Q1 | P3 条件动量 C1–C3 | `20260526_p3_condmom_daily_v1` | 该目录下有 `leaderboard.csv`=完成 | 进行中（已启动） |
-| Q2a | alpha 敏感性 α=5（O4+T1，验欠正则假设） | `20260526_alpha5_o4t1_daily_v1` | 同上 | 待启动 |
-| Q2b | alpha 敏感性 α=20（O4+T1） | `20260526_alpha20_o4t1_daily_v1` | 同上 | 待启动 |
-| Q3 | 综合结论：P1/P2/P3 + alpha 发现 + 对 P4 的建议，写回本文件，给用户回来看 | —（无 run，纯分析+落档） | 本节出现「Q3 已完成」 | 待执行 |
-
-**每项的标准启动命令（看门狗+串行，模板见 AGENTS §5.1 item 5）：**
-- Q1：`... -- python experiments/p0_eval_protocol.py --suite daily --spec-ids C1_R02_plus_conditional_momentum C2_R02_plus_conditional_momentum_interaction --run-id 20260526_p3_condmom_daily_v1 --n-workers 1 > /tmp/p3.log 2>&1`（C3 已删除：与 C1 重复，见 §遗留清理）
-- Q2a：`... --spec-ids O4_R02_plus_ofi_safe T1_R02_plus_trade_impact --run-id 20260526_alpha5_o4t1_daily_v1 --ridge-alpha 5 --n-workers 1 > /tmp/alpha5.log 2>&1`
-- Q2b：同 Q2a，改 `--run-id 20260526_alpha20_o4t1_daily_v1 --ridge-alpha 20`，日志 `/tmp/alpha20.log`
-
-**控制器 procedure（每次 cron 心跳执行）：**
-1. **冷启动安全**：先读本节 + AGENTS §4.6/§4.7（分诊≠判决、每次必多角度看）。
-2. 按队列顺序找"当前项"：逐个查 `results/eval_protocol/<run-id>/leaderboard.csv` 是否存在。
-3. 判定 + 动作：
-   - **有 run 在跑**（进程在 / 无 leaderboard）→ 一句话状态，保留 cron，结束本次。
-   - **当前项刚完成**（有 leaderboard）→ 跑 `PYTHONPATH=src python experiments/analyze_run.py --run-id <id>` 多角度看，**带专业判断**（不只看 decision 标签），按 §一「CLAUDE.md 实验记录维护规范」落档本文件；然后**启动下一项**（标准命令），更新上表状态。
-   - **当前项死了**（无进程 + 无 leaderboard + 目录残留）→ `tail /tmp/<id>.log` 与 guard 日志诊断；若像偶发（看门狗触发/外部干扰）重启一次，否则落档失败原因、跳过、继续下一项。
-   - **全部完成**→ 执行 Q3（综合 P1/P2/P3 + alpha 发现 + 我对"是否进 P4 / 特征族是否挖尽"的建议，写回本节），然后 `CronList`+`CronDelete` 删本 job、停。
-4. **纪律**：中止任务用 `TaskStop`；绝不只认标签自动判卷；泛化性第一（测试集未知）。
+| # | 任务 | 关键参数 |
+|---|---|---|
+| Q1 | P3 条件动量（C1 本体 / C2 交互） | spec `C1_R02_plus_conditional_momentum C2_R02_plus_conditional_momentum_interaction`，run-id `20260526_p3_condmom_daily_v1` |
+| Q2 | alpha 敏感性（验 O4·T1 是否被欠正则埋） | spec `O4_R02_plus_ofi_safe T1_R02_plus_trade_impact`，`--ridge-alpha 5` 与 `20` 两跑 |
+| Q3 | P3.5 高先验交互（§7.10）：缺的交互特征/group 先建（scratch vs 注册自定） | — |
+| Q4 | 跨族组合（§4.5：各族最好的并成新 spec 重跑，组合不可加） | — |
+| Q5 | 综合 P1–P3.5 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档 |
 
 ## 当前阶段目标
 
-**方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；开跑前债务清零（#10–#20）已全部完成；基线已用锁定口径 relock 并锁定为单一 R02。**
+**方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；P1（OFI）、P2（成交冲击）均已跑完判负。**
 
-下一步主线：**正式开 P1（OFI 特征验证，O1–O6）。** 基线已在锁定口径（winsorize 开 + P1/P99、ridge alpha=2.0、float32）下重建为单一 R02，与 P1 候选同尺（见「当前最优基线」段）。P1/P2/P3 候选 spec 已写死在 `src/eval_protocol.py`（O/T/C 系列，均为 R02 + 新 group），底层 stage 在 PE1 已实现并注册——P1 是「候选过 rolling 关 + 对 R02 判 delta」，不是从零造特征。
+当前主线：**特征侧穷尽（P3 条件动量 → alpha 敏感性 → P3.5 交互 → 跨族组合），做完停在 P4 前。** 队列见上。P1/P2 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方 P1/P2 结论）。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
 
 ## 当前口径收敛（指针表）
 
