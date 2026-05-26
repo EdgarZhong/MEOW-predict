@@ -12,13 +12,20 @@
 | ✅Q2 | alpha 敏感性 — **否决**：alpha 不是杠杆，O4 跨 10× alpha 纹丝不动、T1 short 崩塌 shrinkage 救不了；alpha=2 锁定（详见 Q2 结论） | runs `20260526_q2_alpha5/20_daily_v1` 完成 |
 | ✅Q3 | P3.5 高先验交互（新建 4 项）— **判负零增益**；C2(lagret×X) 仍是唯一有戏交互（详见 Q3 结论） | run `20260526_q3_p35int_daily_v1` 完成 |
 | ✅Q4 | 跨族组合 X1=ofi_safe+cond_mom交互 — **三视角全过**：daily Δ+0.00305 + expanding Δ+0.0044(12/12全正,t7.35)；P1–Q4 唯一通过 expanding 硬门槛的候选，待用户定 11 月 Review（详见 Q4 结论） | daily + gate 均完成 |
-| Q5 | 综合 P1–Q4 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档；X1 若 expanding 也成立，交回用户定夺是否进 11 月 Review Holdout |
+| ✅Q5 | 综合 P1–Q4 + 对 P4 的建议 — **完成，特征侧收官，交回用户**（综合见 NOTE.md「P1–Q4 特征侧收官 + 对 P4 的建议」） | 纯分析+落档；交回点见下 |
+
+> **🚩 自动作业到此为止——交回用户两个决定**（详见 NOTE.md 收官节）：
+> 1. **X1 进不进 11 月 Review Holdout**（§4.8 红线，Claude 不跑）：建议 `--suite gate --candidate-spec-id X1_R02_plus_ofi_safe_condmom_interaction --include-review-holdout --n-workers 1`，11 月对得上则 X1 正式替 R02 当 backbone。
+> 2. **P4 怎么开**：建议 ① 对比基线换成 X1 特征集；② 决赛重点上浅树（Q3 已证线性吃不进交互，非线性是唯一未探方向）；③ 加权 long/expanding + minimax 防 ofi_safe 在 short 过拟合。
+> 另：失败 candidate `p35_interactions` 待用户定夺是否按 §7.3 归档（涉及删 spec/builder，Claude 不擅自动）。
 
 ## 当前阶段目标
 
-**方案 B（扩展 rolling 选模型）+ 两速评测结构已固定；P1（OFI）、P2（成交冲击）、P3（条件动量）均已跑完判负。**
+**方案 B + 两速评测结构已固定；特征侧穷尽（P1–Q4）已收官，停在 P4 前交回用户。**
 
-当前主线：**特征侧穷尽（P3 条件动量✅ → alpha 敏感性✅ → P3.5 交互✅ → 跨族组合🔵），做完停在 P4 前。** Q4 跨族组合 X1 **首次破地板（Δ+0.00305，review）**——P1–Q4 唯一站得住的候选；expanding 关口验证中。下一步 Q5 综合 + 交回。P1/P2/P3-C1 根因一致：基线 R02 的 `norm_core` 已含横截面标准化版本，单族线性追加边际≈0 或仅过拟合（详见下方各阶段结论）。**P3 新增信号**：C2 交互列（lagret×{ofi/spread/…}）是 P1 以来最干净候选——小而真（Δ+0.0019、跨 profile 同向、daily IC 双升），证明交互项比单族线性追加更有戏，已转为 Q3/Q4 抓手。评测口径已从"自动判卷"改为"诊断仪表盘+人工多角度判断"（AGENTS §4.6）。
+**特征侧总结论：单族线性加特征基本死路（P1 OFI / P2 成交冲击 / Q2 alpha 非杠杆 / Q3 §7.10 新交互零增益全否）；唯一破地板的是 Q4 的 X1 = R02 + `ofi_safe` + `conditional_momentum_interaction`**——把两个"小而真"的干净信号（OFI 长窗 +0.0027、动量×微结构交互 +0.0019）几乎可加地叠起来。X1 三视角全过：short(+0.0025)<long(+0.0036)<expanding(+0.0044) **Δ 随训练历史拉长单调增大**（鲁棒外推的正面信号）、expanding 12/12 全正、daily IC 三处皆升、不过拟合。它通过了 Claude 权限内全部关口（含 expanding 硬门槛 §4.4），是 P1–Q4 唯一站得住的候选，待用户定 11 月 Review。
+
+根因贯穿全程：基线 R02 的 `norm_core` 已含横截面标准化版本（cross-z），同族线性追加边际≈0 或仅过拟合；线性 Ridge 吃不进乘积/交互（Q3 实证）——故 P4 的增量希望在浅树等非线性模型。评测口径全程"诊断仪表盘+人工多角度判断"，不靠 decision 标签自动判卷（AGENTS §4.6，[[feedback-no-automated-grading]]）。
 
 ## 当前口径收敛（指针表）
 
