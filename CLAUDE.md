@@ -11,7 +11,7 @@
 | ✅Q1 | P3 条件动量（C1 本体 / C2 交互）— **判负**：C1 过拟合、C2 小而真但低于地板；C2 交互信号留作 Q3/Q4 抓手（详见 P3 结论） | run `20260526_p3_condmom_daily_v1` 完成 |
 | ✅Q2 | alpha 敏感性 — **否决**：alpha 不是杠杆，O4 跨 10× alpha 纹丝不动、T1 short 崩塌 shrinkage 救不了；alpha=2 锁定（详见 Q2 结论） | runs `20260526_q2_alpha5/20_daily_v1` 完成 |
 | ✅Q3 | P3.5 高先验交互（新建 4 项）— **判负零增益**；C2(lagret×X) 仍是唯一有戏交互（详见 Q3 结论） | run `20260526_q3_p35int_daily_v1` 完成 |
-| 🔵Q4 | 跨族组合 X1=ofi_safe+cond_mom交互 — **daily 首破地板 Δ+0.00305（review）**；expanding 关口验证中（详见 Q4 结论） | daily `20260526_q4_combo_daily_v1` 完成；gate `20260526_q4_gate_v1` 进行中 |
+| ✅Q4 | 跨族组合 X1=ofi_safe+cond_mom交互 — **三视角全过**：daily Δ+0.00305 + expanding Δ+0.0044(12/12全正,t7.35)；P1–Q4 唯一通过 expanding 硬门槛的候选，待用户定 11 月 Review（详见 Q4 结论） | daily + gate 均完成 |
 | Q5 | 综合 P1–Q4 + 对 P4 的建议，停在 P4 前交回用户 | 纯分析+落档；X1 若 expanding 也成立，交回用户定夺是否进 11 月 Review Holdout |
 
 ## 当前阶段目标
@@ -118,15 +118,22 @@ A–E 档 + S 档全部落地并验收；详细实施与验收留在 git 历史�
 
 ### Q4 跨族组合【§4.5 组合不可加，当新 spec 重跑】
 
-- [x] **Q4-daily：X1 = R02 + ofi_safe + conditional_momentum_interaction — 第一个破 +0.003 地板的候选（Δ=+0.00305，review）。** expanding 关口验证中。
-- [ ] Q4-gate：X1 的 expanding 慢车道关口（run `20260526_q4_gate_v1` 进行中，结果待补）。
+- [x] **Q4-daily：X1 = R02 + ofi_safe + conditional_momentum_interaction — 第一个破 +0.003 地板的候选（Δ=+0.00305，review）。**
+- [x] **Q4-gate：X1 expanding 慢车道关口确认（Δ=+0.0044，12/12 全正，t=7.35）——三视角全过，唯一通过 §4.4 expanding 硬门槛的候选。下一步 11 月 Review Holdout 属红线，交回用户。**
 
 **Q4 结论（daily run `20260526_q4_combo_daily_v1`，2026-05-26）：** 把两个唯一"小而真"的干净信号叠加——O4 的 `ofi_safe`（OFI 长窗 +0.0027 干净）+ C2 的 `conditional_momentum_interaction`（lagret×X，+0.0019 干净）——**首次破地板**。
 - 结果路径：`results/eval_protocol/20260526_q4_combo_daily_v1/`。Δcorr=**+0.00305**（make_decision=review，边界区 [0.003,0.005)）；protocol stability 0.0441↑（基线 0.0397）、corr_min 0.0252↑（基线 0.0194）。
 - per-profile（§4.7，全镜一致）：short Δ+0.0025 / t=1.91 / 15+4− / corr_min**+0.0035↑** / dailyIC+0.0037 / gap+0.0070（中等，来自 ofi_safe 列在 8d 窗的数据饥渴，但未造负折）；long Δ+0.0036 / t=3.46 / **6+0−** / corr_min**+0.0081↑** / dailyIC+0.0050 / gap+0.0015。
 - **一句话洞察**：①**几乎可加**——O4 单(+0.0016)+C2 单(+0.0019)=+0.0035，组合实测 +0.00305，略低于和=§4.5 预言的 OFI 信息重叠造成的轻微次可加，但大部分信号叠上了；②质量与 T1"虚涨真伤"相反：stability 升、两 profile corr_min 双升、daily IC 双升、两 profile 同向正——**这是整个 P1–Q4 第一个、也是唯一一个站得住的候选**。
-- 下一步（自动作业范围内）：已启动 expanding 慢车道关口（§4.4 promote 硬门槛、不碰 holdout）作第三视角验证；expanding 也成立则交回用户由其决定是否进 11 月 Review Holdout（holdout 红线，我不跑）。
 - 运行口径：daily 看门狗 + `--n-workers 1` 串行，exit 0。
+
+**Q4-gate 结论（expanding 关口 run `20260526_q4_gate_v1`，2026-05-26）：第三视角强确认 X1。**
+- 结果路径：`results/eval_protocol/20260526_q4_gate_v1/`（只跑 expanding profile，不含 holdout）。
+- X1 vs R02：Δcorr=**+0.0044**（比 daily 的 +0.00305 更高）、corr_mean 0.0668 vs 0.0624、stability 0.0518↑、corr_min 0.0410↑（基线 0.0335）；expanding 12 折 **Δval+0.0044 / t=7.35 / 12+0− 全正 / gap+0.0007（几乎不过拟合）/ corr_min+0.0076↑ / dailyIC+0.0061↑**。
+- **一句话洞察**：三视角 Δ 随训练历史拉长**单调增大**（short+0.0025 < long+0.0036 < expanding+0.0044），是"见效快但靠近期"危险型的**反面**——信号用更多历史预测未来时更可靠，最契合面向未知隐藏集的鲁棒性目标（[[hidden-test-unknown]]）。§4.7 六镜全过。
+- **X1 已通过 Claude 权限内全部关口**（short/long 快车道 + expanding 慢车道硬门槛 §4.4），是 P1–Q4 唯一通过 expanding 的候选。make_decision=review（+0.0044<0.005 未到 auto-promote，但 §4.3 真关卡=跨视角一致性，X1 达最佳）。
+- **下一步 = 11 月 Review Holdout（§4.8 红线，Claude 不跑）**：交回用户决定是否对 X1 跑 Review Holdout 复核，对得上再定 promote。
+- 运行口径：gate `--n-workers 1` 串行（避免 §5.1 双并行 expanding 尾段 OOM），expanding 尾段峰值 9.82GB（<11GB 硬阈，看门狗瞬时尖峰未误杀），exit 0。
 
 ### P4 稳健模型比较【P3.5 后】
 
