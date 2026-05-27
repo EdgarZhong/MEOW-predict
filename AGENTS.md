@@ -116,8 +116,9 @@ Dev Rolling 只有 ~105 个交易日，short profile 实际仅 ~5–6 个独立�
 | P4 选模型 | 用哪个模型 | short+long 初筛；expanding 只在 2–3 个决赛模型上跑 | 树吃数据、short 对树不公平 → 加权 long/expanding；**minimax：选最差折最好的，不是均值最高的** | 决赛才上 expanding |
 | P5 融合 | 融合 vs 单 backbone | 以 expanding 关口为准（只跑一次）+ 11月 Review + OOF 预测 | 不比 backbone 更稳就交 backbone；融合在 short 上的增益最像噪声 | 最少次，最高规格 |
 
-- **筛选只产出”候选”，不产出”采纳”**：过了快车道只进候选池，真正并入 backbone 必须过慢车道。
-- **expanding 是 promote 的硬门槛**：任何候选 promote 前必须单独跑过 expanding（与日常 suite 分开、配 memory guard；worker 数等提速口径见 `docs/specs/开跑前编码指导_评测口径与提速.md`），expanding 上不成立则不得 promote，**不得因为它慢而跳过**。这是 §4.6”缺 expanding 最高只能 review”的来源。
+- **筛选只产出”候选”，不产出”采纳”**：过了快车道只进候选池，真正并入 backbone 必须过慢车道；候选池里凡有收益迹象的都该进 expanding 验证（宽进），但能否采纳由 expanding + holdout 严判（严出）。
+- **expanding 是 promote 的必经关口（promote 的必要条件，不是进 expanding 的准入门槛）**：任何候选 promote 前必须单独跑过 expanding（与日常 suite 分开、配 memory guard；worker 数等提速口径见 `docs/specs/开跑前编码指导_评测口径与提速.md`），expanding 上不成立则不得 promote，**不得因为它慢而跳过**。这是 §4.6”缺 expanding 最高只能 review”的来源。
+- **宽进严出——进 expanding 不卡数字地板**：+0.003 是”采不采纳”（promote / 进 holdout）的参考线，**不是”要不要验证”的闸刀**。凡快车道（short+long）+每日 IC + §4.7 复核后判断**有真收益迹象**的候选（跨 profile 同向、小而真、不伤稳定性），都应进 expanding 让最可信的判官亲自看一眼，**哪怕单 profile 低于地板**；只有被多视角明确判定为**噪声或有害**（虚涨真伤、造新强负折、零增益）的才不进——是被分析否掉，不是被数字卡掉。expanding 仍要少看、防过拟合，但控次数靠快车道先滤掉明显无效的，**不靠数字地板武断卡**。（反面教训：C2/O4 单独低于地板却跨视角一致，曾被地板挡在 expanding 外，未让判官看过。）
 - **P4 起 expanding 更贵**：上树后训练成本高、且无法用线性增量技巧加速，所以只在少数决赛模型上跑，候选集要小。
 
 ### 4.5 组合不可加：叠加后必须重跑
@@ -145,6 +146,7 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 | `≥ 0.005` 且鲁棒诸条满足 | `promote` | 强候选，但仍走 §4.7 + holdout 才定 |
 
 - **分诊与判决分离**：上表是分诊起点的先验，不是"必须照此 promote/reject"的契约。标签是建议，最终由观察者（现在是我，带判断）拍板并向用户讲清理由。
+- **分诊标签不挡 expanding 验证**：`reject` / 低于 +0.003 地板只代表"暂不直接采纳"，**不代表"不准进 expanding"**。只要 §4.7 复核显示小而真、跨视角一致，低于地板的候选照样该进 expanding（宽进严出，§4.4）。把低于地板的干净候选挡在 expanding 外，等于用主观数字闸刀替代了多视角判断——这是被明令禁止的（[[feedback-no-automated-grading]]）。
 - **没跑 expanding 就不准 promote**：快车道（short+long）缺 expanding 时，分诊最高给到 `review`、不得 `promote`。这条仍是硬约束（§4.4 慢车道关口纪律）。
 - **排行榜排序键**：头条按 `protocol_corr_mean` 排（对齐老师评分，回答"大概能打多少分"），`stability_score` 等并排展示作守门镜头——不要拿 stability 当第一排序键，也不要因为排在前面就采纳。
 - **诊断量化口径**：`long 不显著翻负` = long `delta_corr ≥ −0.006`（约一个标准误，§4.3）；`新的强负折` = 候选使某折 corr 由非负转负（基线该折 ≥ 0、候选该折 < 0），或某折 corr < −0.01。
@@ -181,7 +183,7 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 
 1. 明确要改的一个变量（特征组 / 目标变换 / 模型 / 窗口）
 2. 在 `src/eval_protocol.py` 的 `ALL_SPECS` 里固定本轮候选 spec（§7.1）
-3. 先过快车道筛选（`--suite daily --spec-ids <本轮候选...>`，baseline 自动并入、同表算 delta；不带 `--spec-ids` 则跑默认 R 系列），过线候选再进慢车道关口（`--suite gate --candidate-spec-id <ID>`），按 §4.4 口径评测
+3. 先过快车道筛选（`--suite daily --spec-ids <本轮候选...>`，baseline 自动并入、同表算 delta；不带 `--spec-ids` 则跑默认 R 系列），**有收益迹象的候选**（跨 profile 同向、小而真，**不必过 +0.003 地板**）再进慢车道关口（`--suite gate --candidate-spec-id <ID>`），按 §4.4「宽进严出」口径评测
 4. 每个 run 跑完立即在 CLAUDE.md 当前阶段记一条实时记录（字段见 §一「CLAUDE.md 实验记录维护规范」）；阶段收口时把明细（§8.4 必录字段）沉淀进 `docs/实验记录.md`
 5. 与基线比较，只改一个变量；提交遵循 §八 commit 规范
 
@@ -194,11 +196,12 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 5. **【硬约束】每个 run 必须挂内存看门狗，无一例外**：凡执行 `experiments/p0_eval_protocol.py`（daily / gate / full / ridge / quick 任意 suite），必须经 `experiments/run_with_memory_guard.py` 包装，禁止裸跑。原因：被强杀（OOM）时后台任务不发完成通知、会无声消失（2026-05-26 P2 两次事故）。标准跑法：
    ```bash
    PYTHONPATH=src caffeinate -i python experiments/run_with_memory_guard.py \
-     --rss-limit-gb 9 --rss-hard-limit-gb 11 --log-file /tmp/<run>_guard.log \
+     --rss-limit-gb 9 --rss-hard-limit-gb 11 --log-file logs/memory_guard_<run>.log \
      -- python experiments/p0_eval_protocol.py --suite daily --spec-ids ... \
-        --run-id <run> --n-workers 1 > /tmp/<run>.log 2>&1
+        --run-id <run> --n-workers 1 > logs/<run>.log 2>&1
    ```
    - `caffeinate -i` 防休眠；看门狗软阈值 9GB / 硬阈值 11GB（16GB Mac 留 OS 余量）；输出**重定向到日志文件**（禁止 `| tail`，强杀时缓冲全丢）。
+   - **日志一律写项目内 `logs/`（已 gitignore、不入库），禁止写 `/tmp`**：/tmp 会被系统清理/重启蒸发、不可回溯（教训：2026-05-26 P1–Q4 共 9 个 run 的日志因写 /tmp 已全部丢失，仅 results/ 里的结果与落档洞察幸存）。命名对齐历史：看门狗 `logs/memory_guard_<run>.log`、stdout `logs/<run>.log`。
    - 长跑用 `--run-id` 固定、`--resume` 可续。
 6. **后台运行 + 定时盯岗**：长 run 用后台执行；中止任务一律 `TaskStop`（不要用 Bash `kill`，harness 不认）；离开期间靠 `CronCreate` 定时（≤1 小时间隔）自动回来查任务最新状态（看 leaderboard 产出 / `TaskList` / 日志尾部），覆盖「完成 / 静默死亡 / 卡死」三种终态，不依赖完成通知。
 6. **目标与输出回 raw `fret12`**：winsorize 只作用于训练标签，评测/提交一律原始 `fret12`；提交通道不依赖 `data/features/` 缓存、不依赖任何不可见统计量（§十 推理契约）。
