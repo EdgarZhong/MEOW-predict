@@ -47,9 +47,9 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 |---|---|---:|---:|---:|---|
 | 快车道 short+long | R02_ridge_legacy_plus_norm_core | 0.057168 | 0.039703 | 0.019425 | 线性 backbone |
 | expanding 关口 | R02_ridge_legacy_plus_norm_core | 0.062392 | 0.047159 | 0.033476 | 线性 backbone |
-| 候选（线性最优） | X1_R02_plus_ofi_safe_condmom_interaction | 0.066766(exp) | 0.051788 | 0.041041 | 树要打败的靶子；11 月 holdout 待用户 |
+| 候选（线性最优） | X1_R02_plus_ofi_safe_condmom_interaction | 0.066766(exp) | 0.051788 | 0.041041 | 树要打败的靶子；**11 月 holdout 已通过 0.07367（vs R02 0.06952）** |
 
-来源：`results/eval_protocol/20260526_p0relock_daily_v1` / `..._p0relock_gate_v1` / `..._q4_gate_v1`。
+来源：`results/eval_protocol/20260526_p0relock_daily_v1` / `..._p0relock_gate_v1` / `..._q4_gate_v1` / `..._x1_review_v1`（X1 review holdout）。
 
 ## 口径指针表（规则正文在 AGENTS，"为什么"在 NOTE）
 
@@ -74,7 +74,7 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | P4-1 | 树特征集 + 清脏列 + 模型 plumbing（前置研究）：**plumbing 已落地，未跑**（见下「P4-1 落地」） | ✅ 就绪 |
 | P4-2 | 模型选型 long-only 初筛（en/huber/浅树/浅HGB）+ 双镜头（mean+minimax） | 待开（plumbing 已备） |
 | P4-3 | 决赛 2–3 模型 expanding，打 X1 expanding 0.0668 靶子 | 待开 |
-| 🚩红线 | X1 进 11 月 Review Holdout（§4.8，Claude 不跑） | 交回用户 |
+| 🚩红线 | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，样本外跑赢 +0.0042**（run `20260527_x1_review_v1`） | ✅ 完成 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
 
 ### P4-1 落地（2026-05-27，import + 12 项 unittest 通过，未跑实验）
