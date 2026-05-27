@@ -163,8 +163,6 @@ ALL_SPECS: List[Dict] = [
     # C 系列：条件动量/反转（C1 = 条件动量最大集）
     {"experiment_id": "C1_R02_plus_conditional_momentum", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum"], "notes": "R02 plus 全部条件动量（默认取 stage 全列，最大集）"},
     {"experiment_id": "C2_R02_plus_conditional_momentum_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_interaction"], "notes": "R02 plus conditional momentum interactions"},
-    # I 系列：P3.5 高先验跨族交互（§7.10 中尚未建过的 4 项：ofi×spread / ofi×trade_activity / lagret12×order_pressure / trade_pressure×regime）
-    {"experiment_id": "I1_R02_plus_p35_interactions", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "p35_interactions"], "notes": "R02 plus P3.5 high-prior cross-family interactions (§7.10 remaining 4)"},
     # X 系列：跨族组合（§4.5 组合不可加，必须当新 spec 重跑）。X1 = 两个最干净的小而真信号叠加：O4 的 ofi_safe + C2 的 conditional_momentum_interaction
     {"experiment_id": "X1_R02_plus_ofi_safe_condmom_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"], "notes": "R02 plus OFI safe + conditional momentum interactions (§4.5 cross-family combo of best sub-floor signals)"},
 ]

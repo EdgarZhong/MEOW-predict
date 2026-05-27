@@ -75,7 +75,7 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | P4-2 | 模型选型 daily 初筛（ridge/en/huber/树）+ minimax | 待开 |
 | P4-3 | 决赛 2–3 模型 expanding | 待开 |
 | 🚩红线 | X1 进 11 月 Review Holdout（§4.8，Claude 不跑） | 交回用户 |
-| 清理 | 失败 stage `p35_interactions` 归档（§7.3，涉及删 spec/builder） | 待用户定 |
+| 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
 
 ## 已完成基建（备查）
 

@@ -955,43 +955,6 @@ def build_regime(raw: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     return _sanitize_feature_frame(out)
 
 
-def build_p35_interactions(
-    raw: pd.DataFrame,
-    base: pd.DataFrame,
-    ofi: pd.DataFrame,
-    trade_impact: pd.DataFrame,
-    regime: pd.DataFrame,
-) -> pd.DataFrame:
-    """P3.5 高先验跨族交互 stage（§7.10 中尚未建过的 4 项）。
-
-    §7.10 列了 6 个高先验交互，其中 trade_pressure_qty×spread 已在 trade_impact
-    stage（`trade_pressure_x_spread`，P2/T3 测得零增益）、lagret12×ofi_total 已在
-    conditional_momentum stage（`lagret12_x_ofi`，P3/C2 测得干净小信号）。本 stage 只
-    补齐剩余 4 项，避免重复列。
-
-    全部为**同期特征的点对点乘积**——源特征各自已遵守 shift(1)/cross-z 等历史约束，
-    同一时刻两个已知特征相乘不引入未来信息（与现有 `trade_pressure_x_*` 同理）。
-    candidate 状态：先验证是否带增量，过线才 promote、否则将本 builder 归档。
-    """
-    df = _concat_inputs(_sort_raw_frame(raw), base, ofi, trade_impact, regime)
-    out = pd.DataFrame(index=df.index)
-    ofi_total = df["ofi_total"].fillna(0.0)
-    spread = df["spread"].fillna(0.0)
-    trade_activity = df["trade_activity"].fillna(0.0)
-    lagret12 = df["lagret12"].fillna(0.0)
-    order_pressure = df["order_pressure"].fillna(0.0)
-    trade_pressure_qty = df["trade_pressure_qty"].fillna(0.0)
-    regime_score = df["regime_score"].fillna(0.0)
-    # OFI 在不同流动性/活跃度状态下的方向性（OFI × 价差 / × 成交活跃度）
-    out["i_ofi_x_spread"] = ofi_total * spread
-    out["i_ofi_x_trade_activity"] = ofi_total * trade_activity
-    # 动量在订单簿压力下的条件性（滞后收益 × 订单压力）
-    out["i_lagret12_x_order_pressure"] = lagret12 * order_pressure
-    # 成交压力在波动 regime 下的条件性（成交压力 × regime 分数）
-    out["i_trade_pressure_x_regime"] = trade_pressure_qty * regime_score
-    return _sanitize_feature_frame(out)
-
-
 registry = FeatureRegistry()
 
 registry.stage(
@@ -1179,13 +1142,6 @@ registry.stage(
     group_columns={"regime": _regime_columns()},
 )(build_regime)
 
-registry.stage(
-    name="p35_interactions",
-    deps=["base", "ofi", "trade_impact", "regime"],
-    groups=["p35_interactions"],
-    status="candidate",
-)(build_p35_interactions)
-
 
 __all__ = [
     "EPS",
@@ -1203,6 +1159,5 @@ __all__ = [
     "build_cross",
     "build_conditional_momentum",
     "build_regime",
-    "build_p35_interactions",
     "_make_schema_probe_raw",
 ]
