@@ -10,7 +10,7 @@ import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.linear_model import ElasticNet, HuberRegressor, Ridge
 from sklearn.metrics import mean_squared_error
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
@@ -372,6 +372,18 @@ class ExperimentRunner(object):
             return None
         return pd.DataFrame({"feature": list(feature_cols), "coef": coef, "abs_coef": np.abs(coef)})
 
+    def _extract_tree_importance(self, model, feature_cols):
+        # 树族特征重要性提取（镜像 _extract_linear_coefficients），供 P4-2 反偏颇/重要性扫描。
+        # 输出列对齐线性版的 coef/abs_coef，方便下游统一消费：coef=importance、abs_coef=importance。
+        inner = model.named_steps.get("model") if isinstance(model, Pipeline) else model
+        importance = getattr(inner, "feature_importances_", None)
+        if importance is None:
+            return None
+        importance = np.asarray(importance, dtype=np.float32).ravel()
+        if len(importance) != len(feature_cols):
+            return None
+        return pd.DataFrame({"feature": list(feature_cols), "coef": importance, "abs_coef": importance})
+
     def _fold_metric_row(self, fold_id, experiment_id, feature_set, target_type, model_type, postprocess_type, train_metrics, val_metrics, runtime_sec, notes, random_seed=42):
         return {
             "fold_id": fold_id,
@@ -523,7 +535,10 @@ class ExperimentRunner(object):
         series, _ = self._make_target_series(ydf, target_mode)
         return series
 
-    def fit_model(self, model_name, xtrain, ytrain, target_mode="raw", sample_weight=None):
+    def fit_model(self, model_name, xtrain, ytrain, target_mode="raw", sample_weight=None, model_params=None):
+        # model_params：来自 spec 的预钉超参覆盖（§4.9 各模型小网格预先钉死），
+        # 与各模型的默认参数合并；为 None 时完全走默认，不影响既有线性路径。
+        mp = dict(model_params or {})
         feature_cols = [c for c in xtrain.columns if c not in ["date", "symbol", "interval"]]
         x = xtrain[feature_cols].to_numpy(dtype=np.float32)
         y, baseline = self._make_target_series(ytrain, target_mode=target_mode)
@@ -542,57 +557,75 @@ class ExperimentRunner(object):
         if model_name == "ridge":
             model = Pipeline([
                 ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=self.ridge_alpha, fit_intercept=True, random_state=None)),
+                ("model", Ridge(alpha=mp.get("alpha", self.ridge_alpha), fit_intercept=True, random_state=None)),
             ])
         elif model_name == "elasticnet":
+            en_params = {"alpha": 0.0005, "l1_ratio": 0.1, "fit_intercept": True, "max_iter": 5000, "random_state": 42}
+            en_params.update(mp)
             model = Pipeline([
                 ("scaler", StandardScaler()),
-                ("model", ElasticNet(alpha=0.0005, l1_ratio=0.1, fit_intercept=True, max_iter=5000, random_state=42)),
+                ("model", ElasticNet(**en_params)),
+            ])
+        elif model_name == "huber":
+            # P4 候选：Huber 回归（对收益尾部稳健，介于 OLS/分位之间）。
+            # epsilon 越小越稳健；alpha 是 L2 正则。预钉默认，model_params 可覆盖。
+            hub_params = {"epsilon": 1.35, "alpha": 1e-4, "max_iter": 500, "fit_intercept": True}
+            hub_params.update(mp)
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", HuberRegressor(**hub_params)),
             ])
         elif model_name == "tree":
-            model = ExtraTreesRegressor(
-                n_estimators=40,
-                max_depth=16,
-                min_samples_leaf=50,
-                max_features=0.3,
-                bootstrap=True,
-                max_samples=0.7,
-                random_state=42,
-                n_jobs=1,
-            )
+            tree_params = {
+                "n_estimators": 40, "max_depth": 16, "min_samples_leaf": 50,
+                "max_features": 0.3, "bootstrap": True, "max_samples": 0.7,
+                "random_state": 42, "n_jobs": 1,
+            }
+            tree_params.update(mp)
+            model = ExtraTreesRegressor(**tree_params)
         elif model_name == "tree_big":
-            model = ExtraTreesRegressor(
-                n_estimators=120,
-                max_depth=20,
-                min_samples_leaf=20,
-                max_features=0.5,
-                bootstrap=True,
-                max_samples=0.8,
-                random_state=42,
-                n_jobs=1,
-            )
+            tree_big_params = {
+                "n_estimators": 120, "max_depth": 20, "min_samples_leaf": 20,
+                "max_features": 0.5, "bootstrap": True, "max_samples": 0.8,
+                "random_state": 42, "n_jobs": 1,
+            }
+            tree_big_params.update(mp)
+            model = ExtraTreesRegressor(**tree_big_params)
+        elif model_name == "tree_shallow":
+            # P4 浅 ExtraTrees（§六/CLAUDE：depth≤5）。极低信噪比下 depth 是主正则器；
+            # min_samples_leaf 在 ~200 万行上基本非约束、仅作下限。网格经 model_params 钉 depth。
+            tree_sh_params = {
+                "n_estimators": 300, "max_depth": 5, "min_samples_leaf": 500,
+                "max_features": 0.4, "bootstrap": True, "max_samples": 0.7,
+                "random_state": 42, "n_jobs": 1,
+            }
+            tree_sh_params.update(mp)
+            model = ExtraTreesRegressor(**tree_sh_params)
         elif model_name in {"gbdt", "histgb"}:
             if model_name == "histgb":
-                model = HistGradientBoostingRegressor(
-                    loss="squared_error",
-                    learning_rate=0.05,
-                    max_iter=200,
-                    max_depth=8,
-                    min_samples_leaf=50,
-                    l2_regularization=0.1,
-                    early_stopping=True,
-                    validation_fraction=0.1,
-                    random_state=42,
-                )
+                hgb_params = {
+                    "loss": "squared_error", "learning_rate": 0.05, "max_iter": 200,
+                    "max_depth": 8, "min_samples_leaf": 50, "l2_regularization": 0.1,
+                    "early_stopping": True, "validation_fraction": 0.1, "random_state": 42,
+                }
+                hgb_params.update(mp)
+                model = HistGradientBoostingRegressor(**hgb_params)
             else:
-                model = GradientBoostingRegressor(
-                    learning_rate=0.05,
-                    n_estimators=30,
-                    max_depth=2,
-                    min_samples_leaf=200,
-                    subsample=0.8,
-                    random_state=42,
-                )
+                gbdt_params = {
+                    "learning_rate": 0.05, "n_estimators": 30, "max_depth": 2,
+                    "min_samples_leaf": 200, "subsample": 0.8, "random_state": 42,
+                }
+                gbdt_params.update(mp)
+                model = GradientBoostingRegressor(**gbdt_params)
+        elif model_name == "histgb_shallow":
+            # P4 浅 HistGB（max_depth≤4 + 多轮 boosting 补深度，强 L2）。网格经 model_params 钉 depth/lr。
+            hgb_sh_params = {
+                "loss": "squared_error", "learning_rate": 0.05, "max_iter": 300,
+                "max_depth": 4, "min_samples_leaf": 200, "l2_regularization": 0.5,
+                "early_stopping": True, "validation_fraction": 0.1, "random_state": 42,
+            }
+            hgb_sh_params.update(mp)
+            model = HistGradientBoostingRegressor(**hgb_sh_params)
         elif model_name == "lgbm":
             if LGBMRegressor is None:
                 raise ImportError(
@@ -635,7 +668,7 @@ class ExperimentRunner(object):
             else:
                 model.fit(x, y, sample_weight=np.asarray(sample_weight, dtype=np.float32))
         except PermissionError:
-            if model_name != "histgb":
+            if model_name not in {"histgb", "histgb_shallow"}:
                 raise
             log.yellow("HistGradientBoosting hit a sandbox permission error, falling back to GradientBoostingRegressor.")
             model = GradientBoostingRegressor(
@@ -666,7 +699,7 @@ class ExperimentRunner(object):
         common = merged["interval_mean"].fillna(0.0).to_numpy(dtype=np.float32)
         return common + pred
 
-    def run(self, split_config, model_name, max_train_days=None, max_val_days=None, target_mode="raw"):
+    def run(self, split_config, model_name, max_train_days=None, max_val_days=None, target_mode="raw", model_params=None):
         return self.run_with_groups(
             split_config=split_config,
             model_name=model_name,
@@ -674,6 +707,7 @@ class ExperimentRunner(object):
             max_train_days=max_train_days,
             max_val_days=max_val_days,
             target_mode=target_mode,
+            model_params=model_params,
         )
 
     def run_with_groups(
@@ -685,6 +719,7 @@ class ExperimentRunner(object):
         max_val_days=None,
         target_mode="raw",
         loader=None,
+        model_params=None,
     ):
         train_dates, val_dates, test_dates = self.split_dates(split_config)
         log.inf(f"Train dates: {train_dates[0]} -> {train_dates[-1]} ({len(train_dates)})")
@@ -702,7 +737,7 @@ class ExperimentRunner(object):
             loader=loader,
         )
         log.inf(f"Train shape: {xtrain.shape}, Val shape: {xval.shape}")
-        model, feature_cols, baseline = self.fit_model(model_name, xtrain, ytrain, target_mode=target_mode)
+        model, feature_cols, baseline = self.fit_model(model_name, xtrain, ytrain, target_mode=target_mode, model_params=model_params)
         pred_train = self._predict_with_baseline(
             model,
             xtrain,
@@ -999,6 +1034,7 @@ class ExperimentRunner(object):
                 max_val_days=max_val_days,
                 target_mode=spec.get("target_mode", "raw"),
                 loader=loader,
+                model_params=spec.get("model_params"),
             )
             train_metrics = result["train_metrics"]
             val_metrics = result["val_metrics"]
@@ -1014,8 +1050,11 @@ class ExperimentRunner(object):
                     loader=loader,
                 )
                 xtrain = xtrain.loc[:, ~xtrain.columns.duplicated()].copy()
-                model, feature_cols, _ = self.fit_model(spec["model"], xtrain, ytrain, target_mode=spec.get("target_mode", "raw"))
+                model, feature_cols, _ = self.fit_model(spec["model"], xtrain, ytrain, target_mode=spec.get("target_mode", "raw"), model_params=spec.get("model_params"))
+                # 线性取系数；树/HGB 无 coef_ 时回退取特征重要性（供 P4-2 反偏颇/重要性扫描复用）。
                 coef_df = self._extract_linear_coefficients(model, feature_cols)
+                if coef_df is None:
+                    coef_df = self._extract_tree_importance(model, feature_cols)
         elif spec["type"] == "common_residual":
             result = self.run_common_residual_reconstruction(
                 split_config=fold_split,

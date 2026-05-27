@@ -1137,9 +1137,18 @@ registry.stage(
 registry.stage(
     name="regime",
     deps=["base"],
-    groups=["regime"],
+    groups=["regime", "regime_tree"],
     status="promoted",
-    group_columns={"regime": _regime_columns()},
+    group_columns={
+        "regime": _regime_columns(),
+        # regime_tree（P4 树专用）：去掉 state_spread_cs / state_activity_cs 两个
+        # “一天一值、当天全 symbol 相同”的广播常量——树会拿它们当“日期身份”乱切、
+        # 稀释重要性。state_vol_cs 是日内 rolling、非广播常量，保留。
+        "regime_tree": [
+            col for col in _regime_columns()
+            if col not in ("state_spread_cs", "state_activity_cs")
+        ],
+    },
 )(build_regime)
 
 

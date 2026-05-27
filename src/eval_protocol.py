@@ -129,6 +129,13 @@ BASELINE_SPEC = {
     "notes": "current stable ridge baseline",
 }
 
+# P4 选模型（§4.9）特征集口径：
+#   - 树喂“大集”让树自筛（含手工交互、保留 cross-z/cross-rank、regime 清广播脏列）；
+#     Fork A（2026-05-27 拍板）= 第一版含交互，跑重要性扫描一次回答“树是否真用得上交互 + 反偏颇”。
+#   - 线性候选（EN/Huber）沿用 X1 集做苹果对苹果；ridge-on-X1 即既有 X1 spec，不重复。
+P4_TREE_GROUPS = ["legacy", "norm_core", "ofi_safe", "trade_impact", "conditional_momentum", "lag", "roll", "patch_summary", "cross_rank", "regime_tree"]
+P4_LINEAR_GROUPS = ["legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"]  # = X1 集
+
 # 全部历史实验（含 baseline）
 ALL_SPECS: List[Dict] = [
     # R 系列：Ridge backbone 变体（最优基线对比）
@@ -165,6 +172,19 @@ ALL_SPECS: List[Dict] = [
     {"experiment_id": "C2_R02_plus_conditional_momentum_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "conditional_momentum_interaction"], "notes": "R02 plus conditional momentum interactions"},
     # X 系列：跨族组合（§4.5 组合不可加，必须当新 spec 重跑）。X1 = 两个最干净的小而真信号叠加：O4 的 ofi_safe + C2 的 conditional_momentum_interaction
     {"experiment_id": "X1_R02_plus_ofi_safe_condmom_interaction", "type": "standard", "model": "ridge", "target_mode": "raw", "groups": ["legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"], "notes": "R02 plus OFI safe + conditional momentum interactions (§4.5 cross-family combo of best sub-floor signals)"},
+    # M 系列：P4 选模型（§4.9，模型为变量、各自最佳集；预钉小网格防多重比较）。
+    # 初筛走 long-only（--profiles long_40d_5d）；决赛 2–3 个才上 expanding，打 X1 expanding 0.0668 靶子。
+    # 线性候选（用 X1 集；ridge-on-X1 = 既有 X1，不重复）：
+    {"experiment_id": "M_en_X1", "type": "standard", "model": "elasticnet", "target_mode": "raw", "groups": P4_LINEAR_GROUPS, "notes": "P4 model select: ElasticNet on X1 set"},
+    {"experiment_id": "M_huber_X1", "type": "standard", "model": "huber", "target_mode": "raw", "groups": P4_LINEAR_GROUPS, "notes": "P4 model select: Huber on X1 set"},
+    # 浅 ExtraTrees（树大集，depth 网格；leaf=500 当下限非约束，depth 是主正则器）：
+    {"experiment_id": "M_tree_d4", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4}, "notes": "P4 model select: shallow ExtraTrees depth=4 on tree set"},
+    {"experiment_id": "M_tree_d5", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 5}, "notes": "P4 model select: shallow ExtraTrees depth=5 on tree set"},
+    {"experiment_id": "M_tree_d6", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 6}, "notes": "P4 model select: shallow ExtraTrees depth=6 on tree set"},
+    # 浅 HistGB（树大集，depth/lr 网格；多轮 boosting 补浅 depth）：
+    {"experiment_id": "M_histgb_d3", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 3}, "notes": "P4 model select: shallow HistGB depth=3 on tree set"},
+    {"experiment_id": "M_histgb_d4", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4}, "notes": "P4 model select: shallow HistGB depth=4 on tree set"},
+    {"experiment_id": "M_histgb_d4_lr03", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4, "learning_rate": 0.03}, "notes": "P4 model select: shallow HistGB depth=4 lr=0.03 on tree set"},
 ]
 
 # Ridge baseline 子集（快速复现用）

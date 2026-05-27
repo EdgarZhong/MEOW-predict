@@ -71,11 +71,20 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | # | 任务 | 状态 |
 |---|---|---|
 | 线性收尾 | C2/O4 单独 expanding 跑完落档：均干净、低于地板、X1 真互补 | ✅ 完成 |
-| P4-1 | 树特征集设计 + 清脏列 + winsorize 重评（前置研究） | 待开 |
-| P4-2 | 模型选型 daily 初筛（ridge/en/huber/树）+ minimax | 待开 |
-| P4-3 | 决赛 2–3 模型 expanding | 待开 |
+| P4-1 | 树特征集 + 清脏列 + 模型 plumbing（前置研究）：**plumbing 已落地，未跑**（见下「P4-1 落地」） | ✅ 就绪 |
+| P4-2 | 模型选型 long-only 初筛（en/huber/浅树/浅HGB）+ 双镜头（mean+minimax） | 待开（plumbing 已备） |
+| P4-3 | 决赛 2–3 模型 expanding，打 X1 expanding 0.0668 靶子 | 待开 |
 | 🚩红线 | X1 进 11 月 Review Holdout（§4.8，Claude 不跑） | 交回用户 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
+
+### P4-1 落地（2026-05-27，import + 12 项 unittest 通过，未跑实验）
+
+- **树特征集（Fork A 拍板 = 先全含交互 + 跑重要性扫描）**：`eval_protocol.P4_TREE_GROUPS` = legacy + norm_core + ofi_safe + trade_impact + conditional_momentum + lag + roll + patch_summary + cross_rank + **regime_tree**。含手工交互（让重要性扫描一次回答「树是否真用得上交互」+ 反偏颇），保留 cross-z/cross-rank（树不自做按天截面归一），清广播脏列。
+- **regime_tree group**（feature_registry）：regime 11 列去掉 `state_spread_cs`/`state_activity_cs`（一天一值广播常量，树会当日期身份乱切）= 9 列；`state_vol_cs` 保留。
+- **模型 plumbing**（experiment_runner）：补 `huber`；加浅树变体 `tree_shallow`(ExtraTrees depth≤5)/`histgb_shallow`；`fit_model`/`run`/`run_with_groups`/`_evaluate_spec_on_fold` 加 `model_params` 穿透（预钉网格覆盖超参）；加 `_extract_tree_importance`（collect 路径线性 coef 为 None 时回退取重要性）。
+- **M 系列网格 spec**（ALL_SPECS，预钉防多重比较）：线性 `M_en_X1`/`M_huber_X1`（X1 集，ridge-on-X1=既有 X1）；浅 ExtraTrees `M_tree_d4/d5/d6`；浅 HistGB `M_histgb_d3/d4/d4_lr03`（树大集）。depth 是浅树主正则器、leaf=500 当下限非约束。
+- **winsorize 对树重评**：无需改码，用运行期 `--target-winsorize` 开关做 on/off A/B（默认沿用锁定 P1/P99）。
+- **下一步 P4-2 跑法（long-only 初筛车道）**：`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily --spec-ids M_en_X1 M_huber_X1 M_tree_d4 M_tree_d5 M_tree_d6 M_histgb_d3 M_histgb_d4 M_histgb_d4_lr03 --profiles long_40d_5d --n-workers 1`（日志写 `logs/`，看门狗）；靶子=X1 long-only 数；双镜头看 long corr_mean + long corr_min。
 
 ## 已完成基建（备查）
 
