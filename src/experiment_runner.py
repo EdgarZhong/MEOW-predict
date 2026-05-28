@@ -69,6 +69,8 @@ class ExperimentRunner(object):
         target_winsorize_config=None,
         feature_dtype="float32",
         ridge_alpha=DEFAULT_RIDGE_ALPHA,
+        train_subsample_frac=None,
+        train_subsample_seed=42,
     ):
         """
         实验执行器。
@@ -101,6 +103,51 @@ class ExperimentRunner(object):
         self.target_winsorize_config = self._normalize_target_winsorize_config(
             target_winsorize_config
         )
+        # P4 选模型提速：仅对“训练行”做降采样（验证集全量不动，保证排名指标不被污染）。
+        # 树模型是递归搜索、每行被重扫 depth×n_estimators 遍，砍训练行直接线性减算力 + 减内存；
+        # 线性是闭式解、行数近乎免费，故默认 1.0（关闭）不影响任何既有路径。
+        # 同 winsorize 一样挂 runner 级，主进程 / 串行 / 并行 worker 走同一份配置，避免口径漂移。
+        self.train_subsample_frac = self._normalize_train_subsample_frac(train_subsample_frac)
+        self.train_subsample_seed = int(train_subsample_seed)
+
+    def _normalize_train_subsample_frac(self, frac):
+        """None / 1.0 / 非正 → 视为关闭（返回 None）；否则裁到 (0, 1]。"""
+        if frac is None:
+            return None
+        frac = float(frac)
+        if frac <= 0 or frac >= 1.0:
+            return None
+        return frac
+
+    def get_train_subsample_frac(self):
+        """返回训练行降采样比例（None=关闭），供调度层透传给并行 worker。"""
+        return self.train_subsample_frac
+
+    # 仅对“算力贵”的树族模型降采样；线性模型（闭式解、秒级）始终全量，不付保真代价。
+    # smoke 实证：同折 0.33 vs 全量，树 corr 仅 -0.0004，而 ridge 达 -0.002 → 线性不值得采样。
+    _SUBSAMPLE_MODELS = frozenset({"tree", "tree_big", "tree_shallow", "histgb", "histgb_shallow", "gbdt", "lgbm"})
+
+    def _subsample_train_rows(self, xtrain, ytrain, model_name=None):
+        """
+        对训练特征/标签按相同行位做无放回降采样（带固定种子，可复现）。
+        - 只采训练，调用方不得对验证集调用本函数；
+        - 仅树族模型生效，线性模型直接全量返回（见 _SUBSAMPLE_MODELS）；
+        - 用全块均匀随机采样：每个交易日按比例变薄但全部保留，regime 覆盖不丢；
+        - 采样后保持原行序（排序行位），不依赖下游对顺序的假设。
+        """
+        frac = self.train_subsample_frac
+        if frac is None:
+            return xtrain, ytrain
+        if model_name is not None and model_name not in self._SUBSAMPLE_MODELS:
+            return xtrain, ytrain
+        n = len(xtrain)
+        k = int(n * frac)
+        if k <= 0 or k >= n:
+            return xtrain, ytrain
+        rng = np.random.default_rng(self.train_subsample_seed)
+        idx = np.sort(rng.choice(n, size=k, replace=False))
+        log.inf(f"Train subsample: frac={frac:.3f} rows {n} -> {k}（仅训练，验证集不动）")
+        return xtrain.iloc[idx], ytrain.iloc[idx]
 
     def _normalize_groups(self, groups):
         if groups is None:
@@ -736,6 +783,8 @@ class ExperimentRunner(object):
             max_days=max_val_days,
             loader=loader,
         )
+        # P4 提速：仅对树族模型降采样训练行；验证集 (xval/yval) 全量不动 → 打分/排名指标不被污染。
+        xtrain, ytrain = self._subsample_train_rows(xtrain, ytrain, model_name=model_name)
         log.inf(f"Train shape: {xtrain.shape}, Val shape: {xval.shape}")
         model, feature_cols, baseline = self.fit_model(model_name, xtrain, ytrain, target_mode=target_mode, model_params=model_params)
         pred_train = self._predict_with_baseline(

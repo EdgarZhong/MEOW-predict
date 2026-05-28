@@ -91,5 +91,68 @@ class TestTargetWinsorize(unittest.TestCase):
             self._make_runner(ridge_alpha=0.0)
 
 
+class TestTrainSubsample(unittest.TestCase):
+    """锁住 P4 训练行降采样口径：仅树族生效、验证集不参与、x/y 同位、可复现、全交易日保留。"""
+
+    def _make_runner(self, frac=None, seed=42):
+        return ExperimentRunner(
+            h5dir="dummy-data",
+            feature_dir="dummy-features",
+            loader_cls=_DummyLoader,
+            feature_loader_cls=_DummyFeatureLoader,
+            train_subsample_frac=frac,
+            train_subsample_seed=seed,
+        )
+
+    def _make_xy(self, n=9000, days=30):
+        import pandas as pd
+        x = pd.DataFrame({"a": np.arange(n), "b": np.arange(n) * 2.0})
+        y = pd.DataFrame({"date": np.arange(n) // (n // days), "fret12": np.arange(n) * 0.1})
+        return x, y
+
+    def test_normalize_disables_on_edge_values(self):
+        """None / 1.0 / 0 / 负 / >1 一律视为关闭（None）；(0,1) 内才保留。"""
+        self.assertIsNone(self._make_runner(None).get_train_subsample_frac())
+        self.assertIsNone(self._make_runner(1.0).get_train_subsample_frac())
+        self.assertIsNone(self._make_runner(0.0).get_train_subsample_frac())
+        self.assertIsNone(self._make_runner(-0.5).get_train_subsample_frac())
+        self.assertIsNone(self._make_runner(1.5).get_train_subsample_frac())
+        self.assertAlmostEqual(self._make_runner(0.33).get_train_subsample_frac(), 0.33)
+
+    def test_tree_model_is_subsampled(self):
+        """树族模型按比例无放回降采样：行数对、x/y 同位、保序。"""
+        runner = self._make_runner(0.33)
+        x, y = self._make_xy()
+        xs, ys = runner._subsample_train_rows(x, y, model_name="tree_shallow")
+        self.assertEqual(len(xs), int(len(x) * 0.33))
+        self.assertEqual(list(xs.index), list(ys.index))           # x/y 必须同位
+        self.assertEqual(list(xs.index), sorted(xs.index))         # 采样后保序
+
+    def test_linear_model_keeps_full_rows(self):
+        """线性模型（闭式解、秒级）始终全量，不付保真代价。"""
+        runner = self._make_runner(0.33)
+        x, y = self._make_xy()
+        for m in ("ridge", "elasticnet", "huber"):
+            xs, ys = runner._subsample_train_rows(x, y, model_name=m)
+            self.assertEqual(len(xs), len(x), f"线性 {m} 不应被采样")
+
+    def test_reproducible_and_all_days_retained(self):
+        """同种子结果可复现；全块均匀采样后所有交易日仍被保留（regime 覆盖不丢）。"""
+        runner = self._make_runner(0.33, seed=42)
+        x, y = self._make_xy()
+        xs1, _ = runner._subsample_train_rows(x, y, model_name="histgb_shallow")
+        xs2, _ = runner._subsample_train_rows(x, y, model_name="histgb_shallow")
+        self.assertEqual(list(xs1.index), list(xs2.index))         # 可复现
+        _, ys = runner._subsample_train_rows(x, y, model_name="tree_shallow")
+        self.assertEqual(set(ys["date"]), set(y["date"]))          # 全交易日保留
+
+    def test_disabled_frac_is_noop(self):
+        """frac 关闭时，即便树族模型也原样返回。"""
+        runner = self._make_runner(None)
+        x, y = self._make_xy()
+        xs, ys = runner._subsample_train_rows(x, y, model_name="tree_shallow")
+        self.assertEqual(len(xs), len(x))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

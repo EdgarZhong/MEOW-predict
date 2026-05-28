@@ -196,6 +196,11 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 4. **判官 = 均值 + 鲁棒双镜头，全程维持**：老师只算一个 pooled corr（均值型量），所以 `corr_mean` 必须看（对齐评分）；但隐藏集是未知分布**抽一次**、可能撞最难行情，所以**同时**看鲁棒（最坏折 / minimax：最坏折最好的）。**两个一起看、人工权衡**，维持"均值有竞争力 + 最坏折稳"这个原则即可，**不设死 ε 公式、不退化成单指标闸刀**（延续 §4.6「指标当仪表盘、不自动判卷」）。
 5. **每模型各自的小超参网格、预先钉死**：~5 模型 × 各自小网格，比较次数远多于线性单变量 → 多重比较风险更大（§4.3 garden of forking paths）。网格**小而有据**（树 `max_depth≤5` 硬顶）、**开跑前一次固定、禁止边跑边加**。赢家必须过 expanding + 11 月 Review Holdout 才算数，不是 dev 榜首即采纳。
 6. **winsorize 对每个模型重评**：`P1/P99` 是线性 MSE 防尾部锁的（§7.11）；树用分裂点、机制不同。winsorize 进入每模型的小配置项，**不照搬线性锁**。
+7. **树初筛提速口径（2026-05-27 smoke 实测锁定，不动评测协议、不破坏排名保真）**：long-only 对树仍太贵——全量 2.76M 行 × 单核，单折 26–58min；根因是树=递归搜索（每行被重扫 depth×n_estimators 遍）而非线性的闭式矩阵解（行数近乎免费）。三件套：
+   - **训练行降采样**（`--train-subsample-frac 0.33`）：仅采**训练**行、**验证集全量不动**（打分/排名指标不被污染）；**仅树族生效，线性始终全量**（`_SUBSAMPLE_MODELS` 门控）。smoke 同折 0.33 vs 全量：树 corr 0.0667 vs 0.0671（Δ-0.0004，可忽略），ridge 0.0463 vs 0.0483（Δ-0.002，故线性不采）。
+   - **线程级多核**（ExtraTrees `n_jobs=8`，已钉进 M_tree spec 的 `model_params`）：树天然可并行、多线程**共享同一份数据不增内存**；因 `LOKY_MAX_CPU_COUNT=1` 自动探核失效，必须显式给 `n_jobs`。**进程级并行（`--n-workers`）恒为 1**——单 fit 已吃满 8 核（实测 ~790-800% CPU），再开进程只切分同一块算力蛋糕、还翻倍内存，零吞吐收益（HistGB 走 OpenMP 已自带多核）。
+   - **保留 300 树**（不砍到 100）：前两招已让单折 30min→~1.8min，无需牺牲森林方差/排名稳健性。
+   - 合计单折 **~15-30×** 提速、内存峰 **9.4GB→~3.2GB**。决赛 2–3 个模型再切回**全量行 + expanding** 精确定胜负。
 
 **沿用不变**：三层 Holdout（§4.8）、daily IC「均值÷波动」（§4.7 第 4 步）、§4.7 逐折复核法、无未来信息/泄漏（§三）、提交契约（§十）、"expanding 少看防过拟合"（树更贵，决赛 2–3 个）。
 
@@ -210,7 +215,7 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 ### 5.1 跑命令前自查清单（每次执行 `experiments/*.py` 前逐条过）
 
 1. **suite 选对了吗**：日常筛选 `--suite daily`（short+long+每日IC）；筛 P1–P3 候选用 `--suite daily --spec-ids O1_... O6_...`（baseline 自动并入、同表算 delta，不给 `--spec-ids` 才跑默认 R 系列）；提交关口 `--suite gate --candidate-spec-id <ID>`（候选 vs 基线、只跑 expanding）。别拿 `full`/`ridge` 当日常。
-2. **macOS 并行度上限（16GB）**：`gate` / `expanding` 必须显式 `--n-workers 1`（`gate` 默认压到 2 worker，会撞「双并行 expanding 尾段」OOM，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c）。**`daily` 默认 `n_workers=4`，在这台 16GB Mac 上同样过猛**——`long_40d_5d` 长窗 heavy 组并行时实测会被杀（2026-05-26 P2 事故），daily 也必须显式 `--n-workers 1` 串行跑。只有迁到 20GB+ 空闲内存机器才考虑放开。
+2. **macOS 并行度上限（16GB）**：`gate` / `expanding` 必须显式 `--n-workers 1`（`gate` 默认压到 2 worker，会撞「双并行 expanding 尾段」OOM，口径见 `docs/specs/开跑前编码指导_评测口径与提速.md` §2c）。**`daily` 默认 `n_workers=4`，在这台 16GB Mac 上同样过猛**——`long_40d_5d` 长窗 heavy 组并行时实测会被杀（2026-05-26 P2 事故），daily 也必须显式 `--n-workers 1` 串行跑。只有迁到 20GB+ 空闲内存机器才考虑放开。**树初筛要多核靠模型内 `n_jobs`（线程级、共享内存），不靠 `--n-workers`——后者恒为 1**（单 fit 已吃满核，进程级并行只翻内存无吞吐；口径见 §4.9 第 7 点）。
 3. **候选 spec 已一次性固定**：禁止边加 spec 边重筛（§4.3 多重比较）。本轮要比的全集先定死、一起跑、一起看。
 4. **已锁默认别手改**：训练标签 winsorize = 开启 + P1/P99，ridge alpha = 2.0，特征 dtype = float32，都是 P0.5 扫锁结论（§7.11 / §7.7）。要做对照才显式覆写，且记录在案。
 5. **【硬约束】每个 run 必须挂内存看门狗，无一例外**：凡执行 `experiments/p0_eval_protocol.py`（daily / gate / full / ridge / quick 任意 suite），必须经 `experiments/run_with_memory_guard.py` 包装，禁止裸跑。原因：被强杀（OOM）时后台任务不发完成通知、会无声消失（2026-05-26 P2 两次事故）。标准跑法：
@@ -220,7 +225,8 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
      -- python experiments/p0_eval_protocol.py --suite daily --spec-ids ... \
         --run-id <run> --n-workers 1 > logs/<run>.log 2>&1
    ```
-   - `caffeinate -i` 防休眠；看门狗软阈值 9GB / 硬阈值 11GB（16GB Mac 留 OS 余量）；输出**重定向到日志文件**（禁止 `| tail`，强杀时缓冲全丢）。
+   - **树初筛变体**：在上面命令尾部加 `--train-subsample-frac 0.33`（仅树族采训练行、线性自动全量；`n_jobs=8` 已钉进 M_tree spec，无需命令行传）。这样树初筛单折 ~1.8min、内存峰 ~3.2GB，可安全跑全 9 个 spec（口径见 §4.9 第 7 点）。
+   - `caffeinate -i` 防休眠；看门狗软阈值 12GB / 硬阈值 13GB（16GB Mac 留 OS 余量；v3 实测 peak 11.06GB 安全通过）；输出**重定向到日志文件**（禁止 `| tail`，强杀时缓冲全丢）。
    - **日志一律写项目内 `logs/`（已 gitignore、不入库），禁止写 `/tmp`**：/tmp 会被系统清理/重启蒸发、不可回溯（教训：2026-05-26 P1–Q4 共 9 个 run 的日志因写 /tmp 已全部丢失，仅 results/ 里的结果与落档洞察幸存）。命名对齐历史：看门狗 `logs/memory_guard_<run>.log`、stdout `logs/<run>.log`。
    - 长跑用 `--run-id` 固定、`--resume` 可续。
 6. **后台运行 + 定时盯岗**：长 run 用后台执行；中止任务一律 `TaskStop`（不要用 Bash `kill`，harness 不认）；离开期间靠 `CronCreate` 定时（≤1 小时间隔）自动回来查任务最新状态（看 leaderboard 产出 / `TaskList` / 日志尾部），覆盖「完成 / 静默死亡 / 卡死」三种终态，不依赖完成通知。

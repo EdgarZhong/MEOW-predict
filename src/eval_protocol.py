@@ -178,9 +178,11 @@ ALL_SPECS: List[Dict] = [
     {"experiment_id": "M_en_X1", "type": "standard", "model": "elasticnet", "target_mode": "raw", "groups": P4_LINEAR_GROUPS, "notes": "P4 model select: ElasticNet on X1 set"},
     {"experiment_id": "M_huber_X1", "type": "standard", "model": "huber", "target_mode": "raw", "groups": P4_LINEAR_GROUPS, "notes": "P4 model select: Huber on X1 set"},
     # 浅 ExtraTrees（树大集，depth 网格；leaf=500 当下限非约束，depth 是主正则器）：
-    {"experiment_id": "M_tree_d4", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4}, "notes": "P4 model select: shallow ExtraTrees depth=4 on tree set"},
-    {"experiment_id": "M_tree_d5", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 5}, "notes": "P4 model select: shallow ExtraTrees depth=5 on tree set"},
-    {"experiment_id": "M_tree_d6", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 6}, "notes": "P4 model select: shallow ExtraTrees depth=6 on tree set"},
+    # n_jobs=8：ExtraTrees 在模型内(L2 线程级)并行建树，共享同一份训练数据、不复制内存。
+    # 因 experiment_runner 把 LOKY_MAX_CPU_COUNT 钉成 1，自动探核失效，故必须显式给 n_jobs。
+    {"experiment_id": "M_tree_d4", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4, "n_jobs": 8}, "notes": "P4 model select: shallow ExtraTrees depth=4 on tree set"},
+    {"experiment_id": "M_tree_d5", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 5, "n_jobs": 8}, "notes": "P4 model select: shallow ExtraTrees depth=5 on tree set"},
+    {"experiment_id": "M_tree_d6", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 6, "n_jobs": 8}, "notes": "P4 model select: shallow ExtraTrees depth=6 on tree set"},
     # 浅 HistGB（树大集，depth/lr 网格；多轮 boosting 补浅 depth）：
     {"experiment_id": "M_histgb_d3", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 3}, "notes": "P4 model select: shallow HistGB depth=3 on tree set"},
     {"experiment_id": "M_histgb_d4", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4}, "notes": "P4 model select: shallow HistGB depth=4 on tree set"},
@@ -834,6 +836,7 @@ class EvaluationProtocolRunner:
                 target_winsorize_config=self.runner.get_target_winsorize_config(),
                 feature_dtype=getattr(self.runner, "feature_dtype", "float32"),
                 ridge_alpha=self.runner.get_ridge_alpha(),
+                train_subsample_frac=self.runner.get_train_subsample_frac(),
             )
             if _fold_metrics_csv:
                 scheduler.set_output_path(_fold_metrics_csv)

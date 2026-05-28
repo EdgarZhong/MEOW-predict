@@ -1,8 +1,41 @@
 # CLAUDE.md — 当前阶段进度与任务看板
 
-更新日期：2026-05-27
+更新日期：2026-05-28
 
-## 当前阶段：P4 开局（稳健模型比较，重心 = 树）
+## 当前阶段：P4-2b 树侧精炼（LightGBM + 补深度 + 精简集，准备中）
+
+> P4-2 初筛 v3 已完成读榜（见下）。ExtraTrees d6 双镜头第一，但深度单调递增还没到头（d4<d5<d6）、GBDT 侧只试了 sklearn HistGB（弱化版）没上老师推荐的 LightGBM。**P4-2b 补一轮 long-only 精炼再进决赛。**
+
+### P4-2 初筛 v3 结论（2026-05-28 读榜，run `20260527_p42_modelselect_longscreen_v3`）
+
+✅ 干净跑完（returncode=0，peak RSS 11.06GB，看门狗 soft 12 / hard 13 未触发）。10 个候选 × 6 折 long_40d_5d，0.33 采样训练。
+
+| # | 模型 | corr_mean | corr_min | stability | daily_ic | val_corr std | gap |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | **M_tree_d6** | **0.0708** | **0.0511** | **0.0601** | 0.0659 | 0.017 | 0.012 |
+| 2 | X1 (ridge) | 0.0703 | 0.0403 | 0.0523 | 0.0507 | 0.028 | 0.008 |
+| 3 | M_tree_d5 | 0.0680 | 0.0476 | 0.0573 | 0.0640 | 0.017 | 0.007 |
+| 4 | R02 baseline | 0.0667 | 0.0321 | 0.0476 | 0.0457 | 0.030 | 0.006 |
+| 5-7 | HistGB ×3 | 0.061–0.065 | — | — | — | — | — |
+| 8-9 | Huber / EN | 0.055–0.060 | — | — | — | — | — |
+
+**双镜头判断：**
+- **树的最大优势在鲁棒性（方差压缩）**：M_tree_d6 均值仅比 X1 高 +0.0005，但 corr_min 高 +0.0108（0.051 vs 0.040），逐折 std 几乎减半（0.017 vs 0.028）。树把好折的分匀给差折——隐藏测试集分布未知，minimax 天然利好树。
+- **深度单调递增还没到头**：d4(0.063) < d5(0.068) < d6(0.071)，d6 不是峰值而是截断，需补 d7/d8 看拐点。
+- **d6 有轻微过拟合倾向**：gap=0.012（d5=0.007），fold 4-5 gap 达 0.032-0.035，expanding 时需关注。
+- **HistGB 全线不如 ExtraTrees**（均低于 R02），但 HistGB 是 sklearn 简化版——真正的 LightGBM（GBDT 正牌选手、老师方案推荐）还没上场。
+- **线性替代（EN/Huber）全败**：Ridge 已是线性族天花板。
+- 结果路径：`results/eval_protocol/20260527_p42_modelselect_longscreen_v3/`
+
+**P4-2b 精炼计划（补一轮 long-only 再进决赛）：**
+1. **上 LightGBM**：安装 lightgbm + 加 M_lgbm 浅深度 spec（代码已有 `lgbm` 分支 plumbing，只差装包 + 钉 spec）
+2. **补深度 d7/d8**：ExtraTrees 深度还没到头，补两个点看拐点（估算 +70 min，内存不变）
+3. **精简树特征集**：按 P4-2' 重要性结论剪手工交互列（0.90%≈0）+ raw ofi（0.29%）→ 减噪
+
+**P4-2 提速配置（不变，口径见 AGENTS §4.9 第 7 点 / §5.1）：**
+- `--train-subsample-frac 0.33`（仅树族采训练行、验证集全量不动、线性自动全量）；ExtraTrees `n_jobs=8`（已钉进 M_tree spec）；`--n-workers 1` 不变；保留 300 树。
+- smoke 实证：保真 Δ-0.0004、提速 ~15-30×、内存 9.4→3.2GB。
+- 代码落地：`experiment_runner` 加 `train_subsample_frac` + `_subsample_train_rows`（树族门控）；CLI/scheduler 全链路透传；5 项新单测通过。
 
 特征侧（P1–Q4，线性 Ridge）已收官，全量明细沉淀至 `docs/实验记录.md`。一句话结论：
 
@@ -27,7 +60,7 @@
 4. （可选）特征重要性预探缩集 + 浅树 expanding 单折算力/内存 smoke。
 
 **【模型选型口径 — 协议已改写，正文见 AGENTS §4.9】** 选模型 = 模型为变量，§4.1–4.8 的特征增量口径要改写（2026-05-27 拍板）：
-- 候选：Ridge / ElasticNet / Huber / 浅 ExtraTrees(depth≤5) / 浅 HistGB（AGENTS §六）。
+- 候选：Ridge / ElasticNet / Huber / 浅 ExtraTrees(depth≤5) / 浅 HistGB / **LightGBM**（AGENTS §六）。
 - **对照单元 = 每模型用各自最佳特征集（按类型指派、非搜索）**：树喂"去手工交互+清 regime 脏列"大集自选，ridge/EN/Huber 用 X1 集。目标 = 最准提交（不究模型归因）。
 - **退役 +0.003 地板 + make_decision**（仅选模型语境）：模型互换不是特征增量，地板统计推导不适用。
 - **profile 重心挪 long/expanding，short 降为过拟合诊断**（short=8 天对树不公平）；便宜初筛用 **long-only**，决赛 2–3 个才上 expanding（树贵）。
@@ -71,9 +104,12 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | # | 任务 | 状态 |
 |---|---|---|
 | 线性收尾 | C2/O4 单独 expanding 跑完落档：均干净、低于地板、X1 真互补 | ✅ 完成 |
-| P4-1 | 树特征集 + 清脏列 + 模型 plumbing（前置研究）：**plumbing 已落地，未跑**（见下「P4-1 落地」） | ✅ 就绪 |
-| P4-2 | 模型选型 long-only 初筛（en/huber/浅树/浅HGB）+ 双镜头（mean+minimax） | 待开（plumbing 已备） |
-| P4-3 | 决赛 2–3 模型 expanding，打 X1 expanding 0.0668 靶子 | 待开 |
+| P4-1 | 树特征集 + 清脏列 + 模型 plumbing（前置研究）：**plumbing 已落地**（见「P4-1 落地」） | ✅ 就绪 |
+| P4-2 | 模型 long-only 初筛：v1 OOM→提速→v3 干净跑完（`20260527_p42_modelselect_longscreen_v3`），双镜头读榜见上 | ✅ 完成 |
+| P4-2′ | 树重要性扫描（Fork A）：run `20260527_p4_tree_importance_v1` 干净跑完，结论落档 `docs/实验记录.md`（剪交互 / trade被低估 / ofi没错杀） | ✅ 完成 |
+| P4-2提速 | 训练行采样 plumbing（仅树族门控 + 全链路透传）+ 5 项新单测 + smoke 实测保真/提速/内存 + 文档收敛 | ✅ 完成 |
+| P4-2b | 树侧精炼：① 上 LightGBM（装包+钉 spec）② 补 ExtraTrees d7/d8 ③ 按重要性结论精简树特征集（剪手工交互+raw ofi）→ 合并跑一轮 long-only | ⏳ 准备中 |
+| P4-3 | 决赛 2–3 模型 expanding（全量行 + 300 树），打 X1 expanding 0.0668 靶子 | 待开（等 P4-2b 读榜） |
 | 🚩红线 | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，样本外跑赢 +0.0042**（run `20260527_x1_review_v1`） | ✅ 完成 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
 
@@ -84,7 +120,21 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 - **模型 plumbing**（experiment_runner）：补 `huber`；加浅树变体 `tree_shallow`(ExtraTrees depth≤5)/`histgb_shallow`；`fit_model`/`run`/`run_with_groups`/`_evaluate_spec_on_fold` 加 `model_params` 穿透（预钉网格覆盖超参）；加 `_extract_tree_importance`（collect 路径线性 coef 为 None 时回退取重要性）。
 - **M 系列网格 spec**（ALL_SPECS，预钉防多重比较）：线性 `M_en_X1`/`M_huber_X1`（X1 集，ridge-on-X1=既有 X1）；浅 ExtraTrees `M_tree_d4/d5/d6`；浅 HistGB `M_histgb_d3/d4/d4_lr03`（树大集）。depth 是浅树主正则器、leaf=500 当下限非约束。
 - **winsorize 对树重评**：无需改码，用运行期 `--target-winsorize` 开关做 on/off A/B（默认沿用锁定 P1/P99）。
-- **下一步 P4-2 跑法（long-only 初筛车道）**：`PYTHONPATH=src python experiments/p0_eval_protocol.py --suite daily --spec-ids M_en_X1 M_huber_X1 M_tree_d4 M_tree_d5 M_tree_d6 M_histgb_d3 M_histgb_d4 M_histgb_d4_lr03 --profiles long_40d_5d --n-workers 1`（日志写 `logs/`，看门狗）；靶子=X1 long-only 数；双镜头看 long corr_mean + long corr_min。
+- **P4-2 跑法（long-only 初筛车道）**：`p0_eval_protocol.py --suite daily --spec-ids X1_... M_en_X1 M_huber_X1 M_tree_d4/d5/d6 M_histgb_d3/d4/d4_lr03 --profiles long_40d_5d --n-workers 1 --train-subsample-frac 0.33`（看门狗包装、日志写 `logs/`）。⚠️ 此 P4-1 时点的初版命令**漏了 `--train-subsample-frac`**，v1 全量行×单核跑树被内存看门狗杀；提速口径见上「P4-2 提速配置」+ AGENTS §4.9 第 7 点，正式跑法以 v2 为准。
+
+## P4-2b 交接（下一会话接手点）
+
+**P4-2 初筛 v3 已完成读榜（结论见上），树侧还有空间：深度没到头 + LightGBM 没上场 + 特征集未精简。P4-2b 补一轮 long-only 精炼再进决赛。**
+
+**P4-2b 要做的（代码改动 + 跑一轮）：**
+1. `pip install lightgbm` + 在 `eval_protocol.py` 加 M_lgbm spec（浅深度，预钉网格）
+2. 加 M_tree_d7 / M_tree_d8 spec（ExtraTrees depth=7/8，其他参数同 d4-d6）
+3. 精简树特征集 `P4_TREE_GROUPS_V2`：从 P4_TREE_GROUPS 中去掉 `conditional_momentum`（手工交互，重要性 0.90%）；raw ofi 暂保留（ofi_safe 含 cross-z/rank，不是纯 raw）
+4. 合并跑一轮 long-only（新 spec + 精简集 + X1/R02 对照）
+
+**看门狗阈值**：soft 12GB / hard 13GB（v3 实测 peak 11.06GB，安全）。
+
+**红线提醒**：11 月 Review holdout 已用于 X1 确认（§4.8），**不得再用 11 月调参/选模型**；12 月 Final holdout 全程未碰、最终一次性用。选模型只在 Dev rolling / long / expanding 上做。
 
 ## 已完成基建（备查）
 

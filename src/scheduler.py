@@ -56,7 +56,7 @@ def _fold_group_worker(args: tuple) -> List[dict]:
     每个 worker 在进程内创建独立 ExperimentRunner + FeatureLoader，
     按顺序处理组内各 fold。数据加载直接走 FeatureLoader，不再清理旧 cache。
 
-    args: (h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys)
+    args: (h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys, train_subsample_frac)
     返回: list[FoldResult.to_dict()]
     """
     # macOS 'spawn' 模式：确保 src/ 在 sys.path 中
@@ -68,7 +68,7 @@ def _fold_group_worker(args: tuple) -> List[dict]:
     from feature_loader import FeatureLoader
     from trainer import FoldData, TabularTrainer
 
-    h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys = args
+    h5dir, feature_dir, target_winsorize_config, feature_dtype, ridge_alpha, fold_group, specs, completed_keys, train_subsample_frac = args
 
     runner = ExperimentRunner(
         h5dir,
@@ -76,6 +76,7 @@ def _fold_group_worker(args: tuple) -> List[dict]:
         target_winsorize_config=target_winsorize_config,
         feature_dtype=feature_dtype,
         ridge_alpha=ridge_alpha,
+        train_subsample_frac=train_subsample_frac,
     )
     loader = FeatureLoader(h5dir=h5dir, feature_dir=feature_dir, feature_dtype=feature_dtype)
     results: List[dict] = []
@@ -253,11 +254,15 @@ class ParallelScheduler:
         target_winsorize_config: Optional[Dict[str, object]] = None,
         feature_dtype: str = "float32",
         ridge_alpha: float = 2.0,
+        train_subsample_frac: Optional[float] = None,
     ):
         self.h5dir = h5dir
         self.feature_dir = feature_dir
         self.n_workers = n_workers
         self.heavy_max_workers = heavy_max_workers
+        # P4 训练行降采样比例（None=关闭）。同 winsorize/dtype，必须显式透传给 worker，
+        # 否则并行真实跑数会悄悄退回全量训练，与串行口径不一致。
+        self.train_subsample_frac = train_subsample_frac
         # worker 内会重新实例化 ExperimentRunner/FeatureLoader，
         # 这里必须显式透传 feature_dtype，避免主进程与子进程口径漂移。
         self.feature_dtype = feature_dtype
@@ -360,6 +365,7 @@ class ParallelScheduler:
                 group,
                 specs,
                 completed_keys,
+                self.train_subsample_frac,
             )
             for group in groups
         ]

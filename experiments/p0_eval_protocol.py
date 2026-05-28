@@ -200,6 +200,13 @@ def build_arg_parser():
         default=0.99,
         help="训练标签 winsorize 上分位（默认 0.99，对应 P99）",
     )
+    parser.add_argument(
+        "--train-subsample-frac",
+        type=float,
+        default=1.0,
+        help="训练行降采样比例（默认 1.0=全量、不影响既有路径）。P4 树初筛提速用，"
+             "如 0.33 表示每折只用 1/3 训练行；仅采训练，验证集全量不动、排名指标不受污染。",
+    )
     return parser
 
 
@@ -333,6 +340,7 @@ def main():
         feature_dir=args.feature_dir,
         target_winsorize_config=target_winsorize_config,
         ridge_alpha=args.ridge_alpha,
+        train_subsample_frac=args.train_subsample_frac,
     )
     protocol = EvaluationProtocolRunner(runner)
 
