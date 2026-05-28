@@ -2,9 +2,29 @@
 
 更新日期：2026-05-28
 
-## 当前阶段：P4-2b 树侧精炼（LightGBM + 补深度 + 精简集，准备中）
+## 当前阶段：P4-2b 在跑 → 转 P5 融合 + DL 双轨（2026-05-28）
 
-> P4-2 初筛 v3 已完成读榜（见下）。ExtraTrees d6 双镜头第一，但深度单调递增还没到头（d4<d5<d6）、GBDT 侧只试了 sklearn HistGB（弱化版）没上老师推荐的 LightGBM。**P4-2b 补一轮 long-only 精炼再进决赛。**
+> P4-2b long-only 精炼**正在跑**（run `20260528_p42b_tree_refine_v1`，11:25 启动，4 spec：M_tree_d7/d8 + M_lgbm_d4/d6，全用精简 V2 特征集；peak ~9.3GB 安全，约 12:30 完）。读完榜选 2–3 决赛 → P5 融合；DL 转 Windows 4060 并行。**竞赛背景 + 本周 roadmap + 详细任务见下。**
+
+### 竞赛背景与算力分工（2026-05-28）
+
+- **课程竞赛**：组内**无隐藏集**、仅讨论选**一个代表模型**交老师；老师隐藏集终判。约 **06-04 组内讨论**、老师截止下下周（~06-08~12）。
+- **战略**：稳健 = 竞争武器 → 冲"**可辩护、可泛化**的分"（过 expanding + 11月 holdout），不刷 dev（理由见 NOTE「冲高分阶段」节）。
+- **算力分工**：传统留 **Mac → P5**；DL 上 **Windows 4060 / PyTorch**（不用 MLX/M5），互不抢算力。
+- **回退点 05-31**：DL 打不过传统 ensemble 就回退，传统 ensemble 为保底代表。
+
+### 本周双轨 roadmap
+
+| 日 | Mac（传统，主线） | Windows 4060（DL，上行） |
+|---|---|---|
+| 05-28 | P4-2b 读榜→选决赛→expanding；搭加权 ensemble 脚手架 | 装 PyTorch/CUDA；搭序列管道（防泄漏开窗+归一化）；LSTM 跑起来 |
+| 05-29 | 锁最优单模型；加权 ensemble 上 rolling+expanding | LSTM 接同一 rolling 出真分；判断序列有没有料 |
+| 05-30 | 传统候选过 11月 Review Holdout = 保底强分 | 有料→调/试 stack 进 DL；没料→评估 DeepLOB 或回退 |
+| 05-31 | （机动）小波特征 / OOF stacking，仅明显更好才采 | **回退决策点** |
+| 06-01 | 收敛单一代表模型 | 同左二选一收敛 |
+| 06-02~03 | pitch 材料 + **meow.py 提交通道演练（§十）** | 若 DL 入选：打通 meow.py 提交 |
+| 06-04 | **组内讨论**（带验证过的模型 + 泛化故事） | — |
+| 之后 | 当选→Final Holdout(12月) 一次性确认→提交，看完不改 | — |
 
 ### P4-2 初筛 v3 结论（2026-05-28 读榜，run `20260527_p42_modelselect_longscreen_v3`）
 
@@ -108,9 +128,16 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | P4-2 | 模型 long-only 初筛：v1 OOM→提速→v3 干净跑完（`20260527_p42_modelselect_longscreen_v3`），双镜头读榜见上 | ✅ 完成 |
 | P4-2′ | 树重要性扫描（Fork A）：run `20260527_p4_tree_importance_v1` 干净跑完，结论落档 `docs/实验记录.md`（剪交互 / trade被低估 / ofi没错杀） | ✅ 完成 |
 | P4-2提速 | 训练行采样 plumbing（仅树族门控 + 全链路透传）+ 5 项新单测 + smoke 实测保真/提速/内存 + 文档收敛 | ✅ 完成 |
-| P4-2b | 树侧精炼：① 上 LightGBM（装包+钉 spec）② 补 ExtraTrees d7/d8 ③ 按重要性结论精简树特征集（剪手工交互+raw ofi）→ 合并跑一轮 long-only | ⏳ 准备中 |
-| P4-3 | 决赛 2–3 模型 expanding（全量行 + 300 树），打 X1 expanding 0.0668 靶子 | 待开（等 P4-2b 读榜） |
-| 🚩红线 | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，样本外跑赢 +0.0042**（run `20260527_x1_review_v1`） | ✅ 完成 |
+| P4-2b | 树侧精炼 long-only：M_tree_d7/d8 + M_lgbm_d4/d6（全用精简 V2 集，剪手工交互）→ run `20260528_p42b_tree_refine_v1` | 🔄 在跑（11:25 起，~12:30 完） |
+| P4-3 读榜+决赛 | 读榜（§4.7 双镜头：LightGBM vs ExtraTrees、深度拐点、minimax）→ 选 2–3 决赛 → expanding（**全量行 + 300 树**）打 X1 expanding 0.0668 → 锁最优单模型 | 待开（等读榜） |
+| P5-a 加权 ensemble | X1 + 最优树 + LightGBM 的 **OOF 加权平均**（先等权/按验证给权）→ rolling + expanding 验证；不如 backbone 稳就交 backbone（§7.9） | 待开（主线） |
+| P5-b OOF stacking | **仅当**加权平均明显不够：二层小线性融合器，**必须用 OOF**（§7.9）；黑箱、难辩护，慎用 | 机动 |
+| 特征 小波 | 小波/多尺度分解（CPU/Mac）→ 喂 GBDT 重跑，**明显更好才采**；放低预期（表格特征近天花板，别指望单独冲 0.10） | 机动 |
+| 关口 Review | 传统代表候选过 **11 月 Review Holdout** = 可辩护的保底强分（≤3 次预算，§4.8） | 待开（关口） |
+| 交付 提交通道 | `meow.py` 提交演练（§十）：raw `fret12`、不依赖本地 cache、serve 防泄漏；**决赛代表跑通才算数** | 待开（交付前必做） |
+| DL 分支（Windows） | 4060/PyTorch：序列管道（防泄漏开窗+归一化）→ LSTM（特征当序列，低风险）证序列有料 → DeepLOB raw-LOB（高风险）；**过同协议 + 11月 holdout 才能当代表**；05-31 回退点 | 待开（今下午起） |
+| 🚩红线（Review 已用） | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，+0.0042**（run `20260527_x1_review_v1`）；11 月预算已耗 1 次 | ✅ 完成 |
+| 🚩红线（Final 未碰） | Final Holdout（12 月）全程未碰，**只在最终代表选定后一次性确认**、看完不改提交决策（§4.8） | 未动 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
 
 ### P4-1 落地（2026-05-27，import + 12 项 unittest 通过，未跑实验）
@@ -124,17 +151,14 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 
 ## P4-2b 交接（下一会话接手点）
 
-**P4-2 初筛 v3 已完成读榜（结论见上），树侧还有空间：深度没到头 + LightGBM 没上场 + 特征集未精简。P4-2b 补一轮 long-only 精炼再进决赛。**
+**P4-2b 代码改动已落地、long-only 在跑**（lightgbm 已装、M_tree_d7/d8 + M_lgbm_d4/d6 specs 已加、`P4_TREE_GROUPS_V2` 已建并剪掉 `conditional_momentum`）。**接手点 = 读榜**（run `20260528_p42b_tree_refine_v1`，约 12:30 完）：
 
-**P4-2b 要做的（代码改动 + 跑一轮）：**
-1. `pip install lightgbm` + 在 `eval_protocol.py` 加 M_lgbm spec（浅深度，预钉网格）
-2. 加 M_tree_d7 / M_tree_d8 spec（ExtraTrees depth=7/8，其他参数同 d4-d6）
-3. 精简树特征集 `P4_TREE_GROUPS_V2`：从 P4_TREE_GROUPS 中去掉 `conditional_momentum`（手工交互，重要性 0.90%）；raw ofi 暂保留（ofi_safe 含 cross-z/rank，不是纯 raw）
-4. 合并跑一轮 long-only（新 spec + 精简集 + X1/R02 对照）
+- 读榜重点（§4.7 双镜头）：① LightGBM 是否打过 v3 ExtraTrees d6(0.0708) / X1(long 0.0703) ② ExtraTrees d7/d8 是否还在涨（拐点） ③ corr_min / stability minimax。
+- 之后步骤见上「本周双轨 roadmap」+「待办队列」：选决赛 → expanding → P5 加权 ensemble → Review Holdout → 提交演练；DL 转 Windows 并行。
 
-**看门狗阈值**：soft 12GB / hard 13GB（v3 实测 peak 11.06GB，安全）。
+**看门狗阈值**：soft 12GB / hard 13GB（V2 集 peak ~9.3GB，安全）。
 
-**红线提醒**：11 月 Review holdout 已用于 X1 确认（§4.8），**不得再用 11 月调参/选模型**；12 月 Final holdout 全程未碰、最终一次性用。选模型只在 Dev rolling / long / expanding 上做。
+**红线提醒**：11 月 Review holdout 已用于 X1 确认（§4.8），**不得再用 11 月反复调参/选模型**（≤3 次预算已耗 1）；12 月 Final holdout 全程未碰、最终一次性用。选模型只在 Dev rolling / long / expanding 上做。
 
 ## 已完成基建（备查）
 

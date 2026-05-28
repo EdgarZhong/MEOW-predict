@@ -237,12 +237,17 @@ P1–P3 的实验都是"R02 + 单个特征组"。即使多个组各自单独过�
 ```
 第一优先：Ridge
 第二优先：ElasticNet / HuberRegressor
-第三优先：浅 ExtraTrees（max_depth≤5）/ 浅 HistGradientBoosting
-第四优先：受限融合（仅当 P1-P3 有独立有效信号后）
-禁止：Transformer / LSTM / 复杂 MLP / 自由 stacking（当前阶段）
+第三优先：浅 ExtraTrees（max_depth≤5）/ 浅 HistGB / LightGBM（GBDT 正牌）
+第四优先：受限融合（P5：先加权平均，OOF stacking 仅在明显更好时）
+第五优先（2026-05-28 解禁，专机并行分支）：DL 序列模型（LSTM → DeepLOB raw-LOB）
 ```
 
 新信号必须先在 Ridge 验证有效，再考虑上浅树。
+
+**P4-2b 起补充（2026-05-28，冲高分阶段 phase pivot）：**
+
+- **P5 融合开启**：异质 ensemble（Ridge+LightGBM+ExtraTrees）。先简单加权平均（零过拟合、可辩护、判"融合值不值"的诚实基线），**只有 expanding+holdout 上明显更好才上 OOF stacking**（§7.9）。
+- **DL 解禁但带纪律**：LSTM/序列/Transformer 此前被禁、现作为**上行探索分支**开启（专机 Windows 4060/PyTorch，不抢传统算力）。约束：① 走**同一评测协议 + 三层 holdout**（§4.8）、不得另立标准；② 输入须平稳化 + 归一化 + 防泄漏开窗；③ 必须能在 `meow.py` 提交（§十）；④ **05-31 回退点**——打不过传统 ensemble 就回退，传统 ensemble 为保底代表。
 
 ## 七、特征工程规范
 
@@ -370,6 +375,8 @@ P0-P5 的默认职责如下，除非用户明确改变路线，否则按此执�
 - 面向隐藏测试集时，把泛化性前置
 
 ### 7.9 P5 融合准入标准
+
+**融合节奏（2026-05-28）：先简单加权平均，再 stacking。** 加权平均（等权 / 按验证表现给权）参数极少、零过拟合、可辩护，是"融合到底值不值"的诚实基线；**只有它在 expanding + 11月 holdout 上明显更好，才上二层 OOF stacking**（更强但易过拟合、黑箱难辩护）。在 dev 折数本就少（§4.3）下，stacking 极易学到"碰巧的组合"，慎用。
 
 一个分支进入融合池前，除满足 P4 准入标准外，还应满足：
 
