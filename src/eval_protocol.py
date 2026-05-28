@@ -134,6 +134,8 @@ BASELINE_SPEC = {
 #     Fork A（2026-05-27 拍板）= 第一版含交互，跑重要性扫描一次回答“树是否真用得上交互 + 反偏颇”。
 #   - 线性候选（EN/Huber）沿用 X1 集做苹果对苹果；ridge-on-X1 即既有 X1 spec，不重复。
 P4_TREE_GROUPS = ["legacy", "norm_core", "ofi_safe", "trade_impact", "conditional_momentum", "lag", "roll", "patch_summary", "cross_rank", "regime_tree"]
+# P4-2b 精简版：按 P4-2' 重要性扫描结论剪掉 conditional_momentum（手工交互，0.90%≈0，树自建交互不需要）
+P4_TREE_GROUPS_V2 = ["legacy", "norm_core", "ofi_safe", "trade_impact", "lag", "roll", "patch_summary", "cross_rank", "regime_tree"]
 P4_LINEAR_GROUPS = ["legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"]  # = X1 集
 
 # 全部历史实验（含 baseline）
@@ -187,6 +189,13 @@ ALL_SPECS: List[Dict] = [
     {"experiment_id": "M_histgb_d3", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 3}, "notes": "P4 model select: shallow HistGB depth=3 on tree set"},
     {"experiment_id": "M_histgb_d4", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4}, "notes": "P4 model select: shallow HistGB depth=4 on tree set"},
     {"experiment_id": "M_histgb_d4_lr03", "type": "standard", "model": "histgb_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS, "model_params": {"max_depth": 4, "learning_rate": 0.03}, "notes": "P4 model select: shallow HistGB depth=4 lr=0.03 on tree set"},
+    # P4-2b 精炼轮（2026-05-28）：补深度 d7/d8 + LightGBM，均用精简 V2 特征集（剪手工交互）
+    # ExtraTrees 补深度（d4<d5<d6 单调递增还没到头，看拐点）：
+    {"experiment_id": "M_tree_d7", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS_V2, "model_params": {"max_depth": 7, "n_jobs": 8}, "notes": "P4-2b: ExtraTrees depth=7 on trimmed V2 set"},
+    {"experiment_id": "M_tree_d8", "type": "standard", "model": "tree_shallow", "target_mode": "raw", "groups": P4_TREE_GROUPS_V2, "model_params": {"max_depth": 8, "n_jobs": 8}, "notes": "P4-2b: ExtraTrees depth=8 on trimmed V2 set"},
+    # LightGBM（GBDT 正牌选手，老师方案推荐；浅深度 + 保守正则防过拟合）：
+    {"experiment_id": "M_lgbm_d4", "type": "standard", "model": "lgbm", "target_mode": "raw", "groups": P4_TREE_GROUPS_V2, "model_params": {"max_depth": 4, "num_leaves": 15, "n_jobs": 8}, "notes": "P4-2b: LightGBM depth=4 leaves=15 on trimmed V2 set"},
+    {"experiment_id": "M_lgbm_d6", "type": "standard", "model": "lgbm", "target_mode": "raw", "groups": P4_TREE_GROUPS_V2, "model_params": {"max_depth": 6, "num_leaves": 31, "n_jobs": 8}, "notes": "P4-2b: LightGBM depth=6 leaves=31 on trimmed V2 set"},
 ]
 
 # Ridge baseline 子集（快速复现用）

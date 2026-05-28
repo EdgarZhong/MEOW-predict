@@ -678,19 +678,24 @@ class ExperimentRunner(object):
                 raise ImportError(
                     "lightgbm is not installed. Install it or use model_name='histgb' in this workspace."
                 )
-            model = LGBMRegressor(
-                n_estimators=500,
-                learning_rate=0.05,
-                num_leaves=63,
-                max_depth=8,
-                min_child_samples=100,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.1,
-                reg_lambda=0.1,
-                random_state=42,
-                n_jobs=1,
-            )
+            # P4-2b：LightGBM（GBDT 正牌选手）。默认参数偏保守；
+            # spec 经 model_params 覆盖 depth/num_leaves/n_jobs 等。
+            lgbm_params = {
+                "n_estimators": 300,
+                "learning_rate": 0.05,
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_child_samples": 200,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "reg_alpha": 0.1,
+                "reg_lambda": 0.1,
+                "random_state": 42,
+                "n_jobs": 1,
+                "verbosity": -1,
+            }
+            lgbm_params.update(mp)
+            model = LGBMRegressor(**lgbm_params)
         elif model_name == "mlp":
             model = Pipeline([
                 ("scaler", StandardScaler()),
