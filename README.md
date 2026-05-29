@@ -26,7 +26,8 @@ MEOW--predict/
 ├── experiments/               # 实验入口脚本
 │   ├── p0_eval_protocol.py    # P0：Rolling 评测基准（主入口，含 daily/gate/ridge/quick/full suite）
 │   ├── p05_lock_ridge_alpha_and_winsorize.py # P0.5：alpha + winsorize 扫锁
-│   ├── run_with_memory_guard.py # 通用 RSS 内存看门狗包装器（可复用）
+│   ├── run_with_memory_guard.py # 通用 RSS 内存看门狗包装器（仅 Unix）
+│   ├── run_submission_full_window.py # 交付链全窗口 fit/eval + 内存峰值采样（跨平台，Windows 演练用）
 │   └── legacy/p0_rolling_audit.py # 历史 rolling 审计脚本
 ├── meow/                      # 老师提交目录（python meow.py 入口；正式提交通道）
 ├── data/features/             # 特征缓存（gitignored；pickle_fallback 后端）
@@ -69,6 +70,9 @@ python experiments/run_with_memory_guard.py \
 
 # 正式提交通道（老师入口，正式特征现算，不依赖本地缓存）
 cd meow && python meow.py
+
+# 交付链全窗口演练 + 内存峰值核对（≥32GB 机器；Windows 步骤见 docs/交付演练SOP_Windows全窗口.md）
+python experiments/run_submission_full_window.py
 ```
 
 **已锁定的标准口径（勿手改，对照才显式覆写）**：训练标签 winsorize = 开启 + P1/P99；ridge alpha = 2.0；特征 dtype = float32。来源见 AGENTS §7.7 / §7.11。
@@ -82,6 +86,7 @@ cd meow && python meow.py
 | `AGENTS.md` | 开发规范、实验 SOP、禁止事项 |
 | `docs/实验记录.md` | 所有实验结果的历史记录 |
 | `docs/P0运行耗时监控报告_20260525.md` | 本次 P0 `expanding_40d_5d` 运行的耗时监控与阶段分析报告 |
+| `docs/交付演练SOP_Windows全窗口.md` | 交付链迁移到 Windows + 全窗口 fit/eval + 内存峰值核对的演练 SOP |
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
 | `docs/specs/MEOW金融时序预测V3.3_论文启发稳健冲10_AI执行版.md` | V3.3 执行方案 |
 | `docs/specs/实验平台架构设计.md` | 并发实验平台架构（trainer/scheduler/resume） |
