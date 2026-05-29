@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -28,27 +28,90 @@ from feature_registry import META_COLS, TARGET_COL, FeatureRegistry, registry as
 from feature_store import DEFAULT_FEATURE_DIR
 
 
-# 当前正式提交默认沿用 R02 backbone。
-# 后续若提交口径升级，这里只改一处即可，meow 包装层和实验闭环都会同步。
-DEFAULT_SUBMISSION_GROUPS: Tuple[str, ...] = ("legacy", "norm_core")
-DEFAULT_SUBMISSION_MODEL = "ridge"
-DEFAULT_SUBMISSION_TARGET_MODE = "raw"
+@dataclass(frozen=True)
+class SubmissionMemberSpec:
+    """
+    正式提交中“单个成员模型”的规格。
+
+    这里把成员训练/推理真正会用到的口径都收口在一处：
+    - experiment_id: 成员的人类可读 ID，便于日志与调试
+    - groups: 使用哪些正式特征组
+    - model_name: 训练模型
+    - target_mode: 训练目标口径
+    - model_params: 该成员自己的预钉模型超参
+    """
+
+    experiment_id: str
+    groups: Tuple[str, ...]
+    model_name: str
+    target_mode: str = "raw"
+    model_params: Dict[str, object] = field(default_factory=dict)
+
+
+DEFAULT_SUBMISSION_MEMBERS: Tuple[SubmissionMemberSpec, ...] = (
+    SubmissionMemberSpec(
+        experiment_id="X1_R02_plus_ofi_safe_condmom_interaction",
+        groups=("legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"),
+        model_name="ridge",
+        target_mode="raw",
+        model_params={"alpha": 2.0},
+    ),
+    SubmissionMemberSpec(
+        experiment_id="M_lgbm_d4",
+        groups=("legacy", "norm_core", "ofi_safe", "trade_impact", "lag", "roll", "patch_summary", "cross_rank", "regime_tree"),
+        model_name="lgbm",
+        target_mode="raw",
+        model_params={"max_depth": 4, "num_leaves": 15, "n_jobs": 8},
+    ),
+)
+
+
+def _merge_member_groups(members: Sequence[SubmissionMemberSpec]) -> Tuple[str, ...]:
+    """
+    把多个成员的特征组并成一个稳定有序的并集。
+
+    为什么要并集：
+    - 提交通道需要“一次从 raw 现算全部所需特征”
+    - 之后再让各成员从这份并集里各取自己的子集
+    - 这样既不重复算特征，也能保证 train/serve 用同一份原始现算结果
+    """
+
+    ordered_groups: List[str] = []
+    seen = set()
+    for member in members:
+        for group_name in member.groups:
+            if group_name in seen:
+                continue
+            seen.add(group_name)
+            ordered_groups.append(group_name)
+    return tuple(ordered_groups)
+
+
+# 当前正式提交默认口径 = 两成员融合：
+# 1. X1 Ridge：鲁棒锚
+# 2. M_lgbm_d4：上限型成员
+# 外部包装层只引用这里，后续若提交口径升级，仍维持“改一处，全链同步”。
+DEFAULT_SUBMISSION_GROUPS: Tuple[str, ...] = _merge_member_groups(DEFAULT_SUBMISSION_MEMBERS)
 
 
 @dataclass(frozen=True)
 class SubmissionSpec:
     """
-    正式提交通道使用的最小规格。
+    正式提交通道的整体规格。
 
-    这里只保留会真正影响预测值的核心字段：
-    - groups: 使用哪些正式特征组
-    - model_name: 训练模型
-    - target_mode: 训练目标口径
+    当前默认是“多成员融合”而非单模型，因此这里的核心字段改为：
+    - members: 参与融合的成员列表
+    - blend_mode: 融合方式（当前只锁 `per_day_zscore_mean`）
     """
 
-    groups: Tuple[str, ...] = DEFAULT_SUBMISSION_GROUPS
-    model_name: str = DEFAULT_SUBMISSION_MODEL
-    target_mode: str = DEFAULT_SUBMISSION_TARGET_MODE
+    members: Tuple[SubmissionMemberSpec, ...] = DEFAULT_SUBMISSION_MEMBERS
+    # 提交默认 raw_mean：输出留在 fret12 量纲，MSE/R² 才有意义（老师精度分 = MSE+Pearson+R² 各 1/3）。
+    # per_day_zscore_mean 仅作诊断对照（会把输出推到 std≈1、毁掉 MSE/R²）。
+    blend_mode: str = "raw_mean"
+
+    def feature_groups(self) -> Tuple[str, ...]:
+        """返回当前整体规格所需的特征组并集，供特征现算入口直接复用。"""
+        return _merge_member_groups(self.members)
 
 
 class SubmissionFeaturePipeline:
@@ -226,22 +289,97 @@ class SubmissionModelPipeline:
         self,
         h5dir: str,
         feature_dir: str = DEFAULT_FEATURE_DIR,
-        spec: SubmissionSpec = SubmissionSpec(),
+        spec: Optional[SubmissionSpec] = None,
         target_winsorize_config: Optional[Dict[str, object]] = None,
         ridge_alpha: float = 2.0,
     ):
         self.h5dir = h5dir
         self.feature_dir = feature_dir
-        self.spec = spec
+        self.spec = spec or SubmissionSpec()
         self.runner = ExperimentRunner(
             h5dir=h5dir,
             feature_dir=feature_dir,
             target_winsorize_config=target_winsorize_config or DEFAULT_TARGET_WINSORIZE,
             ridge_alpha=ridge_alpha,
         )
-        self.model = None
-        self.feature_cols: Optional[List[str]] = None
-        self.baseline = None
+        # 多成员提交态：
+        # - models: 每个成员训练好的 estimator
+        # - member_feature_cols: 每个成员真正喂进模型的列
+        # - member_input_cols: 从“并集特征表”里切子集时要取哪些列
+        # - member_baselines: 仅 residual 类 target_mode 才会用到；当前 raw 路线保持兼容
+        self.models: Dict[str, object] = {}
+        self.member_feature_cols: Dict[str, List[str]] = {}
+        self.member_input_cols: Dict[str, List[str]] = {}
+        self.member_baselines: Dict[str, object] = {}
+
+    def _member_xdf(self, xdf: pd.DataFrame, member: SubmissionMemberSpec) -> pd.DataFrame:
+        """
+        从“并集特征表”里切出某个成员自己的输入子集。
+
+        这是提交链的关键点：
+        - raw 侧只现算一次特征并集
+        - 训练/推理时每个成员严格只看自己定义过的列
+        - 避免 X1 错吃到 LightGBM 的扩展列，或反之
+        """
+
+        input_cols = self.member_input_cols.get(member.experiment_id)
+        if input_cols is None:
+            input_cols = SubmissionFeaturePipeline(groups=member.groups).feature_names()
+            self.member_input_cols[member.experiment_id] = list(input_cols)
+        return xdf[META_COLS + list(input_cols)].copy()
+
+    def _per_day_zscore(self, frame: pd.DataFrame, pred: np.ndarray) -> np.ndarray:
+        """
+        对单个成员预测做“按天截面 zscore”。
+
+        这是提交口径里最重要的一条：
+        - **均值/标准差只从当前要预测的那天数据自身计算**
+        - 绝不冻结训练期统计量到 serve 端
+        - 这样不会产生 train/serve skew，也不会把历史窗口先验偷带到新数据
+        """
+
+        work = frame.loc[:, ["date"]].copy()
+        work["pred"] = np.asarray(pred, dtype=np.float64)
+        zpred = np.zeros(len(work), dtype=np.float64)
+        for _, idx in work.groupby("date", sort=False).groups.items():
+            day_values = work.loc[idx, "pred"].to_numpy(dtype=np.float64)
+            day_std = float(np.std(day_values))
+            if day_std < 1e-12:
+                zpred[np.asarray(list(idx), dtype=np.int64)] = day_values - float(np.mean(day_values))
+                continue
+            zpred[np.asarray(list(idx), dtype=np.int64)] = (
+                (day_values - float(np.mean(day_values))) / day_std
+            )
+        return zpred.astype(np.float32)
+
+    def _blend_member_predictions(self, xpred: pd.DataFrame, member_preds: Dict[str, np.ndarray]) -> np.ndarray:
+        """
+        把多个成员预测融合成最终提交分数。
+
+        正式提交锁定 `raw_mean`（等权 raw 平均）：
+        - 两个成员都在 raw `fret12` 上以平方损失训练，输出本就是同量纲的收益预测；
+        - 直接等权平均 → 输出仍落在 `fret12` 量纲，MSE / R² 才有意义（老师精度分 = MSE + Pearson + R² 各占 1/3）；
+        - corr 与 per-day zscore 等权几乎一致（P5 实测 raw 0.0762 ≈ zscore 0.0763），但 zscore 会把输出推到 std≈1，
+          毁掉 MSE / R²，故提交端不用 zscore。
+        - 仍是零自由参数、可辩护的等权融合。
+
+        `per_day_zscore_mean` 仅保留作诊断/对照，不作提交默认。
+        """
+
+        if not member_preds:
+            raise RuntimeError("没有任何成员预测，无法融合")
+
+        blended = np.zeros(len(xpred), dtype=np.float64)
+        if self.spec.blend_mode == "raw_mean":
+            for pred in member_preds.values():
+                blended += np.asarray(pred, dtype=np.float64)
+        elif self.spec.blend_mode == "per_day_zscore_mean":
+            for pred in member_preds.values():
+                blended += self._per_day_zscore(xpred, pred).astype(np.float64)
+        else:
+            raise ValueError(f"未知融合模式: {self.spec.blend_mode}")
+        blended /= float(len(member_preds))
+        return blended.astype(np.float32)
 
     def _normalize_meow_frame(
         self,
@@ -270,42 +408,57 @@ class SubmissionModelPipeline:
 
     def fit(self, xdf: pd.DataFrame, ydf: pd.DataFrame) -> None:
         """
-        用正式提交 spec 训练模型。
+        用正式提交 spec 训练全部成员模型。
 
-        这里直接复用 experiment_runner 的训练核心，确保：
+        这里继续复用 experiment_runner 的训练核心，确保：
         - winsorize 只作用于训练标签
         - 模型参数与实验链一致
-        - 特征列选择口径一致
+        - 但每个成员只吃自己定义过的列，而不是整张并集表
         """
 
         xtrain = self._normalize_meow_frame(xdf, require_target=False)
         ytrain = self._normalize_meow_frame(ydf, require_target=True)
-        self.model, self.feature_cols, self.baseline = self.runner.fit_model(
-            self.spec.model_name,
-            xtrain,
-            ytrain,
-            target_mode=self.spec.target_mode,
-        )
+        self.models = {}
+        self.member_feature_cols = {}
+        self.member_baselines = {}
+        for member in self.spec.members:
+            member_xtrain = self._member_xdf(xtrain, member)
+            model, feature_cols, baseline = self.runner.fit_model(
+                member.model_name,
+                member_xtrain,
+                ytrain,
+                target_mode=member.target_mode,
+                model_params=member.model_params,
+            )
+            self.models[member.experiment_id] = model
+            self.member_feature_cols[member.experiment_id] = list(feature_cols)
+            self.member_baselines[member.experiment_id] = baseline
 
     def predict(self, xdf: pd.DataFrame) -> np.ndarray:
         """
-        用已经训练好的正式提交模型做推理。
+        用全部已训练成员做推理，并按正式融合口径输出最终预测。
 
-        当前正式提交口径是 `target_mode=raw`，因此这里只需直接走 runner 的预测核心。
-        若未来正式提交改成可逆 residual 路线，也仍可在这里集中处理。
+        当前正式提交通道不再输出单模型结果，而是：
+        1. 各成员各自预测
+        2. 各成员按天截面 zscore
+        3. 等权平均成最终 `forecast`
         """
 
-        if self.model is None or self.feature_cols is None:
+        if not self.models:
             raise RuntimeError("模型尚未训练，不能直接调用 predict()")
         xpred = self._normalize_meow_frame(xdf, require_target=False)
-        return np.asarray(
-            self.runner._predict_with_baseline(
-                self.model,
-                xpred,
-                self.feature_cols,
-                ydf=None,
-                baseline=self.baseline,
-                target_mode=self.spec.target_mode,
-            ),
-            dtype=np.float32,
-        )
+        member_preds: Dict[str, np.ndarray] = {}
+        for member in self.spec.members:
+            member_xpred = self._member_xdf(xpred, member)
+            member_preds[member.experiment_id] = np.asarray(
+                self.runner._predict_with_baseline(
+                    self.models[member.experiment_id],
+                    member_xpred,
+                    self.member_feature_cols[member.experiment_id],
+                    ydf=None,
+                    baseline=self.member_baselines.get(member.experiment_id),
+                    target_mode=member.target_mode,
+                ),
+                dtype=np.float32,
+            )
+        return self._blend_member_predictions(xpred, member_preds)

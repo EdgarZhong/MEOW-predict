@@ -9,6 +9,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -19,7 +20,9 @@ from feature_registry import META_COLS, TARGET_COL, _make_schema_probe_raw  # no
 from submission_pipeline import (  # noqa: E402
     DEFAULT_SUBMISSION_GROUPS,
     SubmissionFeaturePipeline,
+    SubmissionMemberSpec,
     SubmissionModelPipeline,
+    SubmissionSpec,
 )
 
 
@@ -45,11 +48,58 @@ class TestSubmissionModelPipeline(unittest.TestCase):
         raw = _make_schema_probe_raw()
         feature_pipeline = SubmissionFeaturePipeline(groups=DEFAULT_SUBMISSION_GROUPS)
         xdf, ydf = feature_pipeline.build_feature_frames(raw)
-        model_pipeline = SubmissionModelPipeline(h5dir="dummy-data")
-        model_pipeline.fit(xdf, ydf)
-        pred = model_pipeline.predict(xdf)
-        self.assertEqual(pred.shape[0], xdf.shape[0])
-        self.assertTrue(np.isfinite(pred).all())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_pipeline = SubmissionModelPipeline(h5dir=tmpdir)
+            model_pipeline.fit(xdf, ydf)
+            pred = model_pipeline.predict(xdf)
+            self.assertEqual(pred.shape[0], xdf.shape[0])
+            self.assertTrue(np.isfinite(pred).all())
+
+    def _blend_fixture(self, blend_mode):
+        """构造一个跨两天、两成员的小样本，返回 (frame, member_preds, pipeline)。"""
+        frame = _make_schema_probe_raw().iloc[:4].copy()
+        frame.loc[:, "date"] = np.array([20230601, 20230601, 20230602, 20230602], dtype=int)
+        frame = frame.reset_index(drop=True)
+        member_a = np.array([1.0, 2.0, 10.0, 20.0], dtype=np.float32)
+        member_b = np.array([2.0, 4.0, 30.0, 10.0], dtype=np.float32)
+        spec = SubmissionSpec(
+            members=(
+                SubmissionMemberSpec("member_a", ("legacy",), "ridge"),
+                SubmissionMemberSpec("member_b", ("legacy",), "ridge"),
+            ),
+            blend_mode=blend_mode,
+        )
+        return frame, {"member_a": member_a, "member_b": member_b}, spec
+
+    def test_blend_raw_mean_is_default(self):
+        """
+        提交默认融合 = raw_mean：直接等权平均、输出留在原始量纲（保 MSE/R²）。
+
+        member_a=[1,2,10,20], member_b=[2,4,30,10] → 等权平均 [1.5,3,20,15]。
+        同时断言默认 spec 的 blend_mode 就是 raw_mean，防止有人误改回 zscore。
+        """
+        self.assertEqual(SubmissionSpec().blend_mode, "raw_mean")
+        frame, member_preds, spec = self._blend_fixture("raw_mean")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_pipeline = SubmissionModelPipeline(h5dir=tmpdir, spec=spec)
+            pred = model_pipeline._blend_member_predictions(frame, member_preds)
+        expected = np.array([1.5, 3.0, 20.0, 15.0], dtype=np.float32)
+        np.testing.assert_allclose(pred, expected, atol=1e-6)
+
+    def test_predict_blends_per_day_zscore(self):
+        """
+        保证 per_day_zscore_mean 模式是“按天截面标准化后再平均”，而非全局 pooled zscore。
+
+        这个模式现在只作诊断对照，但仍卡住口径里最容易漂移的点：
+        - 标准化必须用“当天数据自身”
+        - 不能偷用训练期统计量、不能把所有日期混在一起 pooled zscore
+        """
+        frame, member_preds, spec = self._blend_fixture("per_day_zscore_mean")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_pipeline = SubmissionModelPipeline(h5dir=tmpdir, spec=spec)
+            pred = model_pipeline._blend_member_predictions(frame, member_preds)
+        expected = np.array([-1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        np.testing.assert_allclose(pred, expected, atol=1e-6)
 
 
 if __name__ == "__main__":

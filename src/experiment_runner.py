@@ -827,6 +827,9 @@ class ExperimentRunner(object):
             "feature_groups": self._normalize_groups(feature_groups),
             "model_name": model_name,
             "target_mode": target_mode,
+            # P5 融合：保留验证集 meta（date/symbol/interval/fret12）以便上层把逐行 OOF 预测落盘。
+            # 仅是引用、不复制；只有串行 OOF 落盘路径会用到，不影响既有线性/并行路径。
+            "yval": yval,
         }
 
     def run_on_features(self, xtrain, ytrain, xval, yval, model_name, target_mode="raw"):

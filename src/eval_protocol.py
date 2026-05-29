@@ -426,6 +426,28 @@ class EvaluationProtocolRunner:
     # 单 profile 运行
     # ---------------------------------------------------------------- #
 
+    def _make_oof_writer(self, oof_dir: str):
+        """
+        构造逐行 OOF 落盘回调（P5 融合用）。
+
+        每个 (profile, experiment_id) 一个 HDF 文件，各折 append；
+        行 schema = fold_id / date / symbol / interval / fret12 / pred，全为数值列。
+        用 pytables（项目已有依赖）落 table 格式，append 友好、低内存。
+        """
+        def _writer(profile_name, fold_id, experiment_id, yval, pred_val):
+            meta_cols = ["date", "symbol", "interval", "fret12"]
+            frame = yval[meta_cols].copy()
+            frame.insert(0, "fold_id", int(fold_id))
+            frame["pred"] = np.asarray(pred_val, dtype=np.float32)
+            frame = frame.reset_index(drop=True)
+            safe = f"{profile_name}__{experiment_id}".replace("/", "_")
+            path = os.path.join(oof_dir, f"{safe}.h5")
+            frame.to_hdf(
+                path, key="oof", mode="a", append=True,
+                format="table", complevel=5, complib="zlib",
+            )
+        return _writer
+
     def run_profile(
         self,
         profile: RollingProfile,
@@ -433,11 +455,15 @@ class EvaluationProtocolRunner:
         rolling_end: int,
         specs: List[Dict],
         max_folds: Optional[int] = None,
+        oof_writer=None,
     ) -> Tuple[List[FoldManifestEntry], pd.DataFrame]:
         """
         在指定 profile 下运行所有 specs，返回 (manifest, fold_metrics_df)。
 
         fold_metrics_df 含 profile_name / fold 日期 / 各指标列。
+
+        oof_writer：可选回调 (profile_name, fold_id, experiment_id, yval, pred_val) -> None，
+        用于把每折逐行 OOF 预测落盘（P5 融合用）。为 None 时完全不触发，行为同旧版。
         """
         folds, manifest = self.build_folds_for_profile(profile, rolling_start, rolling_end, max_folds=max_folds)
         if not folds:
@@ -476,6 +502,19 @@ class EvaluationProtocolRunner:
                     row["n_train_days"] = len(fold.train_dates)
                     row["n_val_days"] = len(fold.val_dates)
                     rows.append(row)
+                    # P5 OOF 落盘：仅 standard spec 且 result 同时带 pred_val/yval 时触发。
+                    if oof_writer is not None:
+                        result = bundle.get("result", {})
+                        pred_val = result.get("pred_val")
+                        yval = result.get("yval")
+                        if pred_val is not None and yval is not None:
+                            oof_writer(
+                                profile.profile_name,
+                                fold.fold_id,
+                                spec["experiment_id"],
+                                yval,
+                                pred_val,
+                            )
                 except Exception as e:
                     # 记录失败而不中断，便于调试
                     rows.append({
@@ -784,6 +823,7 @@ class EvaluationProtocolRunner:
         resume: bool = False,
         output_dir: Optional[str] = None,
         run_id: Optional[str] = None,
+        dump_oof: bool = False,
     ) -> Dict[str, Any]:
         """
         主入口：运行完整三层评测协议。
@@ -802,6 +842,19 @@ class EvaluationProtocolRunner:
             profiles = ROLLING_PROFILES
         if run_id is None:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # P5 OOF 落盘 writer：仅串行路径支持（并行 scheduler 只回传 metric 行，拿不到逐行预测）。
+        oof_writer = None
+        if dump_oof:
+            if n_workers > 1:
+                print("[Protocol][OOF] 警告：--dump-oof 仅支持串行（--n-workers 1），当前并行模式跳过落盘")
+            elif not output_dir:
+                print("[Protocol][OOF] 警告：未指定 output_dir，跳过 OOF 落盘")
+            else:
+                oof_dir = os.path.join(output_dir, run_id, "oof")
+                os.makedirs(oof_dir, exist_ok=True)
+                oof_writer = self._make_oof_writer(oof_dir)
+                print(f"[Protocol][OOF] 开启逐行 OOF 落盘 → {oof_dir}")
 
         print(f"\n[Protocol] run_id={run_id}")
         print(f"[Protocol] rolling 范围：{rolling_start} ~ {rolling_end}")
@@ -876,7 +929,8 @@ class EvaluationProtocolRunner:
             for profile in profiles:
                 print(f"\n[Profile] {profile.profile_name} (mode={profile.mode})")
                 manifest, fold_df = self.run_profile(
-                    profile, rolling_start, rolling_end, specs, max_folds=max_folds
+                    profile, rolling_start, rolling_end, specs, max_folds=max_folds,
+                    oof_writer=oof_writer,
                 )
                 all_manifests.extend(manifest)
                 if not fold_df.empty:

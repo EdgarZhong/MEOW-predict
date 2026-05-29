@@ -1,10 +1,25 @@
 # CLAUDE.md — 当前阶段进度与任务看板
 
-更新日期：2026-05-28
+更新日期：2026-05-29
 
-## 当前阶段：P4-2b 在跑 → 转 P5 融合 + DL 双轨（2026-05-28）
+## 当前阶段：传统已基本收口 → 主线转「交付接线 + DL」（2026-05-29）
 
-> P4-2b long-only 精炼**正在跑**（run `20260528_p42b_tree_refine_v1`，11:25 启动，4 spec：M_tree_d7/d8 + M_lgbm_d4/d6，全用精简 V2 特征集；peak ~9.3GB 安全，约 12:30 完）。读完榜选 2–3 决赛 → P5 融合；DL 转 Windows 4060 并行。**竞赛背景 + 本周 roadmap + 详细任务见下。**
+> **传统侧已收口**：P4-3 决赛 + P5 融合拍板——`M_tree_d8` expanding 塌(0.0580 跌破基线、负折)被 reject;**锁等权 zscore 融合 [X1 + M_lgbm_d4] 当传统保底代表**(expanding mean 0.0776 / pooled 0.0763 / 最坏折 0.0491,两镜头超两成员;minimax 正解 + 零自由参数可辩护)。**传统天花板 ~0.085–0.09,冲 0.10 改押 DL。** 详见 `docs/实验记录.md` 2026-05-28。
+>
+> **战略转型(2026-05-29 拍板)**：传统不再冲分,**主线 = ① 交付接线收口(把融合接进 `submission_pipeline`、meow.py 提交管线跑通)+ ② DL(Windows 4060)**。传统的 HPO / 小波 / MLP **保留为后续方向、推迟**(见待办队列 + §「交付接线收口 — 注意事项」)。
+>
+> **传统唯一剩余验证已补完（2026-05-29）**：run `20260529_p43_lgbm_d4_nov_review`，`M_lgbm_d4` 的 Nov holdout corr = **0.08967**，对比 R02 = **0.06952**，样本外**没塌且明显更强**。至此两成员都已过各自样本外检查（X1 已过 0.07367），等权零参融合继续维持“可辩护默认”口径；**不再单测融合本身、放弃"holdout 逐行落盘"那套(方案作废)**。**12 月 Final Holdout 全程不碰**——留给"最终唯一代表(传统 or DL)选定后"一次性确认(§4.8)。
+>
+> **交付接线的注意事项见下「交付接线收口 — 注意事项」节。竞赛背景 + roadmap + 详细任务见下。**
+
+### 2026-05-29 运行记录
+
+- `run_id=20260529_p43_lgbm_d4_nov_review`，suite=`review holdout`，候选 `M_lgbm_d4` vs 基线 `R02_ridge_legacy_plus_norm_core`
+- `make_decision` 标签可忽略（review 脚本仍沿旧地板提示）；实际样本外结果：`M_lgbm_d4=0.08967`，`R02=0.06952`
+- 关键数字：样本外 `delta_corr=+0.02016`，远高于“没塌”的最低要求
+- 一句话洞察：`M_lgbm_d4` 的“gap 偏热”并没有在 11 月外推里兑现成塌方，说明它学到的不是只在 6–10 月局部窗口生效的假信号，而是比 R02 更强的非线性排序结构
+- 结果路径：`results/eval_protocol/20260529_p43_lgbm_d4_nov_review/`
+- 下一步：把 `X1 + M_lgbm_d4` 融合接进 `submission_pipeline` / `meow.py`（**已完成,融合口径锁 `raw_mean` 而非 zscore——见「交付接线收口」第 2 条:老师精度分 MSE/R²/corr 各 1/3,zscore 毁 MSE/R²**）
 
 ### 竞赛背景与算力分工（2026-05-28）
 
@@ -51,6 +66,33 @@
 1. **上 LightGBM**：安装 lightgbm + 加 M_lgbm 浅深度 spec（代码已有 `lgbm` 分支 plumbing，只差装包 + 钉 spec）
 2. **补深度 d7/d8**：ExtraTrees 深度还没到头，补两个点看拐点（估算 +70 min，内存不变）
 3. **精简树特征集**：按 P4-2' 重要性结论剪手工交互列（0.90%≈0）+ raw ofi（0.29%）→ 减噪
+
+### P4-2b 读榜结论（2026-05-28，run `20260528_p42b_tree_refine_v1`）
+
+✅ 干净跑完。4 个候选 × 6 折 `long_40d_5d`，0.33 采样训练；结果路径：`results/eval_protocol/20260528_p42b_tree_refine_v1/`
+
+| # | 模型 | corr_mean | corr_min | stability | daily_ic | gap |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | **M_lgbm_d4** | **0.0864** | 0.0437 | **0.0714** | **0.0763** | **0.1043** |
+| 2 | M_lgbm_d6 | 0.0845 | 0.0451 | 0.0698 | 0.0745 | 0.1937 |
+| 3 | **M_tree_d8** | 0.0721 | **0.0523** | 0.0610 | 0.0678 | 0.0245 |
+| 4 | **M_tree_d7** | 0.0711 | 0.0499 | 0.0597 | 0.0675 | 0.0187 |
+| 5 | R02 baseline | 0.0667 | 0.0321 | 0.0476 | 0.0457 | 0.0065 |
+
+**判断：**
+- **LightGBM 确实打出了最强 long-only 均值**：`M_lgbm_d4` 相对 R02 `delta_corr=+0.0197`，daily 也同步抬升，不是只赚“大盘的钱”。但增益明显集中在 fold0 / fold5，且 `train_val_gap=0.104` 很大，属于**高上限、强过热嫌疑**，不能在 long-only 直接判赢，必须进 `expanding` 让判官验真伪。
+- **LightGBM 只留 d4，不留 d6**：`M_lgbm_d6` 被 `d4` 基本支配（均值更低、daily 更低、gap 更大到 0.194），说明继续加深只是在把训练端推得更热，**没有换来更稳的验证收益**。
+- **ExtraTrees 深度还没塌，但拐点很近**：`d8` 比上一轮 `d6` 继续小升（0.0721 > 0.0708，`corr_min` 0.0523 > 0.0511），说明深度加到 8 还没明显坏掉；但 gap 从 0.012 → 0.025 也在上行，过拟合压力开始累积。
+- **树的收益结构和 LightGBM 完全不同**：`M_tree_d8/d7` 不是靠把强折再拔高，而是**修补弱折 0/4/5、抬最差情况**，这是隐藏集完全未知时更值钱的 minimax 形状。
+- **因此这轮不该只送 2 个**：按“禁止自动判卷 + 宽进严出”的 memory 口径，这里有 **两类不同的真候选**：一个是上限型 `M_lgbm_d4`，一类是鲁棒型 ExtraTrees。`d8` 是树代表；`d7` 虽然被 `d8` 小幅领先，但 gap 更低，是**保守备胎**，值得一起进 `expanding` 让累积训练历史来决定深度峰值。
+
+**P4-3 expanding 决赛名单（拍板）：**
+1. `M_lgbm_d4`
+2. `M_tree_d8`
+3. `M_tree_d7`
+
+**淘汰：**
+- `M_lgbm_d6`：被 `d4` 支配，且过热最严重，不值得占一个 `expanding` 名额。
 
 **P4-2 提速配置（不变，口径见 AGENTS §4.9 第 7 点 / §5.1）：**
 - `--train-subsample-frac 0.33`（仅树族采训练行、验证集全量不动、线性自动全量）；ExtraTrees `n_jobs=8`（已钉进 M_tree spec）；`--n-workers 1` 不变；保留 300 树。
@@ -100,7 +142,9 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 |---|---|---:|---:|---:|---|
 | 快车道 short+long | R02_ridge_legacy_plus_norm_core | 0.057168 | 0.039703 | 0.019425 | 线性 backbone |
 | expanding 关口 | R02_ridge_legacy_plus_norm_core | 0.062392 | 0.047159 | 0.033476 | 线性 backbone |
-| 候选（线性最优） | X1_R02_plus_ofi_safe_condmom_interaction | 0.066766(exp) | 0.051788 | 0.041041 | 树要打败的靶子；**11 月 holdout 已通过 0.07367（vs R02 0.06952）** |
+| 候选（线性最优） | X1_R02_plus_ofi_safe_condmom_interaction | 0.066766(exp) | 0.051788 | 0.041041 | 融合成员（鲁棒锚）；**11 月 holdout 已通过 0.07367（vs R02 0.06952）** |
+| 单模最优（树族） | M_lgbm_d4（lgbm,精简 V2 集） | 0.076217(exp) | 0.060816 | 0.034071 | 融合成员（上限型）；daily IC 0.0651/IR1.56；gap 0.057 偏热 |
+| **传统代表（已锁）** | **BLEND 等权 zscore [X1 + M_lgbm_d4]** | **0.0776(exp)** | **0.0622** | **0.0491** | **传统保底代表**；pooled 0.0763；两镜头超两成员；Nov 由两成员各自样本外推断（X1 0.0737 已过 + lgbm_d4 Nov 待跑），不单测融合 |
 
 来源：`results/eval_protocol/20260526_p0relock_daily_v1` / `..._p0relock_gate_v1` / `..._q4_gate_v1` / `..._x1_review_v1`（X1 review holdout）。
 
@@ -119,6 +163,18 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | 跑命令前自查（看门狗 + `--n-workers 1` 串行 + 日志写 `logs/`） | AGENTS §5.1 |
 | 推理契约与交付约束 | AGENTS §十 |
 
+## 交付接线收口 — 进度与口径（2026-05-29 更新）
+
+> 现状：`meow.py` 壳层(fit/predict/eval)已接进 `src/submission_pipeline.py`、no-cache 已强制、两成员融合(X1 ridge + lgbm_d4)+并集特征已落地。**融合口径已从 zscore 切到 `raw_mean`**(见第 2 条),小窗口冒烟通过(corr 0.106 / R² 0.0065 / MSE≈0,量纲正确)。**唯一剩余 = 全窗口 fit 的内存(见第 7 条)+ 正式 Dec 演练。**
+
+1. **serve 端归一化必须用「新数据自算」、严禁冻结训练期先验**：若用到当日截面统计(如 zscore 诊断模式),mean/std 必须从**老师传进来的当天那批数据自身**实时算,绝不能把训练集统计量存成先验。注：默认 `raw_mean` 不做截面标准化、天然无此风险;此条对 `per_day_zscore_mean` 诊断模式仍适用。
+2. **融合口径 = `raw_mean`（等权 raw 平均，已锁）**：两成员都在 raw `fret12` 上以平方损失训练,输出本就同量纲;直接等权平均 → **输出留在 `fret12` 量纲,MSE/R² 才有意义**。⚠️ **关键**:老师精度分(30) = **MSE + Pearson + R² 各占 1/3**(见 `meow/MEOW金融时序预测2.0.docx`),per-day zscore 会把输出推到 std≈1、毁掉 MSE/R²(2/3 精度分归零)。P5 实测 raw 0.0762 ≈ zscore 0.0763 → 切 raw 不损 corr。`per_day_zscore_mean` 仅留作诊断对照(`SubmissionSpec.blend_mode` 可切)。
+3. **特征并集**：`DEFAULT_SUBMISSION_GROUPS` = 两成员特征集并集(433 列,一次现算、两模型各取子集)。已落地。
+4. **超参 / spec 配置**：两成员 model_params / 特征组 / 融合模式集中在 `SubmissionSpec` + `DEFAULT_SUBMISSION_MEMBERS` 一处声明。已落地。
+5. **特征缓存禁止复用**：从老师新 raw `.h5` 现算(`mdl.py` 把 feature_dir 指向不存在路径以暴露误用)。已落地。
+6. **演练验收清单**：fit 两模型 / predict 输出形状对、**raw `fret12` 量级(已验:R²转正)** / 训练推理同一 `SubmissionFeaturePipeline` 零 skew / winsorize 只作用训练标签 / 跑一轮 `fit+eval`,**Dec 分当 sanity bonus、不当选型依据**(§4.8)。
+7. **【内存】全窗口 fit 的硬事实(2026-05-29 实测)**：单日 69347 行 × 433 特征(float32)=122MB;**Jun–Nov(123 天)≈8.5M 行,lgbm 子集 numpy ≈14GB**。决策口径(用户拍板):**不降采样、一切以交付老师为准、保证管线能在 32GB 上跑**(老师机器内存更高)。32GB 下全行 lgbm(~20GB 峰)够跑;**本机 16GB 跑不了全窗口 → 正式 Dec 演练需上 ≥32GB 机器**。`meow.py` 原始"堆 list→concat 2× 尖峰"写法会冲到 ~30GB(贴 32GB 边缘),**待办:精简 fit 内存(消双份堆叠/concat 尖峰、成员顺序训练释放)把峰压到 ~20GB**。
+
 ## 待办队列
 
 | # | 任务 | 状态 |
@@ -128,14 +184,14 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | P4-2 | 模型 long-only 初筛：v1 OOM→提速→v3 干净跑完（`20260527_p42_modelselect_longscreen_v3`），双镜头读榜见上 | ✅ 完成 |
 | P4-2′ | 树重要性扫描（Fork A）：run `20260527_p4_tree_importance_v1` 干净跑完，结论落档 `docs/实验记录.md`（剪交互 / trade被低估 / ofi没错杀） | ✅ 完成 |
 | P4-2提速 | 训练行采样 plumbing（仅树族门控 + 全链路透传）+ 5 项新单测 + smoke 实测保真/提速/内存 + 文档收敛 | ✅ 完成 |
-| P4-2b | 树侧精炼 long-only：M_tree_d7/d8 + M_lgbm_d4/d6（全用精简 V2 集，剪手工交互）→ run `20260528_p42b_tree_refine_v1` | 🔄 在跑（11:25 起，~12:30 完） |
-| P4-3 读榜+决赛 | 读榜（§4.7 双镜头：LightGBM vs ExtraTrees、深度拐点、minimax）→ 选 2–3 决赛 → expanding（**全量行 + 300 树**）打 X1 expanding 0.0668 → 锁最优单模型 | 待开（等读榜） |
-| P5-a 加权 ensemble | X1 + 最优树 + LightGBM 的 **OOF 加权平均**（先等权/按验证给权）→ rolling + expanding 验证；不如 backbone 稳就交 backbone（§7.9） | 待开（主线） |
-| P5-b OOF stacking | **仅当**加权平均明显不够：二层小线性融合器，**必须用 OOF**（§7.9）；黑箱、难辩护，慎用 | 机动 |
-| 特征 小波 | 小波/多尺度分解（CPU/Mac）→ 喂 GBDT 重跑，**明显更好才采**；放低预期（表格特征近天花板，别指望单独冲 0.10） | 机动 |
-| 关口 Review | 传统代表候选过 **11 月 Review Holdout** = 可辩护的保底强分（≤3 次预算，§4.8） | 待开（关口） |
-| 交付 提交通道 | `meow.py` 提交演练（§十）：raw `fret12`、不依赖本地 cache、serve 防泄漏；**决赛代表跑通才算数** | 待开（交付前必做） |
-| DL 分支（Windows） | 4060/PyTorch：序列管道（防泄漏开窗+归一化）→ LSTM（特征当序列，低风险）证序列有料 → DeepLOB raw-LOB（高风险）；**过同协议 + 11月 holdout 才能当代表**；05-31 回退点 | 待开（今下午起） |
+| P4-2b | 树侧精炼 long-only：M_tree_d7/d8 + M_lgbm_d4/d6（全用精简 V2 集，剪手工交互）→ run `20260528_p42b_tree_refine_v1`；**读榜完成，决赛名单已定：M_lgbm_d4 + M_tree_d8 + M_tree_d7，M_lgbm_d6 淘汰** | ✅ 完成 |
+| P4-3 读榜+决赛 | 三候选带 `--dump-oof` 跑 expanding(X1/lgbm_d4 全量、d8 0.33 采样)。**结论**：`M_lgbm_d4` 0.0762(上限型,pooled 领先)、X1 0.0668(鲁棒锚,最坏折 0.0410 最好)、**`M_tree_d8` 跌破基线 0.0580/负折 -0.0073 → reject**(ExtraTrees expanding 塌,森林平均稀释近期 regime)。详见 `docs/实验记录.md` 2026-05-28 | ✅ 完成 |
+| P5-a 加权 ensemble | X1 + lgbm_d4 OOF 加权融合读榜。**等权 zscore 同时超两成员(帕累托)**：pooled 0.0763 > lgbm 0.0727、最坏折 0.0491 > X1 0.0410、均值 0.0776。加 d8 反拖累(负折污染)。权重对 pooled 几乎无影响(0.0755–0.0765)、rank 模式被否(Pearson 非 Spearman)。**拍板锁等权 zscore(X1+lgbm_d4)当传统代表**——理由 minimax 正解 + 可辩护默认,非"峰值"。详见 `docs/实验记录.md` | ✅ 完成（已锁） |
+| **lgbm_d4 Nov 验证** | run `20260529_p43_lgbm_d4_nov_review` 已完成：`M_lgbm_d4` Nov holdout **0.08967** vs R02 **0.06952**，样本外明显更强、未塌；传统侧样本外验证全部收口 | ✅ 完成 |
+| **交付 接线收口（主线①）** | 把已锁融合接进 `src/submission_pipeline.py`（两成员 + 并集特征 + per-day zscore 平均）→ `meow.py` `fit(Jun,Nov)+eval(Dec)` 跑通演练。**口径见上「交付接线收口 — 注意事项」6 条**（serve 自算 zscore / 融合层 / 并集 / spec 优雅 / 零缓存 / 验收清单）。 | 🔄 进行中 |
+| **DL 分支（主线②，Windows）** | 4060/PyTorch：序列管道（防泄漏开窗+归一化）→ LSTM（特征当序列，低风险）证序列有料 → DeepLOB raw-LOB（高风险）；**过同协议 + 11月 holdout 才能当代表**；05-31 回退点。提交端注意：老师 `fit()` 会现场重训，DL 需 GPU+训练时长，或确认带预训练权重是否被规格允许 | 待开 |
+| 传统后续优化（推迟，保留方向） | 战略转型后**推迟**，有空才碰、上限有限：**① lgbm HPO**（num_leaves/lr+n_est/feature_fraction/min_child/L1L2，+0.003~0.008，0 holdout，性价比最高，要往大数据规模调）；**② 小波→GBDT**（老师 roadmap，+0~0.004，新 builder+防泄漏，ROI 低）；**③ MLP**（融合成员/加权，分数≈0，纯报告贡献度）。SVM/蒸馏/增量已分诊跳过 | 🅿️ 推迟 |
+| P5-b OOF stacking | **仅当**加权平均明显不够：二层小线性融合器，**必须用 OOF**（§7.9）；黑箱、难辩护，慎用 | 🅿️ 推迟 |
 | 🚩红线（Review 已用） | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，+0.0042**（run `20260527_x1_review_v1`）；11 月预算已耗 1 次 | ✅ 完成 |
 | 🚩红线（Final 未碰） | Final Holdout（12 月）全程未碰，**只在最终代表选定后一次性确认**、看完不改提交决策（§4.8） | 未动 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
@@ -151,10 +207,11 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 
 ## P4-2b 交接（下一会话接手点）
 
-**P4-2b 代码改动已落地、long-only 在跑**（lightgbm 已装、M_tree_d7/d8 + M_lgbm_d4/d6 specs 已加、`P4_TREE_GROUPS_V2` 已建并剪掉 `conditional_momentum`）。**接手点 = 读榜**（run `20260528_p42b_tree_refine_v1`，约 12:30 完）：
+**P4-2b 代码改动已落地、long-only 已读榜**（lightgbm 已装、M_tree_d7/d8 + M_lgbm_d4/d6 specs 已加、`P4_TREE_GROUPS_V2` 已建并剪掉 `conditional_momentum`）。**接手点 = 跑 expanding 决赛**（run `20260528_p42b_tree_refine_v1` 已完成）：
 
-- 读榜重点（§4.7 双镜头）：① LightGBM 是否打过 v3 ExtraTrees d6(0.0708) / X1(long 0.0703) ② ExtraTrees d7/d8 是否还在涨（拐点） ③ corr_min / stability minimax。
-- 之后步骤见上「本周双轨 roadmap」+「待办队列」：选决赛 → expanding → P5 加权 ensemble → Review Holdout → 提交演练；DL 转 Windows 并行。
+- 已拍板送 `expanding` 的 3 个候选：`M_lgbm_d4`（上限型）+ `M_tree_d8`（树主代表）+ `M_tree_d7`（低 gap 保守备胎）。
+- `M_lgbm_d6` 淘汰原因：被 `d4` 支配，且 gap 0.194 过热最重。
+- 之后步骤见上「本周双轨 roadmap」+「待办队列」：**expanding → 锁最优单模型 → P5 加权 ensemble → Review Holdout → 提交演练**；DL 转 Windows 并行。
 
 **看门狗阈值**：soft 12GB / hard 13GB（V2 集 peak ~9.3GB，安全）。
 

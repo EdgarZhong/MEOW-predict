@@ -207,6 +207,12 @@ def build_arg_parser():
         help="训练行降采样比例（默认 1.0=全量、不影响既有路径）。P4 树初筛提速用，"
              "如 0.33 表示每折只用 1/3 训练行；仅采训练，验证集全量不动、排名指标不受污染。",
     )
+    parser.add_argument(
+        "--dump-oof",
+        action="store_true",
+        help="落盘逐行 OOF 验证预测到 run 目录下 oof/（P5 加权融合/stacking 用）；"
+             "仅串行（--n-workers 1）支持，并行模式会告警跳过。",
+    )
     return parser
 
 
@@ -365,6 +371,7 @@ def main():
         resume=args.resume,
         output_dir=args.output_dir,
         run_id=args.run_id,
+        dump_oof=args.dump_oof,
     )
 
     # 打印关键结果
