@@ -583,11 +583,21 @@ class ExperimentRunner(object):
         return series
 
     def fit_model(self, model_name, xtrain, ytrain, target_mode="raw", sample_weight=None, model_params=None):
-        # model_params：来自 spec 的预钉超参覆盖（§4.9 各模型小网格预先钉死），
-        # 与各模型的默认参数合并；为 None 时完全走默认，不影响既有线性路径。
-        mp = dict(model_params or {})
+        # 薄包装：从 DataFrame 抽出特征 numpy 后委托 `_fit_model_core`。
+        # 交付链（submission_pipeline）整窗训练时会跳过这层、直接把预抽好的 numpy 喂给 core，
+        # 从而避免「pandas 列子集 + to_numpy」两份大矩阵并存的额外内存尖峰。
         feature_cols = [c for c in xtrain.columns if c not in ["date", "symbol", "interval"]]
         x = xtrain[feature_cols].to_numpy(dtype=np.float32)
+        return self._fit_model_core(
+            model_name, x, feature_cols, ytrain,
+            target_mode=target_mode, sample_weight=sample_weight, model_params=model_params,
+        )
+
+    def _fit_model_core(self, model_name, x, feature_cols, ytrain, target_mode="raw", sample_weight=None, model_params=None):
+        # model_params：来自 spec 的预钉超参覆盖（§4.9 各模型小网格预先钉死），
+        # 与各模型的默认参数合并；为 None 时完全走默认，不影响既有线性路径。
+        # 约定：x 已是 float32 特征矩阵、feature_cols 与其列严格一一对应（由调用方保证）。
+        mp = dict(model_params or {})
         y, baseline = self._make_target_series(ytrain, target_mode=target_mode)
         y, winsor_info = self._apply_target_winsorize(y)
         if winsor_info is None:

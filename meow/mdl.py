@@ -37,13 +37,22 @@ class MeowModel(object):
 
     def fit(self, xdf, ydf):
         """
-        用正式提交 spec 训练模型。
+        非破坏式训练入口（训练后仍要复用入参时用）。
 
         这里显式保留日志，是为了老师直接跑 `python meow.py` 时，
         能从终端看到提交链已经进入我们的正式训练实现，而不是样例 baseline。
         """
 
         self.runtime.fit(xdf, ydf)
+        log.inf("Done fitting formal submission model")
+
+    def fit_window(self, frames):
+        """
+        整窗消费式训练入口：接收 `{"xdf","ydf"}` holder 并交出所有权，
+        委托正式提交链在末位成员训练前释放整窗源帧、压低内存峰值。
+        """
+
+        self.runtime.fit_window(frames)
         log.inf("Done fitting formal submission model")
 
     def predict(self, xdf):

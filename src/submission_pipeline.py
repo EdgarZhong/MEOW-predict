@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -312,21 +313,29 @@ class SubmissionModelPipeline:
         self.member_input_cols: Dict[str, List[str]] = {}
         self.member_baselines: Dict[str, object] = {}
 
-    def _member_xdf(self, xdf: pd.DataFrame, member: SubmissionMemberSpec) -> pd.DataFrame:
+    def _resolve_member_input_cols(self, member: SubmissionMemberSpec) -> List[str]:
         """
-        从“并集特征表”里切出某个成员自己的输入子集。
+        解析某个成员从“并集特征表”里要取的输入列（不含 meta），结果缓存。
 
-        这是提交链的关键点：
-        - raw 侧只现算一次特征并集
-        - 训练/推理时每个成员严格只看自己定义过的列
-        - 避免 X1 错吃到 LightGBM 的扩展列，或反之
+        每个成员严格只看自己定义过的列：避免 X1 错吃到 LightGBM 的扩展列，或反之。
         """
 
         input_cols = self.member_input_cols.get(member.experiment_id)
         if input_cols is None:
             input_cols = SubmissionFeaturePipeline(groups=member.groups).feature_names()
             self.member_input_cols[member.experiment_id] = list(input_cols)
-        return xdf[META_COLS + list(input_cols)].copy()
+        return self.member_input_cols[member.experiment_id]
+
+    def _member_xdf(self, xdf: pd.DataFrame, member: SubmissionMemberSpec) -> pd.DataFrame:
+        """
+        从“并集特征表”里切出某个成员自己的输入子集（meta + 该成员特征列）。
+
+        说明：`xdf[col_list]` 在 pandas 中本身已返回拷贝，因此这里不再额外 `.copy()`
+        （旧写法多复制一份，整窗下白白吃掉一份大矩阵的内存）。
+        """
+
+        input_cols = self._resolve_member_input_cols(member)
+        return xdf[META_COLS + list(input_cols)]
 
     def _per_day_zscore(self, frame: pd.DataFrame, pred: np.ndarray) -> np.ndarray:
         """
@@ -385,6 +394,7 @@ class SubmissionModelPipeline:
         self,
         frame: pd.DataFrame,
         require_target: bool = False,
+        copy: bool = True,
     ) -> pd.DataFrame:
         """
         把 `meow/` 包装层传进来的 DataFrame 统一还原成实验主链口径。
@@ -392,40 +402,89 @@ class SubmissionModelPipeline:
         `meow` 样例习惯把 `(symbol, date, interval)` 设为 index；
         experiment_runner 习惯把三列保留成普通列。
         这里做一次无损归一化，避免两套入口因为 DataFrame 形态不同而漂移。
+
+        copy：
+        - True（默认）：返回独立拷贝，调用方后续可安全复用原帧（如 predict 复用入参）。
+        - False：整窗消费式训练专用——调用方已交出源帧所有权，这里不再额外复制，
+          以免整窗下凭空多出一份大矩阵；meta 已是普通列时直接原样返回。
         """
 
-        out = frame.copy()
-        if not set(META_COLS).issubset(out.columns):
-            if list(out.index.names) == META_COLS:
-                out = out.reset_index()
-            else:
-                raise ValueError(
-                    "输入 DataFrame 缺少正式提交所需的 meta 列，且 index 也不是标准 MultiIndex"
-                )
+        meta_is_columns = set(META_COLS).issubset(frame.columns)
+        if meta_is_columns:
+            out = frame.copy() if copy else frame
+        elif list(frame.index.names) == META_COLS:
+            # reset_index 本身已生成新对象，无需再 copy。
+            out = frame.reset_index()
+        else:
+            raise ValueError(
+                "输入 DataFrame 缺少正式提交所需的 meta 列，且 index 也不是标准 MultiIndex"
+            )
         if require_target and TARGET_COL not in out.columns:
             raise ValueError(f"训练目标缺少列: {TARGET_COL}")
         return out
 
     def fit(self, xdf: pd.DataFrame, ydf: pd.DataFrame) -> None:
         """
-        用正式提交 spec 训练全部成员模型。
+        非破坏式训练入口（单测 / 训练后仍要复用入参的场景用）。
 
-        这里继续复用 experiment_runner 的训练核心，确保：
-        - winsorize 只作用于训练标签
-        - 模型参数与实验链一致
-        - 但每个成员只吃自己定义过的列，而不是整张并集表
+        会对入参做一次拷贝归一化，因此调用方训练后仍可安全复用原 `xdf`（如紧接着 predict）。
+        整窗交付训练请改用 `fit_window`，那条路会消费并即时释放整窗源帧、把内存峰值压下来。
         """
 
-        xtrain = self._normalize_meow_frame(xdf, require_target=False)
-        ytrain = self._normalize_meow_frame(ydf, require_target=True)
+        self._fit_impl({"xdf": xdf, "ydf": ydf}, release_source=False)
+
+    def fit_window(self, frames: Dict[str, pd.DataFrame]) -> None:
+        """
+        整窗消费式训练入口：交付链（meow.py）专用。
+
+        约定：调用方已把整窗 `xdf/ydf` 装进 `frames` 字典并交出所有权
+        （自己不再持有引用）。本方法据此：
+        - 归一化时不再额外拷贝整窗矩阵；
+        - 成员按 spec 顺序训练，末位成员（默认 = 列数最多的 LightGBM）`fit` 前
+          先把整窗源帧释放掉，避免「整窗源帧 + 该成员训练矩阵」长时间并存。
+        """
+
+        self._fit_impl(frames, release_source=True)
+
+    def _fit_impl(self, frames: Dict[str, pd.DataFrame], release_source: bool) -> None:
+        """
+        成员训练核心，被 `fit` / `fit_window` 共用。
+
+        winsorize 只作用于训练标签、模型参数与实验链一致、每个成员只吃自己定义过的列。
+        内存关键：直接把「预抽好的特征 numpy」喂给 `runner._fit_model_core`，
+        不再生成中间的成员级 pandas 子表，省掉一份大矩阵；末位成员训练前释放整窗源帧。
+        """
+
+        # release_source=True：源帧所有权已移交 → 不拷贝；并立即解除 frames 对源帧的引用。
+        xtrain = self._normalize_meow_frame(
+            frames["xdf"], require_target=False, copy=not release_source
+        )
+        ytrain = self._normalize_meow_frame(
+            frames["ydf"], require_target=True, copy=not release_source
+        )
+        if release_source:
+            frames["xdf"] = None
+            frames["ydf"] = None
+        gc.collect()
+
         self.models = {}
         self.member_feature_cols = {}
         self.member_baselines = {}
-        for member in self.spec.members:
-            member_xtrain = self._member_xdf(xtrain, member)
-            model, feature_cols, baseline = self.runner.fit_model(
+        members = list(self.spec.members)
+        last_idx = len(members) - 1
+        for i, member in enumerate(members):
+            input_cols = self._resolve_member_input_cols(member)
+            # 只抽该成员需要的特征列为 float32 numpy（不含 meta；raw 口径训练不需要 meta）。
+            member_x = xtrain[input_cols].to_numpy(dtype=np.float32)
+            if i == last_idx:
+                # 末位成员（默认 lgbm，列数最多）训练前先释放整窗源帧：
+                # 此后内存里只剩「该成员训练矩阵 + 模型内部结构」，避免与整窗源帧并存。
+                xtrain = None
+                gc.collect()
+            model, feature_cols, baseline = self.runner._fit_model_core(
                 member.model_name,
-                member_xtrain,
+                member_x,
+                list(input_cols),
                 ytrain,
                 target_mode=member.target_mode,
                 model_params=member.model_params,
@@ -433,6 +492,8 @@ class SubmissionModelPipeline:
             self.models[member.experiment_id] = model
             self.member_feature_cols[member.experiment_id] = list(feature_cols)
             self.member_baselines[member.experiment_id] = baseline
+            del member_x
+            gc.collect()
 
     def predict(self, xdf: pd.DataFrame) -> np.ndarray:
         """
