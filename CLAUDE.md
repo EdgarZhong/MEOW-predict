@@ -2,11 +2,12 @@
 
 更新日期：2026-05-31
 
-## 当前阶段：DL 主线地基（设计定稿 → D0 实现）
+## 当前阶段：DL 主线地基（D0 实现完成 → 待接 PyTorch 卡带）
 
 > **战略**：传统侧已收口、可提交（保底代表已锁）；主线 = ① 交付接线收口（剩尾巴）+ ② **DL 冲 0.12**（Windows 4060 / PyTorch）。
 > **DL 地基设计已定稿** → `docs/specs/DL实验设计规格.md`（固定脊柱 + 可换卡带 / 海选+expanding 评测 / 配置管理 / D0 交付物）。当前在 `feat/dl-foundation` 分支。
-> **本会话已完成**：DL 设计定稿 + 核心文档净化（AGENTS/NOTE 压缩线性那套、CLAUDE 精简）。**下一步 = 实现 D0 地基**（见待办队列）。
+> **本会话已完成**：**D0 地基全部落地**（接 PyTorch 前能做的开发测试全做完）——`src/sequence_dataset.py`（WindowIndexer+Normalizer+SequenceDataset）/ `src/dl_protocol.py`（三段切分+embargo+4指标+防泄漏检查）/ `src/dl_trainer.py`（SequenceTrainer）/ `models/dl_models.py`+`models/registry.py`（InputAdapter+FeatureAdapter+numpy 参考模型+注册表）/ `config/`（6 文件 frozen 配置块+RunConfig 组装校验）/ `tests/test_dl_pipeline.py`（六项验收闸 17 test 全过，含真实 h5 FeatureAdapter）。全程 torch-free、Mac CPU 跑通。README 已重写为「DL 工程地基说明 + 代码/文档索引」。
+> **未提交**：本会话所有 DL 代码 + README 改动尚在工作区（用户决定提交时机）。**下一步 = DL 基础设施（run_dl.py Orchestrator + HPO Searcher）+ 等 4060 接 PyTorch 卡带（D1 LSTM）**。
 
 ### 传统侧（已收口、保底代表；全量明细见 `docs/实验记录.md`）
 
@@ -40,9 +41,9 @@
 |---|---|---|
 | 传统全程（P0–P5 + 交付接线主体） | 特征侧 / 选模型 / 融合 / 交付融合接线 + raw_mean + 内存中档精简，全部完成、明细沉淀 `docs/实验记录.md` | ✅ 收口 |
 | **DL 地基设计** | 脊柱+卡带架构 / 海选+expanding 协议 / 配置管理 / D0 交付物，定稿落 `docs/specs/DL实验设计规格.md` | ✅ 完成 |
-| **DL D0 地基实现（下一步，主线②）** | torch-free、Mac CPU 跑通，按 spec §9 顺序：① `src/sequence_dataset.py`（窗口索引器:惰性[B,L,C]/不跨日/因果对齐/warmup + Normalizer:fit-on-train/可 identity）→ ② `src/dl_protocol.py`（协议引擎:walk-forward 折日期/三段切分/embargo/4指标/防泄漏入口）→ ③ `src/dl_trainer.py`（`SequenceTrainer(BaseTrainer)` 骨架，产 `FoldResult`）→ ④ `models/dl_models.py`（`InputAdapter` 接口 + `FeatureAdapter` 包装 433 管线 + numpy 参考模型当泄漏探测器）→ ⑤ `config/`（配置块 frozen dataclass+枚举 + `RunConfig` 组装/校验）→ ⑥ 单测（CPU 端到端 + 参考模型低分 + 无泄漏 + 窗口不跨日 + 归一化只用训练统计） | 🔜 下一步 |
-| **DL 基础设施实施** | `experiments/run_dl.py`（Orchestrator:组装+冻结 RunConfig+两阶段交接）+ HPO Searcher（采样/早杀/海选→认证/多种子）+ per-kind 实现 registry；早杀先留 TrainRecord 钩子、实现推后 | 🔜 D0 后 |
-| **README 重写** | **D0 代码落地后**重写本分支 README：作为「DL 已落实工程环境说明书 + 重要代码/文档索引」（含 DL 规格入口、`config/`/`src/dl_*`/`models/` 结构、依赖补 `torch`/`psutil`、运行方式） | 🔜 D0 后 |
+| **DL D0 地基实现（主线②）** | torch-free、Mac CPU 跑通，按 spec §9 全部落地：① `src/sequence_dataset.py`（WindowIndexer 惰性[B,L,C]/不跨日/不跨票/因果对齐/warmup + Normalizer fit-on-train/可 identity + subset_by_dates）② `src/dl_protocol.py`（DLFold 三段切分/embargo/4指标逐字对齐 experiment_runner/assert_folds_causal/summarize_folds）③ `src/dl_trainer.py`（`SequenceTrainer(BaseTrainer)`，鸭子类型注入 adapter+cartridge_factory+raw_loader，产 `FoldResult`）④ `models/dl_models.py`（InputAdapter 接口+IdentityAdapter+FeatureAdapter 包装433+numpy 参考模型 ReferenceZero/Last 当泄漏探测器）+`models/registry.py`（枚举→类注册+required_adapter 校验）⑤ `config/` 6 文件（frozen dataclass+枚举顶部 + `RunConfig` 组装/校验/fingerprint）⑥ `tests/test_dl_pipeline.py`（六项验收闸 **17 test 全过**：端到端/参考模型低分/无泄漏因果/不跨日跨票/归一化只用训练统计/config 校验 + 真实 h5 FeatureAdapter）。**import 约定：src/config/models 三目录平铺，入口 `PYTHONPATH=src:config:models`** | ✅ 完成（本会话，未提交） |
+| **DL 基础设施实施（下一步）** | `experiments/run_dl.py`（Orchestrator:组装+冻结 RunConfig+两阶段交接）+ HPO Searcher（采样/早杀/海选→认证/多种子）；registry 已就位；早杀 D0 已留 `TrainRecord` 钩子、实现推后 | 🔜 下一步 |
+| **README 重写** | 已重写为「DL 工程地基说明 + 代码/文档索引」（DL 规格入口、`config/`/`src/dl_*`/`models/` 结构、import 约定、依赖说明 torch[D1/D2]/psutil[演练]、DL 测试运行方式） | ✅ 完成（本会话，未提交） |
 | **DL D1/D2（4060 就绪后）** | D1：LSTM 卡带（特征当序列，低风险）跑海选+expanding；D2：DeepLOB raw-LOB 卡带（高风险）。过协议才当代表候选 | 待开（等卡） |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待 ≥32GB 机器实测（本机 16GB 跑不了全窗口） | 🔜 待机器 |
 | 交付接线 — Dec 全窗口演练 | ≥32GB 机器跑 `fit(Jun,Nov)+eval(Dec)`：不 OOM + 三指标健康 + 零 skew + 核对内存峰。跑法 `python experiments/run_submission_full_window.py`，SOP `docs/交付演练SOP_Windows全窗口.md`。**Dec 只当 sanity、不回灌选型** | 🔜 待机器 |
