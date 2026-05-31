@@ -25,6 +25,7 @@ HPO Searcher —— 结构超参随机搜索 + 早杀钩子 + 海选排名（脊
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -73,6 +74,43 @@ def sample_hparams(
     for knob, spec in overrides.items():
         space[knob] = spec
     return {knob: _sample_one(spec, rng) for knob, spec in space.items()}
+
+
+def enumerate_grid(search_space: Dict, overrides: Optional[Dict] = None) -> List[Dict]:
+    """
+    把卡带 ``search_space``（叠加 ``overrides`` 收窄）展开成**确定性网格**（笛卡尔积）。
+
+    与 ``sample_hparams`` 随机采样相对：SWEEP 档1 用确定性小网格，忠实「HPO 网格预先声明、
+    跑一次」（AGENTS §十一·11.7 护栏 1）。逐 knob 展开：
+    - ``choice``  → 全部 values；
+    - ``int``     → 闭区间 ``[low, high]`` 全部整数；
+    - ``uniform`` → 取 ``[low, high]`` 两端点（连续旋钮本不该进网格，仅兜底）。
+
+    返回 hparam dict 列表（每个 = 一组完整超参，knob 顺序稳定）；空空间返回 ``[{}]``（单点）。
+    """
+    overrides = overrides or {}
+    space = dict(search_space)
+    for knob, spec in overrides.items():
+        space[knob] = spec
+    if not space:
+        return [{}]
+    knobs = list(space.keys())
+    axes: List[List] = []
+    for knob in knobs:
+        spec = space[knob]
+        t = spec.get("type")
+        if t == "choice":
+            axis = list(spec["values"])
+        elif t == "int":
+            axis = list(range(int(spec["low"]), int(spec["high"]) + 1))
+        elif t == "uniform":
+            axis = [float(spec["low"]), float(spec["high"])]
+        else:
+            raise ValueError(f"未知 search_space spec type: {t!r}（应为 choice/int/uniform）")
+        if not axis:
+            raise ValueError(f"knob {knob!r} 展开为空")
+        axes.append(axis)
+    return [dict(zip(knobs, combo)) for combo in itertools.product(*axes)]
 
 
 # ================================================================== #
@@ -124,6 +162,8 @@ class TrialResult:
     n_evals: int                  # 参与汇总的 (seed, fold) 数
     status: str = "ok"            # "ok" | "error"
     error_msg: str = ""
+    best_epoch_mean: float = 0.0  # 平均 best_epoch（诊断 early stopping 是否提前触发）
+    n_epochs_mean: float = 0.0    # 平均实际跑了多少 epoch（判断是否撞 max_epochs 天花板）
 
     def to_row(self) -> dict:
         """落 trials.csv 的一行（hparams 摊平进列，前缀 hp_）。"""
@@ -134,6 +174,8 @@ class TrialResult:
             "val_corr_min": self.val_corr_min,
             "val_corr_std": self.val_corr_std,
             "n_evals": self.n_evals,
+            "best_epoch_mean": self.best_epoch_mean,
+            "n_epochs_mean": self.n_epochs_mean,
             "status": self.status,
             "error_msg": self.error_msg,
         }
@@ -210,9 +252,11 @@ class Searcher:
         self.early_kill = early_kill or EarlyKillPolicy(enabled=False)
         self.sampling_seed = int(sampling_seed)
 
-    def _eval_trial(self, seq_len: int, cart_hparams: Dict) -> List[float]:
-        """一组超参跑 seeds × folds，收集所有 ok 折的 val_corr。"""
+    def _eval_trial(self, seq_len: int, cart_hparams: Dict) -> Dict:
+        """一组超参跑 seeds × folds，收集 val_corr + epoch 诊断信息。"""
         corrs: List[float] = []
+        best_epochs: List[int] = []
+        n_epochs_list: List[int] = []
         for seed in self.seeds:
             trainer = SequenceTrainer(
                 self.spec, self.adapter, self.cartridge_factory, self.raw_loader,
@@ -223,10 +267,16 @@ class Searcher:
                 r = trainer.run_on_dl_fold(fold, profile_name=self.profile_name)
                 if r.status == "ok" and np.isfinite(r.val_corr):
                     corrs.append(float(r.val_corr))
+                    best_epochs.append(int(r.best_epoch))
+                    n_epochs_list.append(int(r.n_epochs))
                 elif r.status == "error":
                     # 单折失败不拖垮 trial，但记一次让上层 status 反映异常。
                     raise RuntimeError(f"fold {fold.fold_id} 失败: {r.error_msg}")
-        return corrs
+        return {
+            "corrs": corrs,
+            "best_epoch_mean": float(np.mean(best_epochs)) if best_epochs else 0.0,
+            "n_epochs_mean": float(np.mean(n_epochs_list)) if n_epochs_list else 0.0,
+        }
 
     def run(self) -> SearchOutcome:
         rng = np.random.default_rng(self.sampling_seed)
@@ -240,17 +290,21 @@ class Searcher:
             cart_hparams = effective
 
             status, err = "ok", ""
+            trial_data: Dict = {"corrs": [], "best_epoch_mean": 0.0, "n_epochs_mean": 0.0}
             try:
-                corrs = self._eval_trial(seq_len, cart_hparams)
+                trial_data = self._eval_trial(seq_len, cart_hparams)
             except Exception as e:                       # noqa: BLE001
-                corrs, status, err = [], "error", str(e)[:500]
+                status, err = "error", str(e)[:500]
 
+            corrs = trial_data["corrs"]
             summ = summarize_folds([{"corr": c} for c in corrs])
             trials.append(TrialResult(
                 trial_id=t, seq_len=seq_len, hparams=dict(cart_hparams),
                 val_corr_mean=summ["mean"], val_corr_min=summ["min"],
                 val_corr_std=summ["std"], n_evals=len(corrs),
                 status=status, error_msg=err,
+                best_epoch_mean=trial_data["best_epoch_mean"],
+                n_epochs_mean=trial_data["n_epochs_mean"],
             ))
 
         ranked = sorted(

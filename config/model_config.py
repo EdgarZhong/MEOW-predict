@@ -24,8 +24,8 @@ class ModelKind(Enum):
     REFERENCE_ZERO = "reference_zero"   # numpy 参考模型：恒 0，sanity 基线
     REFERENCE_LAST = "reference_last"   # numpy 参考模型：末步通道线性，防泄漏探测器
     REFERENCE_POOL = "reference_pool"   # numpy 参考模型：窗口均值池化 + 线性；声明 STRUCTURE_SEARCH_SPACE，当 HPO/TCN 的 torch-free 模板
-    TCN = "tcn"                         # D2 主攻（原始微结构当通道，绑 RAW_CHANNELS）；因果膨胀卷积，归纳偏置贴订单流
-    GRU = "gru"                         # 第二卡带（433 工程特征当输入，绑 FEATURE_433）；两门 RNN，参数少、短序列快，与 TCN 形成"架构×输入"对照
+    TCN = "tcn"                         # 【否决·2026-06-01】TCN-on-raw 截面盲区（详见规格 §8.0 / NOTE.md）；保留为历史词位
+    GRU = "gru"                         # 时序基线 + 保底主跑（433 工程特征，绑 FEATURE_433）；编码每票日内路径，也是截面模型(规格 §8.2)的时序腿
     LSTM = "lstm"                       # 占位，待定（GRU 已覆盖 D1 角色，此槽保留供未来对照）
     DEEPLOB = "deeplob"                 # 【退役】数据无连续 LOB（规格 §8.0），保留为历史词位，不实现
 

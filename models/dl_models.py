@@ -220,15 +220,20 @@ class RawChannelAdapter(InputAdapter):
 # ModelCartridge 接口 + numpy 参考模型
 # ================================================================== #
 
-# TCN / LSTM 等结构化序列卡带共用的"只搜 3 个结构旋钮"搜索空间（规格 §6）。
-# 约定：``seq_len`` 是 trainer 级旋钮（决定开窗、要重建 SequenceDataset，由 Searcher 喂
-# SequenceTrainer），``hidden_size`` / ``num_layers`` 是卡带级 hparams（进 fit）。
-# 迷你 spec 三型：{"type":"choice","values":[...]} / {"type":"int","low":a,"high":b} /
-# {"type":"uniform","low":a,"high":b}（见 src/dl_search.py 采样器）。
+# ---- TCN 搜索空间（原始微结构通道，深层卷积有意义，num_layers 可到 4） ----
 STRUCTURE_SEARCH_SPACE: Dict = {
     "seq_len":     {"type": "choice", "values": [16, 32, 48, 64]},
     "hidden_size": {"type": "choice", "values": [32, 64, 128]},
     "num_layers":  {"type": "int", "low": 1, "high": 4},
+}
+
+# ---- GRU 搜索空间（433 工程特征输入，特征已含多步期信息，浅层即可） ----
+# - seq_len：去掉 64，聚焦 16/32/48（TCN expanding 已证 48 对原始通道负，但特征版值得试）
+# - num_layers：上限压 2——特征已预编码多步期，深层 GRU 只增噪声和过拟合风险
+GRU_SEARCH_SPACE: Dict = {
+    "seq_len":     {"type": "choice", "values": [16, 32, 48]},
+    "hidden_size": {"type": "choice", "values": [32, 64, 128]},
+    "num_layers":  {"type": "int", "low": 1, "high": 2},
 }
 
 
@@ -762,7 +767,7 @@ class GRUCartridge(ModelCartridge):
     训练策略与 TCNCartridge 完全一致（MSE + AdamW + 早停 + 梯度裁剪），降低对照噪声。
     """
 
-    search_space: ClassVar[Dict] = STRUCTURE_SEARCH_SPACE
+    search_space: ClassVar[Dict] = GRU_SEARCH_SPACE
     required_adapter = AdapterKind.FEATURE_433
 
     def __init__(self):

@@ -18,7 +18,7 @@
 
 - **目标分**：直接冲 **0.12**（老师明示有人做到过 0.12、业界 0.2–0.3）。不浪费预算去"验证序列有没有料"。
 - **保留的纪律**：评测要能拦住自欺——过拟合探测、时间外推稳定性、防泄漏、config-lock、红线 holdout（见 §5、§10）。
-- **算力**：Windows 4060 / PyTorch；与传统侧（Mac）互不抢算力。全程预算估算 ~25 GPU-hours（海选 ~15 + 认证 ~12），单卡一周可容纳。
+- **算力**：Windows 4060 / PyTorch；与传统侧（Mac）互不抢算力。预算口径已改为 `AGENTS.md §十一·11.6`「一命令两档」——一晚一个结构族 ≈25–30 次 fit / 7–15 小时，单卡一周可比完 2–3 个结构族。
 - **与传统侧的关系**：评测体系、数据认知、9-stage 特征工程、提交通道**全可复用**；DL 只是把"模型"这一格换成序列模型 + 把"输入"这一格换成可换的 adapter。
 
 ---
@@ -139,6 +139,8 @@ class ModelCartridge:
 
 ## 5. 评测协议
 
+> ⚠️ **2026-06-01 作废通告**：本节 §5.2 的"海选(单切分+早杀) + expanding 两阶段"口径**已废**，由 `AGENTS.md §十一 DL 评测协议`取代（锚定扩展 walk-forward + purge/embargo + 最坏折/bootstrap + 一命令两档预算）。原因见 `NOTE.md`「交付=方法非权重 → 评测协议为什么这么重设计」。下方 §5.3 三段折+embargo、§5.4 四指标双镜头、§5.5 numpy 参考模型**仍有效**，沿用。
+
 ### 5.1 walk-forward 复用，不另起炉灶
 
 复用传统侧 `expanding` 走查思想。DL 有两类盲区、配两类工具：
@@ -172,7 +174,7 @@ class ModelCartridge:
 ### 5.4 四指标 + 双镜头判官
 
 - 指标：`corr`（对齐老师 pooled corr）/ `MSE` / `R²` / `daily-IC`。
-- 判官 = **均值（pooled corr）+ 鲁棒（最坏折/minimax）双镜头同时看、人工权衡**，不退化成单指标闸刀（沿用 AGENTS §4.9）。
+- 判官 = **均值（pooled corr）+ 鲁棒（最坏折/minimax）双镜头同时看、人工权衡**，不退化成单指标闸刀（沿用 AGENTS §四「双镜头」/ §十一·11.3）。
 - 同时看 **train vs earlystop-val gap + 逐 epoch 曲线** 判过拟合，**逐折 corr 方差** 判稳定性。
 
 ### 5.5 防泄漏：numpy 参考模型
@@ -188,6 +190,8 @@ class ModelCartridge:
 ---
 
 ## 6. 超参搜索（省算力的叠加策略）
+
+> ⚠️ **2026-06-01 升级通告**：选型粒度口径以 `AGENTS.md §十一·11.4/11.6/11.7` 为准——**结构族为主**（一命令一族）+ 命令内小 HPO 网格（结构子旋钮 + λ 损失对齐）+ **seed 当探针不优化** + 其余训练超参**固定重正则默认**；一命令两档预算（筛选→认证）取代旧"海选→另起命令 expanding"。下方"只搜 3 旋钮 / 随机搜索 / 早杀 / 训练行采样"作为**实现细节**仍可参考，但范围/阶段以 §十一 为准。
 
 1. **只搜 3 个结构超参**：序列长 `seq_len` / 隐藏维 `hidden_size` / 层数 `num_layers`；其余冻结默认。
 2. **随机搜索 ≫ 网格**。
@@ -288,7 +292,7 @@ config/
 - **没有连续 LOB**：盘口只有 4 个稀疏聚合档位（`bid0/4/9/19` + `ask` 同构）+ 聚合 size（`bsize0 / bsize0_4 / bsize5_9 / bsize10_19`）+ turnover ratio（`btr0_4 / atr0_4 …`），**不是 DeepLOB 假设的连续 10 档价量网格**。→ **DeepLOB-on-rawLOB 退役**（无对应输入，照搬 Inception 网格没意义）。
 - **能喂的 = ~59 个原始微结构通道**：价（`midpx / lastpx / OHLC` + 4 档买卖价）、量（聚合 size / turnover ratio）、订单流（主动买卖 + 挂单 + 撤单的笔数 / 量 / 额 / 高低 / vwad）。
 - **序列 = 某票某日 ~226 步日内路径**，绝不跨日。
-- **D2 主攻收敛**：`TCN-on-原始微结构`（RawChannelAdapter + TCN 卡带）。理由见 `NOTE.md`「为什么 TCN」：因果自带 + 训练并行省 GPU + 膨胀卷积归纳偏置贴订单流；架构是小杠杆，把算力砸在输入/归一化/结构搜索。`DEEPLOB` 枚举保留为历史词位但标退役。
+- **路线收敛（2026-06-01 更新，替代原 TCN 主攻判断）**：`TCN-on-原始微结构` 海选 + expanding 已跑完、**否决**——真因 = **截面盲区**（`[B,L,C]` 一次只看一只票、RawChannelAdapter 无任何截面归一 → 看不见 cross-z/rank 那一维 alpha，而传统 0.0776 主力恰在此），非 max_epochs；且 raw 与 433 同源、无更富数据、raw-LOB 终局不存在。详见 `NOTE.md`「路线再收敛」+ `CLAUDE.md`。**新主攻 = 截面联合建模**（共享时序腿 + 截面 set-attention，见 §8.2）；`GRU-on-433`（FeatureAdapter）作**时序基线 + 保底**先跑。`TCN` / `DEEPLOB` 枚举保留为历史词位。
 
 ### 8.1 张量形态与泛化缝
 
@@ -306,6 +310,37 @@ config/
 - **D0 取舍（已拍板）**：先锁单张 `[L,C]`（YAGNI，主线冲 0.12 不需要多张量），但 Window Indexer / Normalizer 写成"不假设只有一张"的形态，留缝。
 
 ---
+
+### 8.2 截面联合建模（新主攻，张量契约泛化；设计「为什么」见 `NOTE.md`「截面模型怎么设计」）
+
+**目标**：每个 `(date, interval)` 把当时在场的 ~N 票横喂一个模型，让网络看见"这只票此刻在全市场排第几"——cross-z / cross-rank 那一维 alpha（传统 0.0776 主力、TCN-on-raw 整整瞎掉的维度）。
+
+**结构 = 因子化两腿 + 残差**（业界 STGNN / 关系排序同构；为什么不用时空联合大注意力、不用 GAT/GCN 图网络见 `NOTE.md`）：
+
+```
+每票日内窗 [L, C] ──共享时序腿(GRU，所有票/所有 interval 同一套权重)──▶ h_i ∈ R^d
+{h_1..h_N}(同一 (date,interval) 在场票) ──截面腿(set-attention，无位置/无 ID，带 padding mask)──▶ Δ_i
+z_i = h_i + Δ_i (残差) ──per-票头(Linear)──▶ ŷ_i  (该票该 interval 的 fret12)
+```
+
+- 时序腿权重**跨票 + 跨 interval 共享**（样本效率拉满）；截面腿只在某 `(date,interval)` 的票集合内自注意力。
+- set-attention **无位置编码、无股票 ID** → 置换等变 + 零身份（换池子免费保险，§十一·11.5）。
+- **残差**：截面腿学不到 → Δ≈0 → 退化回纯时序 GRU 基线（= GRU-on-433 那条 ③）→ ③ 天然是 ② 的消融下界。
+
+**张量契约泛化（§8.1 扩展缝兑现，唯一动脊柱处）**：
+
+| 组件 | 原（单票序列） | 改（截面快照） |
+|---|---|---|
+| 样本单元 | 某 (票,日,interval) 一个窗 `[L,C]` | 某 (date,interval) 的票集合 `[N,L,C]` + `mask[N]` + `y[N]` |
+| Window Indexer | 按 (票,日) 逐窗 gather | 按 (date,interval) 聚票，各票取前 L 窗 stack；变长 N → pad + mask（不跨日、因果对齐不变） |
+| Normalizer | 通道 train-stat 白化 | 同上 **+ 加一档截面内归一（每 (date,interval) cross-z）** ← 正补 TCN 瞎掉的那维 |
+| 协议 / 指标 / HPO / Orchestrator / SWEEP | — | **全不动**（脊柱+卡带架构的价值兑现） |
+
+**卡带**：新 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 `FEATURE_433`）；torch（共享 GRU + `nn.MultiheadAttention` 1 块 + 残差 + Linear 头）；loss = `MSE + λ·(1 − 截面内 Pearson)`，λ∈{0,0.3} 走 SWEEP 小网格。
+
+**与评分联姻**：一次预测整截面 ~N 个 fret12 → corr 项就是**截面内 Pearson** = 老师 pooled corr / daily-IC 那一维，预测一个截面、直接优化它的截面排名。
+
+**风险盒**：截面腿是冲 0.10 主攻一摆；周中若 ③ 基线 + ② 截面都无正信号超传统保底（最坏折 + 均值双镜头），回落保底交付（DL 作增强叠传统核心，§十一·11.8）。
 
 ## 9. D0 地基交付物（torch-free，Mac CPU 即可跑通）
 
@@ -332,11 +367,13 @@ DL 评测就两段（§5.2）：**海选（便宜搜超参）→ expanding 认�
 
 ---
 
-## 11. 未决 / 待办
+## 11. 未决 / 待办（2026-06-01 路线收敛后刷新）
 
-- **D0 地基**：✅ 已落地（§9 六件 + 17 test，torch-free / Mac CPU 跑通）。
-- **接 PyTorch 前的基础设施**：✅ 已落地（torch-free）——`RawChannelAdapter`（§3.1/§8.0）、`src/dl_search.py` HPO Searcher（§6）、`experiments/run_dl.py` Orchestrator（§7）、`tests/test_dl_infrastructure.py` 端到端测试。`ModelKind` 加 `TCN`、`DEEPLOB` 标退役；`AdapterKind` 加 `RAW_CHANNELS`。
-- **TCN 卡带本体（等 4060）**：`models/dl_models.py` 加 `TCNCartridge`（nn.Module + 训练循环 + 早停），复用 `STRUCTURE_SEARCH_SPACE`、绑 `RAW_CHANNELS`；脊柱 / Orchestrator / Searcher / adapter 一律不动。
+- **D0 地基 + 接卡前基础设施**：✅ 已落地（§9 六件 + Searcher / Orchestrator / RawChannelAdapter，torch-free / Mac CPU 跑通）。`ModelKind` 含 `TCN`(否决) / `GRU`(已实现) / `DEEPLOB`(退役)；`AdapterKind` 含 `FEATURE_433` / `RAW_CHANNELS` / `IDENTITY`。
+- **TCN-on-raw**：❌ **否决**（卡带本体 + 海选 + expanding 均已跑完）。真因 = 截面盲区，非 max_epochs；详见 `NOTE.md`「路线再收敛」、`CLAUDE.md` 看板。
+- **新评测协议落代码**：✅ 已落地——`Stage.SWEEP`「一命令两档」（档1 小网格 × 近 2 折 × 2 seed → 按**最坏折**选冠军；档2 冠军 × 5 折 × 3 seed）+ `build_dl_folds(fold_select="recent")`（Oct–Dec 五段不重合、自 `rolling_end` 倒贴）+ `enumerate_grid`（确定性网格）。口径权威见 `AGENTS.md §十一`。
+- **GRU-on-433 基线（当前主跑）**：✅ 卡带已实现（绑 `FEATURE_433`、MSE + AdamW + 早停）；走 `SWEEP` 新 rolling 出第一个可信 features-DL 读数 + 立保底。实跑命令见 `CLAUDE.md`。`MSE+λ·corr` 损失对齐为下一增量（改卡带 loss，下一晚）。
+- **截面模型卡带（主攻，待实现）**：见 §8.2 设计——共享时序腿（GRU 编码每票日内路径）+ 截面腿（set-attention 跨票、置换等变零身份）+ per-票头、残差融合；需把张量契约从单张 `[L,C]` 泛化成「整截面快照 `[N,L,C]` + mask」（§8.1 扩展缝、Window Indexer 重写为按 `(date,interval)` 聚票）。
+- **早杀实现**：`EarlyKillPolicy` 钩子在位（no-op）；GRU 卡带可逐 epoch 回调，撞 GPU 上限再接。
+- **多张量/图输入**：暂不实现，按 §8.1 留缝。
 - **传统交付 fit/predict 签名核验**：遗留另会话办（见 `CLAUDE.md` 看板），与 DL 地基不冲突。
-- **早杀实现**：先留 `EarlyKillPolicy` 钩子（no-op 桩），海选真撞 GPU 上限再补。
-- **多张量/图输入**：暂不实现，按 §8 留缝。

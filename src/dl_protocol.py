@@ -24,7 +24,7 @@ numpy 预测，不碰任何 tensor、不 import torch，也刻意**不依赖** `
    embargo 真的隔开了训练区与打分区——是 D0 的核心验收闸之一。
 
 4. **稳定性汇总**（``summarize_folds``）：pooled 均值 + 最坏折（minimax）双镜头，
-   沿用 AGENTS §4.9"不退化成单指标闸刀"。
+   沿用 AGENTS §十一·11.3"不退化成单指标闸刀"。
 """
 
 from __future__ import annotations
@@ -114,6 +114,41 @@ def split_train_earlystop(
     return tuple(train_dates[:-es]), tuple(train_dates[-es:])
 
 
+def _recent_anchored_splits(
+    all_dates: Sequence[int],
+    *,
+    val_window: int,
+    step: int,
+    embargo: int,
+    min_train_days: int,
+    max_folds: int,
+) -> List[Tuple[List[int], List[int]]]:
+    """
+    自序列末尾（``rolling_end``）倒贴生成最近 ``max_folds`` 个打分段（锚定扩展训练）。
+
+    与正向 expanding 的区别：正向折锚在 ``min_train_days + k·step``、末折未必贴住 rolling_end；
+    本函数让**最近一折的打分段紧贴 rolling_end**（最像老师未来集，§十一·11.2/11.8），各段按
+    ``step`` 倒退、互不重合（``step==val_window`` 即连续铺满最近 ``max_folds·val_window`` 天），
+    训练区一律从头锚定到该段前 ``embargo`` 日（吃满全部历史 → DL 最长训练窗）。
+
+    返回升序 ``(train_dates, scoring_dates)`` 列表（fold 0 = 最早一段）。
+    """
+    n_all = len(all_dates)
+    seg_step = step if step > 0 else val_window
+    out: List[Tuple[List[int], List[int]]] = []
+    hi = n_all
+    while len(out) < max_folds:
+        lo = hi - val_window
+        if lo < 0 or (lo - embargo) < min_train_days:    # 训练区不足或越界 → 停
+            break
+        scoring_dates = list(all_dates[lo:hi])
+        train_dates = list(all_dates[0: lo - embargo])
+        if len(train_dates) >= min_train_days and scoring_dates:
+            out.append((train_dates, scoring_dates))
+        hi -= seg_step
+    return list(reversed(out))
+
+
 def build_dl_folds(
     rolling_start: int,
     rolling_end: int,
@@ -128,6 +163,7 @@ def build_dl_folds(
     min_earlystop_days: int = 1,
     min_core_days: int = 10,
     max_folds: Optional[int] = None,
+    fold_select: str = "first",
     calendar: Optional[Calendar] = None,
 ) -> List[DLFold]:
     """
@@ -136,9 +172,12 @@ def build_dl_folds(
     折日期算法与 ``eval_protocol.build_folds_for_profile`` 同口径：
     - ``mode="sliding"``：固定 ``train_window`` 天训练窗，按 ``step`` 滚动；
     - ``mode="expanding"``：训练集从头扩张，最少 ``min_train_days`` 天，按 ``step`` 滚动；
-    - 训练区与打分区之间始终隔 ``embargo`` 天。
+    - 训练区与打分区之间始终隔 ``embargo`` 天（``fret12`` 是日内 12-interval 前向标签、不跨夜，
+      故 day 级 embargo 已等价 purge——前向标签伸不进打分段，无需再丢行，§十一·11.2）。
+    - ``fold_select="recent"``（§十一·11.2）：取**最近** ``max_folds`` 段、自 ``rolling_end`` 倒贴
+      （最近一折紧贴末日、最像老师未来集），训练区锚定从头；默认 ``"first"`` 取最早若干折。
 
-    海选档可传 ``max_folds=1`` 取单切分；认证档用 expanding 少折（如 3）。
+    海选档可传 ``max_folds=1`` 取单切分；认证/SWEEP 档用 expanding + ``fold_select="recent"`` 少折。
     """
     cal = calendar or Calendar()
     all_dates = cal.range(rolling_start, rolling_end)
@@ -174,7 +213,13 @@ def build_dl_folds(
     else:
         raise ValueError(f"未知 mode: {mode}，应为 'sliding' / 'expanding'")
 
-    if max_folds is not None:
+    if fold_select == "recent" and max_folds is not None:
+        # 最近 max_folds 折、倒贴 rolling_end（§十一·11.2，新协议主路径）。
+        raw_splits = _recent_anchored_splits(
+            all_dates, val_window=val_window, step=step, embargo=embargo,
+            min_train_days=min_train_days, max_folds=max_folds,
+        )
+    elif max_folds is not None:
         raw_splits = raw_splits[:max_folds]
 
     folds: List[DLFold] = []
@@ -288,7 +333,7 @@ def corr_gap(train_metrics: Dict[str, float], val_metrics: Dict[str, float]) -> 
 
 def summarize_folds(fold_metrics: Sequence[Dict[str, float]], key: str = "corr") -> Dict[str, float]:
     """
-    把多折打分汇总成"均值（pooled）+ 鲁棒（最坏折）"双镜头（AGENTS §4.9）。
+    把多折打分汇总成"均值（pooled）+ 鲁棒（最坏折）"双镜头（AGENTS §十一·11.3）。
 
     返回 ``mean / std / min(最坏折) / max / n_folds / positive_rate``。判官不退化成
     单指标闸刀——均值看整体水平、最坏折看是否撞运气，人工权衡。

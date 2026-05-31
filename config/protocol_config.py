@@ -17,9 +17,10 @@ from typing import Optional
 
 
 class Stage(Enum):
-    """评测阶段（规格 §5.2）。"""
-    SEARCH = "search"           # 海选：单切分 + 早杀，便宜搜超参
-    VALIDATION = "validation"   # 认证：expanding 少折 + 多种子，最终确认
+    """评测阶段（规格 §5.2；SWEEP 见 AGENTS §十一·11.6）。"""
+    SEARCH = "search"           # 海选：单切分 + 早杀，便宜搜超参（旧两段法，保留调试用）
+    VALIDATION = "validation"   # 认证：expanding 少折 + 多种子，定参确认（旧两段法，保留调试用）
+    SWEEP = "sweep"             # 一命令两档（主路径）：档1 小网格×近2折×2seed→按最坏折选冠军；档2 冠军×全折×3seed
 
 
 class ProfileKind(Enum):
@@ -52,6 +53,7 @@ class ProtocolConfig:
     train_window: Optional[int] = None
     earlystop_frac: float = 0.15
     max_folds: Optional[int] = None
+    fold_select: str = "first"      # "first"=最早若干折（默认/调试）；"recent"=最近若干折倒贴 rolling_end（§十一·11.2 新协议）
 
     def fold_mode(self) -> str:
         """派生 build_dl_folds 的 mode：两种 profile 都走 expanding 切法（单切分=取 1 折）。"""
@@ -76,4 +78,5 @@ class ProtocolConfig:
             "train_window": self.train_window,
             "earlystop_frac": self.earlystop_frac,
             "max_folds": self.max_folds,
+            "fold_select": self.fold_select,
         }

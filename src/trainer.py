@@ -81,6 +81,12 @@ class FoldResult:
 
     notes: str = ""
 
+    # 训练过程可观测量（DL 卡带填；传统 ML 保持默认 0/空）
+    best_epoch: int = 0
+    n_epochs: int = 0
+    train_curve: str = ""       # JSON 编码的 list[float]，每 epoch 训练 MSE
+    earlystop_curve: str = ""   # JSON 编码的 list[float]，每 epoch earlystop MSE
+
     def to_dict(self) -> dict:
         """
         输出与旧版 fold_metrics.csv 列名兼容的字典。
@@ -130,6 +136,11 @@ class FoldResult:
             # resume 状态
             "status":             self.status,
             "error_msg":          self.error_msg,
+            # 训练过程可观测量
+            "best_epoch":         self.best_epoch,
+            "n_epochs":           self.n_epochs,
+            "train_curve":        self.train_curve,
+            "earlystop_curve":    self.earlystop_curve,
         }
 
 

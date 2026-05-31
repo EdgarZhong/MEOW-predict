@@ -105,10 +105,10 @@ def assemble_run_config(
             f"protocol 数据窗口非法：rolling_start={protocol.rolling_start} > rolling_end={protocol.rolling_end}"
         )
 
-    # (3) stage / profile 搭配
-    if protocol.stage == Stage.VALIDATION and protocol.profile != ProfileKind.EXPANDING:
+    # (3) stage / profile 搭配：认证 / 一命令两档都要多折判官（EXPANDING）
+    if protocol.stage in (Stage.VALIDATION, Stage.SWEEP) and protocol.profile != ProfileKind.EXPANDING:
         raise ValueError(
-            f"认证阶段(VALIDATION)必须用 EXPANDING profile（少折判官），实际 {protocol.profile}"
+            f"{protocol.stage.value} 阶段必须用 EXPANDING profile（多折判官），实际 {protocol.profile}"
         )
 
     # (2) required_adapter 匹配（延迟 import，避免 config <-> models 顶层循环）

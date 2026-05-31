@@ -31,8 +31,8 @@ from dl_models import (  # noqa: E402
     TCNCartridge, GRUCartridge,
     _PRICE_REL_COLS, _LOG_VOLUME_COLS, _RATIO_COLS,
 )
-from dl_search import EarlyKillPolicy, Searcher, sample_hparams  # noqa: E402
-from dl_protocol import build_dl_folds  # noqa: E402
+from dl_search import EarlyKillPolicy, Searcher, sample_hparams, enumerate_grid  # noqa: E402
+from dl_protocol import build_dl_folds, assert_folds_causal  # noqa: E402
 from sequence_dataset import SequenceDataset, Normalizer, build_sequence_arrays  # noqa: E402
 from tradingcalendar import Calendar  # noqa: E402
 
@@ -524,6 +524,111 @@ class TestGRUCartridge(unittest.TestCase):
             seed=7,
         )
         self.assertGreaterEqual(record.best_epoch, 1)
+
+
+# ------------------------------------------------------------------ #
+# 6) enumerate_grid（确定性网格，SWEEP 档1 用）
+# ------------------------------------------------------------------ #
+
+class TestEnumerateGrid(unittest.TestCase):
+    def test_cartesian_product(self):
+        space = {"a": {"type": "choice", "values": [1, 2]},
+                 "b": {"type": "int", "low": 0, "high": 1}}
+        grid = enumerate_grid(space)
+        self.assertEqual(len(grid), 4)              # 2×2
+        self.assertIn({"a": 1, "b": 0}, grid)
+        self.assertIn({"a": 2, "b": 1}, grid)
+
+    def test_overrides_narrow_to_single_point(self):
+        grid = enumerate_grid(
+            STRUCTURE_SEARCH_SPACE,
+            overrides={"seq_len": {"type": "choice", "values": [16]},
+                       "hidden_size": {"type": "choice", "values": [32]},
+                       "num_layers": {"type": "choice", "values": [1]}},
+        )
+        self.assertEqual(grid, [{"seq_len": 16, "hidden_size": 32, "num_layers": 1}])
+
+    def test_empty_space_single_point(self):
+        self.assertEqual(enumerate_grid({}), [{}])
+
+    def test_int_axis_inclusive(self):
+        grid = enumerate_grid({"n": {"type": "int", "low": 1, "high": 3}})
+        self.assertEqual(sorted(g["n"] for g in grid), [1, 2, 3])
+
+
+# ------------------------------------------------------------------ #
+# 7) build_dl_folds fold_select="recent"（倒贴 rolling_end）
+# ------------------------------------------------------------------ #
+
+class TestRecentFolds(unittest.TestCase):
+    def _folds(self, fold_select, max_folds=4):
+        days = list(range(1, 61))   # 60 个交易日
+        return build_dl_folds(1, 60, mode="expanding", val_window=6, step=6, embargo=1,
+                              min_train_days=10, max_folds=max_folds, fold_select=fold_select,
+                              calendar=_IntCalendar(days))
+
+    def test_recent_hugs_end_anchored_nonoverlap(self):
+        folds = self._folds("recent")
+        self.assertEqual(len(folds), 4)
+        self.assertEqual(folds[-1].scoring_dates[-1], 60)          # 最近折紧贴 rolling_end
+        self.assertLess(folds[0].val_start, folds[-1].val_start)   # 升序：fold 0 最早
+        seen = set()
+        for f in folds:
+            self.assertEqual(f.train_start, 1)                     # 锚定扩展：训练从头
+            self.assertFalse(seen & set(f.scoring_dates))          # 打分段互不重合
+            seen |= set(f.scoring_dates)
+        assert_folds_causal(folds)                                 # 四段严格递增、embargo 隔开
+
+    def test_recent_later_than_first(self):
+        first = self._folds("first", max_folds=3)
+        recent = self._folds("recent", max_folds=3)
+        self.assertGreater(recent[-1].val_end, first[-1].val_end)
+
+
+# ------------------------------------------------------------------ #
+# 8) Orchestrator SWEEP 一命令两档端到端（torch-free）
+# ------------------------------------------------------------------ #
+
+class TestSweepOrchestrator(unittest.TestCase):
+    def test_sweep_end_to_end(self):
+        from model_config import ModelKind, ModelConfig
+        from adapter_config import AdapterKind, AdapterConfig
+        from protocol_config import Stage, ProfileKind, ProtocolConfig
+        from search_config import SearchConfig
+        from exec_config import ExecConfig
+        from run_config import assemble_run_config
+        from run_dl import Orchestrator
+
+        dates = Calendar().range(20230601, 20230710)
+        df = make_synth_seq(dates, n_symbols=6, n_interval=15, label="current", seed=8)
+        with tempfile.TemporaryDirectory() as td:
+            rc = assemble_run_config(
+                "20260601_sweep_refpool_test_v1",
+                ModelConfig(ModelKind.REFERENCE_POOL, hparams={}),
+                AdapterConfig(AdapterKind.IDENTITY, columns=("c0", "c1")),
+                ProtocolConfig(Stage.SWEEP, ProfileKind.EXPANDING, dates[0], dates[-1],
+                               val_window=2, step=2, min_train_days=6, max_folds=4,
+                               fold_select="recent"),
+                SearchConfig(n_trials=1, search_overrides={
+                    "seq_len": {"type": "choice", "values": [3, 4]},
+                    "hidden_size": {"type": "choice", "values": [8]},
+                    "num_layers": {"type": "choice", "values": [1]}}),
+                ExecConfig(seeds=(42, 7, 11), out_dir=td),
+            )
+            orch = Orchestrator(rc, raw_loader=make_loader(df),
+                                adapter=IdentityAdapter(["c0", "c1"]),
+                                cartridge_factory=ReferencePoolCartridge)
+            summary = orch.run()
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(summary["stage"], "sweep")
+            self.assertEqual(summary["grid_size"], 2)              # seq_len{3,4}×hidden{8}×layers{1}
+            self.assertEqual(summary["n_screen_folds"], 2)        # 档1 最近 2 折
+            self.assertIn("champion", summary)
+            self.assertIn("seq_len", summary["champion"])
+            self.assertGreater(summary["val_corr"]["mean"], 0.2)  # 同期信号被池化线性抓到
+            run_dir = os.path.join(td, rc.run_id)
+            for fn in ("config.json", "trials.csv", "fold_metrics.csv", "summary.json"):
+                self.assertTrue(os.path.exists(os.path.join(run_dir, fn)), fn)
 
 
 if __name__ == "__main__":

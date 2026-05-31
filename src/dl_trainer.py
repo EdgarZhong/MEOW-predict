@@ -24,6 +24,7 @@ torch-free 且不反向依赖卡带目录。具体卡带/适配器由 Orchestrat
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Callable, Dict, Optional, Sequence
 
@@ -113,6 +114,12 @@ class SequenceTrainer(BaseTrainer):
 
             notes = self.spec.get("notes", "")
             best_epoch = getattr(record, "best_epoch", 0)
+            n_epochs = getattr(record, "n_epochs", 0)
+            # 曲线序列化为 JSON 字符串（保留 6 位小数，节省空间）
+            train_curve_json = json.dumps(
+                [round(v, 6) for v in (record.train_curve or [])]) if hasattr(record, "train_curve") else "[]"
+            es_curve_json = json.dumps(
+                [round(v, 6) for v in (record.earlystop_curve or [])]) if hasattr(record, "earlystop_curve") else "[]"
             return FoldResult(
                 profile_name=profile_name,
                 fold_id=fold.fold_id,
@@ -132,7 +139,11 @@ class SequenceTrainer(BaseTrainer):
                 val_start=fold.val_start, val_end=fold.val_end,
                 n_train_days=len(fold.train_dates), n_val_days=len(fold.scoring_dates),
                 status="ok", error_msg="",
-                notes=f"{notes}|best_epoch={best_epoch}" if notes else f"best_epoch={best_epoch}",
+                notes=notes,
+                best_epoch=best_epoch,
+                n_epochs=n_epochs,
+                train_curve=train_curve_json,
+                earlystop_curve=es_curve_json,
             )
         except Exception as e:  # 单折失败不拖垮整轮，记 error 供 resume（同 TabularTrainer）。
             nan = float("nan")

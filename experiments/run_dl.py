@@ -36,10 +36,15 @@ for _sub in ("src", "config", "models"):
 import numpy as np  # noqa: E402
 
 from dl_protocol import DLFold, assert_folds_causal, build_dl_folds, summarize_folds  # noqa: E402
-from dl_search import EarlyKillPolicy, Searcher  # noqa: E402
+from dl_search import EarlyKillPolicy, Searcher, enumerate_grid  # noqa: E402
 from dl_trainer import SequenceTrainer  # noqa: E402
 from registry import build_adapter, build_cartridge  # noqa: E402
 from protocol_config import ProfileKind, Stage  # noqa: E402
+
+# —— SWEEP 两档预算常量（§十一·11.6；改它们 = 改协议预算，慎重） —— #
+_SWEEP_SCREEN_FOLDS = 2   # 档1 筛选用最近 2 折（最像老师未来集）
+_SWEEP_SCREEN_SEEDS = 2   # 档1 每 combo 2 seed
+_DEFAULT_SEQ_LEN = 32     # seq_len 缺省（search_space / defaults 都没给时兜底）
 
 
 # ================================================================== #
@@ -78,6 +83,7 @@ class Orchestrator:
             mode=p.fold_mode(), val_window=p.val_window, step=p.step, embargo=p.embargo,
             train_window=p.train_window, min_train_days=p.min_train_days,
             earlystop_frac=p.earlystop_frac, max_folds=p.effective_max_folds(),
+            fold_select=p.fold_select,
         )
         assert_folds_causal(folds)   # 防泄漏闸：四段时间严格递增、embargo 隔开训练/打分
         return folds
@@ -109,6 +115,8 @@ class Orchestrator:
 
         if self.cfg.protocol.stage == Stage.SEARCH:
             return self._run_search(folds, out_dir)
+        if self.cfg.protocol.stage == Stage.SWEEP:
+            return self._run_sweep(folds, out_dir)
         return self._run_validation(folds, out_dir)
 
     # ---- 海选 ---- #
@@ -178,6 +186,118 @@ class Orchestrator:
         _dump_json(os.path.join(out_dir, "summary.json"), summary)
         return summary
 
+    # ---- 一命令两档（SWEEP，§十一·11.6） ---- #
+    def _eval_config(self, seq_len: int, cart_hparams: Dict, folds, seeds) -> Dict:
+        """一组超参跑 seeds × folds，收 val_corr + best_epoch（档1/档2 共用的最小评估单元）。"""
+        corrs: List[float] = []
+        best_epochs: List[int] = []
+        for seed in seeds:
+            trainer = SequenceTrainer(
+                self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
+                seq_len=seq_len, normalizer_mode=self._normalizer_mode(),
+                hparams=dict(cart_hparams), seed=int(seed),
+            )
+            for fold in folds:
+                r = trainer.run_on_dl_fold(fold, profile_name="sweep_screen")
+                if r.status == "ok" and np.isfinite(r.val_corr):
+                    corrs.append(float(r.val_corr))
+                    best_epochs.append(int(r.best_epoch))
+                elif r.status == "error":
+                    raise RuntimeError(f"fold {fold.fold_id} 失败: {r.error_msg}")
+        return {"corrs": corrs, "best_epoch_mean": float(np.mean(best_epochs)) if best_epochs else 0.0}
+
+    def _run_sweep(self, folds: Sequence[DLFold], out_dir: str) -> dict:
+        """
+        一命令两档（§十一·11.6），全程同一套 §十一·11.2 忠实协议（锚定扩展 + 倒贴 + embargo）：
+
+        - **档1 筛选**：确定性小网格 × 最近 ``_SWEEP_SCREEN_FOLDS`` 折 × ``_SWEEP_SCREEN_SEEDS``
+          seed → **按最坏折(minimax)选冠军**（§十一·11.7 规则 3，不按峰值）。
+        - **档2 认证**：冠军 × 全折 × 全 seed（建议 3）→ 落逐折逐 seed 明细 + pooled / 最坏折 /
+          R² 双镜头读数（R² 盯老师精度分 1/3，§十一·11.3）。
+        """
+        ec = self.cfg.exec_
+        sc = self.cfg.search
+        # 网格 = 卡带 search_space 叠加 overrides 收窄后**确定性**展开（忠实「网格预先声明跑一次」）。
+        search_space = dict(getattr(self.cartridge_factory(), "search_space", {}) or {})
+        grid = enumerate_grid(search_space, dict(sc.search_overrides))
+        defaults = dict(self.cfg.model.hparams)
+        defaults.setdefault("device", ec.device)
+
+        n_screen = min(_SWEEP_SCREEN_FOLDS, len(folds))
+        screen_folds = list(folds[-n_screen:])     # 最近 N 折（fold_select=recent 下 = 最贴 rolling_end）
+        screen_seeds = ec.seeds[:_SWEEP_SCREEN_SEEDS] if len(ec.seeds) >= _SWEEP_SCREEN_SEEDS else ec.seeds
+
+        # —— 档1：网格逐点跑最近折，按最坏折排名 —— #
+        trial_rows: List[dict] = []
+        ranked: List[tuple] = []     # (min, mean, tid, seq_len, hparams)
+        for tid, combo in enumerate(grid):
+            eff = {**defaults, **combo}
+            seq_len = int(eff.pop("seq_len", _DEFAULT_SEQ_LEN))
+            cart_hp = eff
+            status, err, res = "ok", "", {"corrs": [], "best_epoch_mean": 0.0}
+            try:
+                res = self._eval_config(seq_len, cart_hp, screen_folds, screen_seeds)
+            except Exception as e:                       # noqa: BLE001
+                status, err = "error", str(e)[:300]
+            summ = summarize_folds([{"corr": c} for c in res["corrs"]])
+            row = {"trial_id": tid, "seq_len": seq_len,
+                   "screen_corr_mean": summ["mean"], "screen_corr_min": summ["min"],
+                   "screen_corr_std": summ["std"], "n_evals": len(res["corrs"]),
+                   "best_epoch_mean": res["best_epoch_mean"], "status": status, "error_msg": err}
+            for k, v in cart_hp.items():
+                if k != "device":
+                    row[f"hp_{k}"] = v
+            trial_rows.append(row)
+            if status == "ok" and len(res["corrs"]) > 0:
+                ranked.append((summ["min"], summ["mean"], tid, seq_len, dict(cart_hp)))
+        _dump_csv(os.path.join(out_dir, "trials.csv"), trial_rows)
+
+        if not ranked:
+            summary = {"run_id": self.cfg.run_id, "stage": "sweep", "status": "no_champion",
+                       "grid_size": len(grid), "note": "档1 全部 trial 无有效评估"}
+            _dump_json(os.path.join(out_dir, "summary.json"), summary)
+            return summary
+
+        # 按最坏折 min 排名（§十一·11.7 规则 3），mean 兜底 tiebreak。
+        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        champ_min, champ_mean, champ_tid, champ_seq_len, champ_hp = ranked[0]
+
+        # —— 档2：冠军 × 全折 × 全 seed，落逐折逐 seed 明细 —— #
+        cert_seeds = ec.seeds
+        fold_rows: List[dict] = []
+        corrs: List[float] = []
+        for seed in cert_seeds:
+            trainer = SequenceTrainer(
+                self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
+                seq_len=champ_seq_len, normalizer_mode=self._normalizer_mode(),
+                hparams=dict(champ_hp), seed=int(seed),
+            )
+            for fold in folds:
+                r = trainer.run_on_dl_fold(fold, profile_name="sweep_cert")
+                d = r.to_dict()
+                d["random_seed"] = int(seed)
+                fold_rows.append(d)
+                if r.status == "ok" and np.isfinite(r.val_corr):
+                    corrs.append(float(r.val_corr))
+        _dump_csv(os.path.join(out_dir, "fold_metrics.csv"), fold_rows)
+
+        summ_cert = summarize_folds([{"corr": c} for c in corrs])
+        r2s = [d["val_r2"] for d in fold_rows
+               if d.get("status") == "ok" and np.isfinite(d.get("val_r2", float("nan")))]
+        summary = {
+            "run_id": self.cfg.run_id, "stage": "sweep", "status": "ok",
+            "grid_size": len(grid), "n_screen_folds": n_screen,
+            "screen_seeds": [int(s) for s in screen_seeds],
+            "champion": {"trial_id": champ_tid, "seq_len": champ_seq_len, "hparams": champ_hp,
+                         "screen_corr_min": champ_min, "screen_corr_mean": champ_mean},
+            "n_folds": len(folds), "cert_seeds": [int(s) for s in cert_seeds],
+            "val_corr": summ_cert,    # mean / std / min(最坏折) / max / positive_rate
+            "val_r2_mean": float(np.mean(r2s)) if r2s else 0.0,
+            "val_r2_min": float(np.min(r2s)) if r2s else 0.0,
+        }
+        _dump_json(os.path.join(out_dir, "summary.json"), summary)
+        return summary
+
     def _normalizer_mode(self) -> str:
         # RAW_CHANNELS 已在 adapter 做语义归一，但脊柱仍跑 zscore 统计白化（职责分明，规格 §2.3）；
         # 模式可由 model.hparams["normalizer_mode"] 覆盖（如 identity）。
@@ -233,12 +353,27 @@ def _build_run_config(args):
                else AdapterConfig(adapter_kind))
     protocol = ProtocolConfig(
         stage, profile, args.start, args.end,
-        val_window=args.val_window, step=args.step, min_train_days=args.min_train_days,
-        max_folds=max_folds,
+        val_window=args.val_window, step=args.step, embargo=args.embargo,
+        min_train_days=args.min_train_days,
+        max_folds=max_folds, fold_select=args.fold_select,
     )
-    search = SearchConfig(n_trials=args.trials)
-    exec_ = ExecConfig(seeds=tuple(int(s) for s in args.seeds.split(",")), out_dir=args.out_dir)
+    search = SearchConfig(n_trials=args.trials, search_overrides=_parse_grid_overrides(args))
+    exec_ = ExecConfig(
+        seeds=tuple(int(s) for s in args.seeds.split(",")),
+        device=args.device, out_dir=args.out_dir,
+    )
     return assemble_run_config(args.run_id, model, adapter, protocol, search, exec_)
+
+
+def _parse_grid_overrides(args) -> dict:
+    """从 --grid-* 收窄各结构旋钮的 SWEEP 网格（空 = 用卡带 search_space 全集展开）。"""
+    overrides: dict = {}
+    for knob, raw in (("seq_len", args.grid_seq_len),
+                      ("hidden_size", args.grid_hidden),
+                      ("num_layers", args.grid_layers)):
+        if raw:
+            overrides[knob] = {"type": "choice", "values": [int(x) for x in raw.split(",")]}
+    return overrides
 
 
 def _parse_hparams(s: str) -> dict:
@@ -275,21 +410,31 @@ def _wrap_max_symbols(h5dir: str, max_symbols: int):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="DL Orchestrator（torch-free smoke）")
     ap.add_argument("--run-id", default="20260531_search_refpool_smoke_v1")
-    ap.add_argument("--stage", default="search", choices=["search", "validation"])
+    ap.add_argument("--stage", default="search", choices=["search", "validation", "sweep"],
+                    help="sweep=一命令两档（主路径，§十一·11.6）；search/validation 为旧两段调试用")
     ap.add_argument("--model", default="reference_pool",
-                    help="reference_zero / reference_last / reference_pool（tcn/lstm 等 4060 接卡后）")
+                    help="reference_pool（torch-free smoke）/ gru（433 特征，需 torch+GPU）/ reference_zero|last")
     ap.add_argument("--adapter", default="raw_channels",
-                    help="raw_channels / feature_433 / identity")
+                    help="raw_channels / feature_433（gru 必须）/ identity")
     ap.add_argument("--columns", default="", help="identity adapter 的列（逗号分隔）")
     ap.add_argument("--start", type=int, default=20230601)
     ap.add_argument("--end", type=int, default=20230731)
     ap.add_argument("--val-window", type=int, default=5)
     ap.add_argument("--step", type=int, default=5)
     ap.add_argument("--min-train-days", type=int, default=20)
-    ap.add_argument("--max-folds", type=int, default=3, help="仅 validation 用")
+    ap.add_argument("--embargo", type=int, default=1,
+                    help="训练区与打分区之间禁飞天数（日内标签下 1 日已等价 purge）")
+    ap.add_argument("--fold-select", default="first", choices=["first", "recent"],
+                    help="recent=最近若干折倒贴 rolling_end（新协议主路径）；first=最早若干折（调试）")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                    help="gru 卡带训练设备；整晚 GPU 跑传 cuda")
+    ap.add_argument("--max-folds", type=int, default=3, help="validation / sweep 折数（新协议 5）")
     ap.add_argument("--trials", type=int, default=4, help="仅 search 用")
     ap.add_argument("--seeds", default="42")
-    ap.add_argument("--hparams", default="", help="k=v,k2=v2（如 seq_len=32,hidden_size=64）")
+    ap.add_argument("--hparams", default="", help="k=v,k2=v2（如 dropout=0.2,weight_decay=0.001,max_epochs=30）")
+    ap.add_argument("--grid-seq-len", default="", help="SWEEP 收窄 seq_len 网格，逗号分隔（如 16,32）")
+    ap.add_argument("--grid-hidden", default="", help="SWEEP 收窄 hidden_size 网格（如 32,64）")
+    ap.add_argument("--grid-layers", default="", help="SWEEP 收窄 num_layers 网格（如 1,2）")
     ap.add_argument("--out-dir", default="results/dl")
     ap.add_argument("--h5dir", default="data")
     ap.add_argument("--max-symbols", type=int, default=20,
