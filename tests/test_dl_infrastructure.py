@@ -27,11 +27,12 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from dl_models import (  # noqa: E402
-    RawChannelAdapter, ReferencePoolCartridge, IdentityAdapter, STRUCTURE_SEARCH_SPACE,
+    RawChannelAdapter, ReferencePoolCartridge, IdentityAdapter, STRUCTURE_SEARCH_SPACE, TCNCartridge,
     _PRICE_REL_COLS, _LOG_VOLUME_COLS, _RATIO_COLS,
 )
 from dl_search import EarlyKillPolicy, Searcher, sample_hparams  # noqa: E402
 from dl_protocol import build_dl_folds  # noqa: E402
+from sequence_dataset import SequenceDataset, Normalizer, build_sequence_arrays  # noqa: E402
 from tradingcalendar import Calendar  # noqa: E402
 
 
@@ -264,6 +265,104 @@ class TestSearcher(unittest.TestCase):
         self.assertTrue(bc["found"])
         self.assertIn("seq_len", bc)
         self.assertIn("hparams", bc)
+
+
+# ------------------------------------------------------------------ #
+# 4.5) TCN 卡带（需要 torch，但只测最小接线）
+# ------------------------------------------------------------------ #
+
+try:
+    import torch  # noqa: E402
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+
+class TestTCNCartridge(unittest.TestCase):
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 TCN 接线测试")
+    def test_required_adapter_is_raw_channels(self):
+        from adapter_config import AdapterKind
+        self.assertEqual(TCNCartridge.required_adapter, AdapterKind.RAW_CHANNELS)
+
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 TCN 接线测试")
+    def test_fit_and_predict_on_cpu(self):
+        # 用多日原始微结构假数据走真实 RawChannelAdapter → SequenceDataset 链路，
+        # 只验证“接线可训、可预测、输出有限值”，不在单测里追求分数。
+        day1 = make_raw_micro_oneday(symbol_ids=(0, 1, 2), n_interval=12, seed=11).copy()
+        day1["date"] = 20230601
+        day1["fret12"] = (
+            day1.groupby("symbol")["midpx"]
+            .pct_change()
+            .fillna(0.0)
+            .astype(float)
+        )
+        day2 = make_raw_micro_oneday(symbol_ids=(0, 1, 2), n_interval=12, seed=12).copy()
+        day2["date"] = 20230602
+        day2["fret12"] = (
+            day2.groupby("symbol")["midpx"]
+            .pct_change()
+            .fillna(0.0)
+            .astype(float)
+        )
+        raw = pd.concat([day1, day2], ignore_index=True)
+
+        arrays = build_sequence_arrays(raw, RawChannelAdapter())
+        normalizer = Normalizer("zscore").fit(arrays.features)
+        ds = SequenceDataset(arrays, seq_len=4, normalizer=normalizer)
+
+        cart = TCNCartridge()
+        record = cart.fit(
+            ds,
+            ds,
+            hparams={
+                "device": "cpu",
+                "hidden_size": 16,
+                "num_layers": 2,
+                "dropout": 0.0,
+                "batch_size": 16,
+                "max_epochs": 2,
+                "patience": 2,
+            },
+            seed=42,
+        )
+        pred = cart.predict(ds)
+
+        self.assertGreaterEqual(record.best_epoch, 1)
+        self.assertEqual(record.extra["kind"], "tcn")
+        self.assertEqual(pred.shape[0], len(ds))
+        self.assertTrue(np.isfinite(pred).all())
+
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 TCN 接线测试")
+    def test_fit_does_not_materialize_all_windows(self):
+        # 回归测试：fit 不能再调 gather_all() 把整份 X[B,L,C] 一次性搬进内存。
+        day = make_raw_micro_oneday(symbol_ids=(0, 1), n_interval=10, seed=21).copy()
+        day["date"] = 20230601
+        day["fret12"] = day.groupby("symbol")["midpx"].pct_change().fillna(0.0).astype(float)
+        arrays = build_sequence_arrays(day, RawChannelAdapter())
+        normalizer = Normalizer("zscore").fit(arrays.features)
+        ds = SequenceDataset(arrays, seq_len=4, normalizer=normalizer)
+
+        def _boom():
+            raise AssertionError("fit 不应调用 gather_all() 物化整窗")
+
+        ds.gather_all = _boom  # type: ignore[method-assign]
+
+        cart = TCNCartridge()
+        record = cart.fit(
+            ds,
+            ds,
+            hparams={
+                "device": "cpu",
+                "hidden_size": 8,
+                "num_layers": 1,
+                "dropout": 0.0,
+                "batch_size": 8,
+                "max_epochs": 1,
+                "patience": 1,
+            },
+            seed=7,
+        )
+        self.assertGreaterEqual(record.best_epoch, 1)
 
 
 # ------------------------------------------------------------------ #

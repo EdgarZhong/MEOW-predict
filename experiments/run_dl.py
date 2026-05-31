@@ -116,11 +116,14 @@ class Orchestrator:
         # search_space 是卡带私有声明：建一个临时卡带读它。
         search_space = dict(getattr(self.cartridge_factory(), "search_space", {}) or {})
         sc = self.cfg.search
+        # device 属执行层而非模型层：由 Orchestrator 在派发时注入，避免卡带自己猜。
+        defaults = dict(self.cfg.model.hparams)
+        defaults.setdefault("device", self.cfg.exec_.device)
         searcher = Searcher(
             spec=self._spec(), adapter=self.adapter, cartridge_factory=self.cartridge_factory,
             raw_loader=self.raw_loader, folds=folds, search_space=search_space,
             n_trials=sc.n_trials, seeds=self.cfg.exec_.seeds,
-            defaults=dict(self.cfg.model.hparams), normalizer_mode=self._normalizer_mode(),
+            defaults=defaults, normalizer_mode=self._normalizer_mode(),
             search_overrides=dict(sc.search_overrides), profile_name="search",
             early_kill=EarlyKillPolicy(enabled=sc.early_kill, warmup_epochs=sc.early_kill_warmup_epochs),
         )
@@ -144,6 +147,7 @@ class Orchestrator:
     # ---- 认证 ---- #
     def _run_validation(self, folds: Sequence[DLFold], out_dir: str) -> dict:
         defaults = dict(self.cfg.model.hparams)
+        defaults.setdefault("device", self.cfg.exec_.device)
         seq_len = int(defaults.pop("seq_len", 32))
         cart_hparams = defaults
 

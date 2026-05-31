@@ -231,6 +231,124 @@ STRUCTURE_SEARCH_SPACE: Dict = {
     "num_layers":  {"type": "int", "low": 1, "high": 4},
 }
 
+
+def _require_torch():
+    """
+    按需导入 torch。
+
+    约束：``dl_models.py`` 作为卡带注册中心会被脊柱频繁 import；若在模块顶层直接
+    import torch，会把“torch-free 脊柱”这条纪律打破，也会让没装 torch 的环境在
+    仅使用参考模型时直接炸掉。因此这里统一走懒加载：真正进入 TCN/LSTM 卡带时才导。
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前环境未安装 PyTorch，无法使用 TCN/LSTM 卡带。"
+            "如只想跑 torch-free 脊柱，请继续使用 reference_* 模型。"
+        ) from exc
+    return torch, nn, F
+
+
+def _resolve_torch_device(torch, requested: str) -> str:
+    """
+    解析本次训练实际使用的 device。
+
+    口径：
+    - 显式要求 ``cuda`` 但本机不可用 → 立即报错，避免用户误以为已经上卡。
+    - ``auto`` / 空值 → 有卡用 cuda，否则退 cpu。
+    - 其余显式值直接透传给 torch（如 ``cpu`` / ``cuda:0``）。
+    """
+    req = str(requested or "auto").strip().lower()
+    if req in ("", "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if req.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("请求使用 CUDA，但当前 torch.cuda.is_available() 为 False。")
+    return requested
+
+
+class _CausalConvBlock:
+    """
+    极薄的因果卷积包装。
+
+    这里不用 ``padding='same'``，因为 same padding 会在左右两侧同时补零；那样时间 t
+    的输出会看到未来位置信息，直接破坏“因果卷积”这一条根纪律。正确做法是只在左侧补。
+    """
+
+    def __init__(self, conv, pad: int, torch):
+        self.conv = conv
+        self.pad = int(pad)
+        self._torch = torch
+
+    def __call__(self, x):
+        if self.pad > 0:
+            x = self._torch.nn.functional.pad(x, (self.pad, 0))
+        return self.conv(x)
+
+
+def _build_tcn_module(input_channels: int, hidden_size: int, num_layers: int, dropout: float):
+    """
+    构造一个轻量 TCN 回归头。
+
+    结构选择刻意保守：
+    - 残差块 + 膨胀卷积，覆盖 226 步日内序列足够；
+    - 全局平均池化后接线性头，输出单个 ``fret12`` 标量；
+    - 不在这里搞花哨结构，先把“接线 + 因果 + 可训 + 可搜”打通。
+    """
+    torch, nn, _ = _require_torch()
+
+    class ResidualBlock(nn.Module):
+        def __init__(self, in_ch: int, out_ch: int, dilation: int):
+            super().__init__()
+            kernel_size = 3
+            pad = dilation * (kernel_size - 1)
+            self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation)
+            self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=kernel_size, dilation=dilation)
+            self.conv1_wrap = _CausalConvBlock(self.conv1, pad, torch)
+            self.conv2_wrap = _CausalConvBlock(self.conv2, pad, torch)
+            self.norm1 = nn.BatchNorm1d(out_ch)
+            self.norm2 = nn.BatchNorm1d(out_ch)
+            self.act = nn.GELU()
+            self.dropout = nn.Dropout(float(dropout))
+            self.skip = nn.Identity() if in_ch == out_ch else nn.Conv1d(in_ch, out_ch, kernel_size=1)
+
+        def forward(self, x):
+            residual = self.skip(x)
+            out = self.conv1_wrap(x)
+            out = self.norm1(out)
+            out = self.act(out)
+            out = self.dropout(out)
+            out = self.conv2_wrap(out)
+            out = self.norm2(out)
+            out = self.act(out)
+            out = self.dropout(out)
+            return out + residual
+
+    class TCNRegressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            layers = []
+            in_ch = int(input_channels)
+            for i in range(int(num_layers)):
+                dilation = 2 ** i
+                layers.append(ResidualBlock(in_ch, int(hidden_size), dilation))
+                in_ch = int(hidden_size)
+            self.backbone = nn.ModuleList(layers)
+            self.head = nn.Linear(int(hidden_size), 1)
+
+        def forward(self, x):
+            # 输入约定：[B, L, C]，Conv1d 期望 [B, C, L]
+            out = x.transpose(1, 2)
+            for block in self.backbone:
+                out = block(out)
+            # 只用时间维平均池化，保持回归头极薄，避免再引入额外泄漏面。
+            pooled = out.mean(dim=-1)
+            return self.head(pooled).squeeze(-1)
+
+    return TCNRegressor()
+
 @dataclass
 class TrainRecord:
     """
@@ -393,3 +511,201 @@ class ReferencePoolCartridge(ModelCartridge):
         if Xp.shape[0] == 0:
             return np.zeros(0, dtype=np.float32)
         return (Xp @ self._w + self._b).astype(np.float32)
+
+
+@register_model(ModelKind.TCN)
+class TCNCartridge(ModelCartridge):
+    """
+    主攻卡带：TCN-on-原始微结构。
+
+    设计边界严格贴规格：
+    - **唯一 torch 层**：nn.Module / optimizer / autograd / device 全封在这里；
+    - **required_adapter 固定 RAW_CHANNELS**：让组装期就拦住“TCN 却喂错输入”的配置错误；
+    - **search_space 复用 STRUCTURE_SEARCH_SPACE**：序列长由 trainer 开窗，hidden/layers 在
+      这里真正消费。
+
+    训练策略先取最小可用闭环，不在第一版里把复杂度堆上去：
+    - loss = MSE（与最终回归目标同量纲）；
+    - early stopping 看训练区尾段的 ``earlystop_ds``，绝不碰 scoring；
+    - 如果 earlystop 为空，就退化成看训练损失，至少保持接口闭环不炸。
+    """
+
+    search_space: ClassVar[Dict] = STRUCTURE_SEARCH_SPACE
+    required_adapter = AdapterKind.RAW_CHANNELS
+
+    def __init__(self):
+        self._torch = None
+        self._model = None
+        self._device = "cpu"
+        self._fallback_bias = 0.0
+        self._fitted = False
+
+    @classmethod
+    def from_config(cls, model_config) -> "TCNCartridge":
+        return cls()
+
+    @staticmethod
+    def _default_hparams(hparams: Dict) -> Dict:
+        """
+        合并本卡带的默认训练超参与搜索得到的结构超参。
+
+        结构三旋钮（seq_len / hidden_size / num_layers）里，本卡带只真正消费后两者；
+        ``seq_len`` 仍由 Searcher/Trainer 决定开窗，不在此重复处理。
+        """
+        merged = {
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.10,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "batch_size": 256,
+            "max_epochs": 20,
+            "patience": 4,
+            "grad_clip": 1.0,
+            "device": "auto",
+        }
+        merged.update(dict(hparams or {}))
+        return merged
+
+    def _eval_loss(self, ds, loss_fn) -> float:
+        """按自然顺序评估一个数据集的平均损失。"""
+        torch = self._torch
+        if len(ds) == 0:
+            return float("inf")
+        total = 0.0
+        count = 0
+        self._model.eval()
+        with torch.no_grad():
+            for xb, yb in ds.iter_batches(batch_size=512, shuffle=False):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
+                pred = self._model(x)
+                loss = loss_fn(pred, y)
+                total += float(loss.item()) * len(yb)
+                count += len(yb)
+        return total / max(count, 1)
+
+    def fit(self, train_ds, earlystop_ds, hparams: Dict, seed: int) -> TrainRecord:
+        torch, nn, _ = _require_torch()
+        cfg = self._default_hparams(hparams)
+        self._torch = torch
+        self._device = _resolve_torch_device(torch, cfg.get("device", "auto"))
+
+        t0 = time.time()
+        if len(train_ds) == 0:
+            self._model = None
+            self._fitted = True
+            self._fallback_bias = 0.0
+            return TrainRecord(
+                train_curve=[0.0],
+                earlystop_curve=[0.0] if len(earlystop_ds) else [],
+                best_epoch=0,
+                n_epochs=1,
+                fit_seconds=time.time() - t0,
+                extra={"kind": "tcn", "empty": True, "device": self._device},
+            )
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+        self._model = _build_tcn_module(
+            input_channels=train_ds.n_channels,
+            hidden_size=int(cfg["hidden_size"]),
+            num_layers=int(cfg["num_layers"]),
+            dropout=float(cfg["dropout"]),
+        ).to(self._device)
+
+        optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=float(cfg["lr"]),
+            weight_decay=float(cfg["weight_decay"]),
+        )
+        loss_fn = nn.MSELoss()
+        batch_size = int(cfg["batch_size"])
+        max_epochs = int(cfg["max_epochs"])
+        patience = int(cfg["patience"])
+        grad_clip = float(cfg["grad_clip"])
+
+        best_metric = float("inf")
+        best_epoch = 0
+        best_state = None
+        no_improve = 0
+        train_curve: List[float] = []
+        early_curve: List[float] = []
+
+        # 兜底偏置：只需要“训练标签的均值”，不需要把整份 ``X[B,L,C]`` 一次性物化进内存。
+        # 这里改走 label_frame 只取 ``fret12`` 一列，避免海选单折在 40 天训练窗上额外造一个
+        # 数 GB 级的窗口张量副本；训练主路径仍保持 iter_batches 流式。
+        train_labels = train_ds.label_frame()["fret12"].to_numpy(dtype=np.float32)
+        self._fallback_bias = float(np.mean(train_labels)) if len(train_labels) else 0.0
+
+        for epoch in range(1, max_epochs + 1):
+            self._model.train()
+            total = 0.0
+            count = 0
+            for xb, yb in train_ds.iter_batches(batch_size=batch_size, shuffle=True, seed=int(seed) + epoch):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
+                optimizer.zero_grad(set_to_none=True)
+                pred = self._model(x)
+                loss = loss_fn(pred, y)
+                loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=grad_clip)
+                optimizer.step()
+                total += float(loss.item()) * len(yb)
+                count += len(yb)
+
+            train_loss = total / max(count, 1)
+            train_curve.append(train_loss)
+
+            if len(earlystop_ds) > 0:
+                metric = self._eval_loss(earlystop_ds, loss_fn)
+                early_curve.append(metric)
+            else:
+                metric = train_loss
+
+            if metric + 1e-8 < best_metric:
+                best_metric = metric
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+
+        self._fitted = True
+        return TrainRecord(
+            train_curve=train_curve,
+            earlystop_curve=early_curve,
+            best_epoch=best_epoch,
+            n_epochs=len(train_curve),
+            fit_seconds=time.time() - t0,
+            extra={
+                "kind": "tcn",
+                "device": self._device,
+                "hidden_size": int(cfg["hidden_size"]),
+                "num_layers": int(cfg["num_layers"]),
+            },
+        )
+
+    def predict(self, ds) -> np.ndarray:
+        if len(ds) == 0:
+            return np.zeros(0, dtype=np.float32)
+        if not self._fitted or self._model is None:
+            return np.full(len(ds), self._fallback_bias, dtype=np.float32)
+
+        torch = self._torch
+        preds: List[np.ndarray] = []
+        self._model.eval()
+        with torch.no_grad():
+            for xb, _ in ds.iter_batches(batch_size=512, shuffle=False):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                pred = self._model(x).detach().cpu().numpy().astype(np.float32)
+                preds.append(pred)
+        return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)
