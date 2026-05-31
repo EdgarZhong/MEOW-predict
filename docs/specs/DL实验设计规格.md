@@ -1,0 +1,318 @@
+# DL 实验设计规格
+
+创建日期：2026-05-31
+状态：设计定稿（D0 地基待实现）
+适用范围：MEOW 金融时序预测 —— 深度学习（DL）主线（Windows 4060 / PyTorch）
+
+> 本文是 DL 主线的**设计真相源**。规则正文（红线纪律、两速评测、宽进严出等通用口径）仍以 `AGENTS.md` 为准；本文只补 DL 特有的架构、协议、配置与地基约定。动态进度看 `CLAUDE.md`。
+
+---
+
+## 0. 一句话定位
+
+把**评测协议 / 窗口切分 / 归一化 / 指标 / 配置管理**做成**不可变脊柱**，把**输入适配**与**模型本体**做成**可换卡带**；PyTorch 只在卡带内部存在，脊柱全程 torch-free。目标是**直接冲 0.12**（不做"序列是否有信号"的存在性验证——该结论已是先验），同时保留"不骗自己"的评测纪律。
+
+---
+
+## 1. 战略定位与目标
+
+- **目标分**：直接冲 **0.12**（老师明示有人做到过 0.12、业界 0.2–0.3）。不浪费预算去"验证序列有没有料"。
+- **保留的纪律**：评测要能拦住自欺——过拟合探测、时间外推稳定性、防泄漏、config-lock、红线 holdout（见 §5、§10）。
+- **算力**：Windows 4060 / PyTorch；与传统侧（Mac）互不抢算力。全程预算估算 ~25 GPU-hours（海选 ~15 + 认证 ~12），单卡一周可容纳。
+- **与传统侧的关系**：评测体系、数据认知、9-stage 特征工程、提交通道**全可复用**；DL 只是把"模型"这一格换成序列模型 + 把"输入"这一格换成可换的 adapter。
+
+---
+
+## 2. 总架构：固定脊柱 + 可换卡带
+
+### 2.1 控制层级（谁调谁、谁负责什么）
+
+```
+Orchestrator (experiments/run_dl.py)          ← 发起一次实验；组装+冻结 RunConfig；管两阶段交接
+  │  对一份 RunConfig 启动一次 run
+  ▼
+HPO Searcher                                   ← 谁负责超参搜索
+  │  采样 config / 早杀坏 trial / 海选→认证两段 / 种子重复
+  ▼  (对每个候选 config 调一次)
+Protocol Engine (src/dl_protocol.py)           ← 谁负责评测协议(窗口切分) + 把模型输出换成统一指标
+  │  走查折日期 / 三段切分 / embargo / 跑 k 个种子 / 算 4 指标 / gap·曲线·稳定性判断
+  ▼  (对每折调一次)
+SequenceTrainer (src/dl_trainer.py)  [纯编排, torch-free]
+  ├─ Data Pipeline
+  │   ├─ Input Adapter   [可换]  ← 谁负责适配不同模型的 load + 预处理（含价格相对归一）
+  │   ├─ Window Indexer  [不变]  ← 惰性出 [B, L, C]，不跨日 + 因果对齐 + warmup
+  │   └─ Normalizer      [不变]  ← fit-on-train 的统计白化（可配置成 identity）
+  └─ Model Cartridge (models/dl_models.py)  [可换 + 唯一 torch]  ← 谁对接 PyTorch
+        fit() / predict() 内含 epoch 循环 / optimizer / GPU 放置 / nn.Module / 早停
+```
+
+**两个边界一句话记牢**：
+- **横切：脊柱不变 / 卡带可换。** 中间一整列（HPO、协议、窗口、归一化、指标、leaderboard、配置）是脊柱，永不为换模型而改。
+- **纵切：PyTorch 封死在卡带。** 所有 torch import / nn.Module / optimizer / device / checkpoint 只出现在 Model Cartridge 内；脊柱从不碰一个 tensor。
+
+### 2.2 数据流
+
+```
+老师/本地 raw .h5（逐日）
+   │  InputAdapter.build(raw_day_df)         [可换：定义通道含义]
+   ▼
+每日 [n_interval, C] 干净数值数组（通道布局固定、含义已知）
+   │  Window Indexer                         [不变：纯时间索引]
+   ▼
+窗口批 [B, L, C]（不跨日、标签因果对齐在窗口末端、warmup 丢弃不足窗）
+   │  Normalizer（fit-on-train 统计量 → 套全部）[不变：纯张量数学，可关]
+   ▼
+归一化后的 [B, L, C]  ──────────────►  Model Cartridge.fit/predict()   [可换 + 唯一 torch]
+                                              │  predict → np[fret12 量纲, 与样本顺序对齐]
+                                              ▼
+                                        Protocol Engine 指标模块
+                                              │  corr / MSE / R² / daily-IC
+                                              ▼
+                                        FoldResult（列与 leaderboard 兼容）
+```
+
+### 2.3 换模型时：什么不变、什么变
+
+以 `LSTM-on-features`（433 手工特征当通道）→ `DeepLOB-on-rawLOB`（原始订单簿当通道）为例：
+
+| | 是否改动 | 说明 |
+|---|---|---|
+| **InputAdapter** | ✅ 变 | 通道定义 + 语义预处理（特征列 → 原始 LOB 各档价/量；价格相对归一在此做） |
+| **ModelCartridge** | ✅ 变 | nn.Module 结构 + 训练循环 |
+| Window Indexer | ❌ 不变 | "不跨日、因果对齐、按 step 滑" 与通道含义无关 |
+| Normalizer | ❌ 不变（机制） | 仍是 fit-on-train 白化；DeepLOB 若用价格相对归一，则把 Normalizer 配成 identity |
+| 协议（walk-forward / 三段 / embargo） | ❌ 不变 | |
+| 4 指标 / leaderboard | ❌ 不变 | |
+| HPO 搜索环 / 种子集成 | ❌ 不变 | |
+| gap·曲线判过拟合 / walk-forward 稳定性 / config-lock | ❌ 不变 | |
+
+---
+
+## 3. 两个接口契约
+
+### 3.1 InputAdapter（输入适配卡带）
+
+唯一需要"理解原始数据语义"的地方。一旦它吐出通道布局固定的干净数组，下游全是不关心含义的张量数学。
+
+```
+class InputAdapter:
+    channels: list[str]                     # 通道名（顺序即 C 维布局，固定）
+    def build(self, raw_day_df) -> np.ndarray   # 返回单日 [n_interval, C]，float32
+```
+
+- **不跨日**：每次只吃"一天"的 raw，禁止把多日 raw 一次性喂进来（避免跨日串值，与 `SubmissionFeaturePipeline` 逐日现算口径一致）。
+- **语义归一化归这里**：如原始 LOB 按当下 mid-price 做相对归一，属"语义预处理"，放 adapter；统计白化才交给脊柱 Normalizer。
+- **首个实现 = FeatureAdapter**：包装现有 433 特征管线（`SubmissionFeaturePipeline` / `feature_registry`），把特征列当通道，零新特征公式。
+
+### 3.2 ModelCartridge（模型卡带，唯一 torch）
+
+```
+class ModelCartridge:
+    search_space: dict                      # 本模型私有的超参声明（不进 config/ 全局枚举）
+    required_adapter: AdapterKind           # 类型化引用集中枚举，不写裸字符串
+    def fit(self, train_ds, earlystop_ds, hparams, seed) -> TrainRecord
+    def predict(self, ds) -> np.ndarray     # np[fret12 量纲, 与 ds 样本顺序对齐]
+```
+
+- `fit()` **内部跑完整个 epoch 循环 / optimizer / GPU / 早停**；早停看 `earlystop_ds`（训练区尾段切出，与打分集隔离），可用代理指标（如 val MSE）。
+- `fit()` 返回 **TrainRecord**：逐 epoch 的 train / earlystop 曲线、best epoch、用时等——供脊柱判过拟合 + HPO 早杀（**单向上报，不让脊柱控制内层循环**）。
+- `predict()` 输出**留在 `fret12` 量纲**（与传统侧 raw_mean 口径一致，保 MSE/R²），脊柱据此算 4 指标。
+
+---
+
+## 4. PyTorch 边界与训练生命周期归属
+
+**内层训练循环归 PyTorch（卡带内），外层协议归框架（脊柱）。**
+
+| 关注点 | 归属 | 说明 |
+|---|---|---|
+| epoch 循环 / autograd / optimizer / device / checkpoint | **卡带（PyTorch）** | 脊柱不可见、不介入 |
+| 早停（看 earlystop_ds 上的代理指标决定何时收手） | **卡带自包含** | 用训练区尾段，**不碰打分集**，避免对打分集过拟合 |
+| 官方 4 指标（corr/MSE/R²/daily-IC） | **脊柱**，在 `predict()` 之后算一次 | 打分集在 predict 前一次不碰 |
+| 训练过程的可见性（曲线/早杀） | **卡带 → 脊柱单向上报**（TrainRecord / 轻量进度回调） | 用于判过拟合 + HPO 早杀整个 trial；**不是** "这个 epoch 该不该发生" 的逐步控制 |
+
+**结论**：训练**之中**无数据回流脊柱做控制；脊柱只在 `predict()` 边界拿到 numpy 预测、训练**之后**算指标。早杀是 HPO 级（杀整个 trial）的可选加速，D0 先留 TrainRecord 钩子、实现推后。
+
+---
+
+## 5. 评测协议
+
+### 5.1 walk-forward 复用，不另起炉灶
+
+复用传统侧 `expanding` 走查思想。DL 有两类盲区、配两类工具：
+- **单窗口内**自带过拟合探测器：一次 fit 里 train vs earlystop-val 两条曲线就能看出过拟合。
+- **walk-forward 多折**探测时间不稳定性（撞运气）。
+
+→ 最优分配 = **单窗口看曲线 + 少量 walk-forward 折看稳定性**，不堆很多折（DL 训练贵、数据有限）。
+
+### 5.2 两阶段预算
+
+| 阶段 | profile | 目的 | 种子 |
+|---|---|---|---|
+| **海选 search** | 单时间切分 + 早杀 | 快速分诊大量 config，砍掉没希望的 | 1–2 |
+| **认证 validation（= expanding）** | 少量 expanding walk-forward 折 | 对 1–2 个幸存者做最终确认 | 3 |
+
+交接 = 海选输出 `best_config.json`，认证（expanding）**消费 + 冻结**（config-lock）。Orchestrator 管这个生命周期（见 §7）。
+
+> **就这两段，没有传统那套"三层 Holdout"**：传统 Dev/Review/Final 里第三层（12 月 Final）历史上从未执行，新协议已用 海选 + expanding 取代分层。防自欺内核见 §10。
+
+### 5.3 三段折结构 + embargo
+
+每折：
+
+```
+[ train_core | earlystop-val(训练区尾段) | embargo(1 日) | scoring-val ]
+```
+
+- earlystop-val 从训练区切，归卡带早停用；scoring-val 归脊柱打分用，**两者隔离**。
+- embargo 沿用现有 1 日（`RollingProfile.embargo`），切断标签前视泄漏。
+
+### 5.4 四指标 + 双镜头判官
+
+- 指标：`corr`（对齐老师 pooled corr）/ `MSE` / `R²` / `daily-IC`。
+- 判官 = **均值（pooled corr）+ 鲁棒（最坏折/minimax）双镜头同时看、人工权衡**，不退化成单指标闸刀（沿用 AGENTS §4.9）。
+- 同时看 **train vs earlystop-val gap + 逐 epoch 曲线** 判过拟合，**逐折 corr 方差** 判稳定性。
+
+### 5.5 防泄漏：numpy 参考模型
+
+一个 torch-free 的 **numpy 参考模型**（如恒 0 / 末 interval 线性）走**完整脊柱管线**必须打**低分**。若它打高分 = 脊柱漏了未来信息（窗口/归一化/标签对齐出 bug）。这是 D0 的核心验收闸。
+
+### 5.6 profile 调整
+
+- **砍 short/medium**（8/20 天序列对 DL 不公平）。
+- **加单切分迭代档**（调试 / 海选用）。
+- 认证沿用 `expanding`-类 walk-forward（少折）。
+
+---
+
+## 6. 超参搜索（省算力的叠加策略）
+
+1. **只搜 3 个结构超参**：序列长 `seq_len` / 隐藏维 `hidden_size` / 层数 `num_layers`；其余冻结默认。
+2. **随机搜索 ≫ 网格**。
+3. **早杀**：跑几个 epoch 后明显落后即弃整个 trial。
+4. **训练行采样**（类比树侧 0.33）降单 fit 成本。
+5. **海选少种子（1–2）、认证多种子（3）**。
+
+> `search_space` 是模型私有声明（跟卡带走）；"本次 run 搜哪几个、收窄到什么范围、几个 trial"是 `SearchConfig`（跟 run 走，见 §7）。
+
+---
+
+## 7. 配置管理：分布式声明 + 中央组装
+
+### 7.1 原则
+
+- **每层声明属于自己职责的配置块**（谁的活谁定义旋钮）。
+- **Orchestrator 只负责组装**：把各块拼成一份 `RunConfig` → 校验一致性 → 冻结 → 派发 → 盖进 run_id；外加它独占的 run 级/执行级配置。
+- **反模式警告**：不要把所有配置塞进 Orchestrator 写成 god-object——那会让"换模型不动脊柱"作废。
+
+### 7.2 配置归属表
+
+| 配置块 | 真相源（谁声明） | Orchestrator 的角色 |
+|---|---|---|
+| 搜索空间（超参 + 范围/分布） | ModelCartridge.`search_space` | 选 cartridge；本 run 收窄/覆盖/冻结部分范围 |
+| required_adapter + 通道 | Cartridge 声明需求、Adapter 声明通道 | 绑定 + 校验匹配（不匹配组装期报错） |
+| RollingProfile（折结构/embargo/阶段） | dl_protocol / eval_protocol | 选哪个 profile + 哪个阶段 |
+| 种子 / 种子数 | — | 独占 |
+| 重训 vs resume、run_id、输出目录 | — | 独占 |
+| 搜索预算（n_trials/早杀/subsample） | — | 独占 |
+| GPU device / worker 数 | — | 独占（执行级） |
+| 数据窗口（train/val 日期区间） | Orchestrator 给区间、Protocol 派生折 | 拥有区间 |
+| config-lock 冻结 | — | 强制执行 |
+
+### 7.3 三层枚举拆分（避免"枚举字符串散落各处"）
+
+把三件事分开，别糊在一起：
+
+| 层 | 是什么 | 放哪 |
+|---|---|---|
+| ① 合法词表（枚举） | "blend_mode ∈ {raw_mean, zscore}" 这类封闭选项集 | **集中**：放该配置块文件顶部的 `Enum` 类 |
+| ② 实现注册（枚举→类/函数） | `LSTM` 枚举值对应哪个 cartridge 类 | per-kind registry，**和实现挨着**（cartridge 文件把自己注册进去） |
+| ③ 本次选择（选了哪个值） | 这次 run 用 raw_mean 还是 zscore | `RunConfig`，Orchestrator 组装 |
+
+- 保留"分布式"的只有 **③ 的选择 + cartridge 私有 search_space**；**① 词表必须集中**。
+- cartridge 用 `required_adapter: AdapterKind`（**类型化引用集中枚举**），不写裸字符串——拼错当场报错。
+- search_space 是模型私有超参声明，**不算全局枚举、不进 config/**。
+
+### 7.4 config/ 文件结构（每块单独成文件 + 枚举进块文件顶部）
+
+```
+config/
+  model_config.py     # ModelKind(Enum) + ModelConfig(frozen dataclass)
+  adapter_config.py   # AdapterKind(Enum) + AdapterConfig
+  protocol_config.py  # Stage / ProfileKind(Enum) + ProtocolConfig
+  search_config.py    # SearchConfig（n_trials / 早杀 / 对 search_space 的收窄·冻结）
+  exec_config.py      # ExecConfig（seeds / device / resume / retrain / out_dir）
+  run_config.py       # RunConfig = 组装以上(frozen) + 组装期校验
+```
+
+- 枚举放**各块文件顶部**（高内聚：一个文件同时见到词表 + schema），不放单个 `enums.py` 巨型文件；**真·跨块共享**的才提升到 `config/common.py`。
+- 实现注册放对应 registry（如 `models/registry.py`）。
+
+### 7.5 RunConfig 四性质
+
+1. **不可变 + 冻结**（frozen dataclass）：组装后中途改不动——**这就是 config-lock 的机械实现**。
+2. **可序列化**：每次 run dump 成 JSON 落输出目录旁，完全可复现可审计。
+3. **组装期校验**：required_adapter 对不对、阶段/profile 一不一致、覆盖有没有拧到不存在的旋钮——全在组装那刻报错。
+4. **分层嵌套**：`RunConfig = {ModelConfig, AdapterConfig, ProtocolConfig, SearchConfig, ExecConfig}`，不平铺成大 dict。
+
+### 7.6 run_id 口径
+
+- **手工维护、语义更重**（沿用传统侧习惯）：`<日期>_<阶段>_<模型>_<意图>_<版本>`，如 `20260601_search_lstm_seqsweep_v1`、`20260603_valid_lstm_wf3seed_v1`。
+- **哈希降级成字段防漂移**：dump 的 RunConfig 里存 `config_fingerprint = hash(语义内容)`；唯一用途 = resume/复用 run_id 时比对，不一致就告警/拒跑。可读性 + 防配置悄悄漂移两头都占。
+
+### 7.7 "是否重新训练"拆两层（都归 Orchestrator/执行级）
+
+- **(a) resume 中断的 run**：部分折跑完接着跑，按 `(profile, fold, experiment_id)` 查 status（同传统侧）。
+- **(b) 复用 checkpoint vs 从头重训**：DL 训练贵，支持 `(config_fingerprint, fold, seed)` 训过就 load 权重跳过。
+- 两者是 `ExecConfig` 里**两个独立字段**，别混成一个 bool。
+
+---
+
+## 8. 数据喂入泛化性
+
+- 主流序列模型标准输入 = `[B, L, C]`（批 × 序列长 × 通道）。
+- 我们的"序列" = **某票某日的日内 interval 序列**，`L`=日内 bar 数、`C`=通道，**绝不跨日**。
+- 业界改进与本框架适配能力：
+
+| 方向 | 例子 | 当前契约能否直接适配 |
+|---|---|---|
+| 换通道内容 | DeepLOB 原始 LOB / PatchTST patch | ✅ 直接适配，换 InputAdapter 即可，脊柱零改 |
+| 多粒度多分辨率 | 1min+5min+日级多张张量 | ⚠️ 不直接：当前单张 [L,C] 不够 |
+| 截面/图结构 | 跨票 attention / 图网络 | ⚠️ 不直接：缺邻接关系输入 |
+
+- **诚实结论**：对"换通道内容"是真泛化（D0 即覆盖 LSTM-on-features 与 DeepLOB）；对"换输入结构种类"（多张量/图）有**清晰扩展缝**——把 InputAdapter 输出从"一张 ndarray"放宽成"张量字典"，仅 Window Indexer + Normalizer 两组件需做一次泛化，协议/指标/HPO 不动。
+- **D0 取舍（已拍板）**：先锁单张 `[L,C]`（YAGNI，主线冲 0.12 不需要多张量），但 Window Indexer / Normalizer 写成"不假设只有一张"的形态，留缝。
+
+---
+
+## 9. D0 地基交付物（torch-free，Mac CPU 即可跑通）
+
+按依赖顺序实现，**泄漏风险最高的先写先测**：
+
+1. `src/sequence_dataset.py` —— Window Indexer：惰性 gather [B,L,C]、不跨日、因果对齐、warmup 处理；Normalizer：fit-on-train、可配 identity。
+2. `src/dl_protocol.py` —— Protocol Engine：walk-forward 折日期、三段切分、embargo、4 指标、gap/曲线/稳定性、防泄漏检查入口。
+3. `src/dl_trainer.py` —— `SequenceTrainer(BaseTrainer)` 骨架：编排 data pipeline + cartridge，产出 `FoldResult`（已与 leaderboard 兼容，见 `src/trainer.py`）。
+4. `models/dl_models.py` —— `InputAdapter` 接口 + `FeatureAdapter`（包装 433 管线）；**numpy 参考模型**（防泄漏探测器）。
+5. `config/` —— §7.4 的配置块（frozen dataclass + 枚举）+ `RunConfig` 组装/校验骨架。
+6. **单测**：CPU 端到端跑通全链路；**参考模型打低分**；无泄漏告警；窗口不跨日；归一化只用训练统计量。
+
+> 全部 torch-free、Mac 可测；PyTorch 卡带（LSTM 等）等 4060 就绪后再在卡带层加，脊柱不动。
+
+---
+
+## 10. 评测纪律（防自欺：config-lock + 少看 expanding）
+
+DL 评测就两段（§5.2）：**海选（便宜搜超参）→ expanding 认证（walk-forward 判官）**。**不套传统"三层 Holdout"**——第三层（12 月 Final）历史从未执行，新协议已用 海选 + expanding 取代分层。保留的只有防自欺内核：
+
+- **config-lock**：获胜超参在进入最终交付演练（Dec 全窗口 fit/eval）之前冻结——靠 RunConfig frozen 机械保证；演练只当 sanity，绝不回灌选型。
+- **少看 expanding**：同一 expanding 窗口反复看会被过拟合、不再可信；海选已用便宜车道滤掉没希望的，expanding 只在少数幸存者上跑。
+- **不在最终确认数据上调参**：交付演练那次（最近一段、未用于选型的数据）看完即定，不据其改模型再交。
+
+---
+
+## 11. 未决 / 待办
+
+- **D0 实现**：按 §9 顺序落地（本规格定稿后即可开工）。
+- **传统交付 fit/predict 签名核验**：遗留另会话办（见 `CLAUDE.md` 看板），与 DL 地基不冲突。
+- **早杀实现**：D0 先留 TrainRecord 钩子，海选真感到 GPU 不够再补。
+- **多张量/图输入**：暂不实现，按 §8 留缝。
