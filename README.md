@@ -54,6 +54,7 @@ MEOW--predict/
 │   └── test_dl_infrastructure.py # RawChannelAdapter / 采样器 / 早杀钩子 / Searcher / Orchestrator 端到端
 ├── data/                      # 原始 .h5 数据（gitignored）；data/features/ 特征缓存（gitignored）
 ├── results/                   # 实验结果 CSV（gitignored）
+├── tracked_results/           # git 追踪的小体量正式结果归档（双机同步 / 深入分析）
 ├── .archive/                  # 废弃/归档文件（gitignored，不主动追踪）
 └── docs/                      # 文档（specs/ 规格、archived/ 历史快照只读）
 ```
@@ -134,6 +135,7 @@ python experiments/run_submission_full_window.py
 | `CLAUDE.md` | 当前阶段任务看板、进度、决策 |
 | `AGENTS.md` | 开发规范、实验 SOP、禁止事项 |
 | `docs/实验记录.md` | 所有实验结果的历史记录 |
+| `tracked_results/README.md` | git 追踪的正式结果同步目录说明与收录规则 |
 | `docs/specs/DL实验设计规格.md` | **DL 主线设计真相源**：脊柱+卡带架构 / 海选+expanding 协议 / 配置管理 / D0 交付物 |
 | `docs/交付演练SOP_Windows全窗口.md` | 交付链迁移到 Windows + 全窗口 fit/eval + 内存峰值核对的演练 SOP |
 | `docs/specs/高分实验总方案V2.md` | 整体方案设计 |
