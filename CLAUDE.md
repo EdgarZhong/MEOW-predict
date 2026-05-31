@@ -1,6 +1,6 @@
 # CLAUDE.md — 当前阶段进度与任务看板
 
-更新日期：2026-05-29
+更新日期：2026-05-31
 
 ## 当前阶段：传统已基本收口 → 主线转「交付接线 + DL」（2026-05-29）
 
@@ -8,9 +8,9 @@
 >
 > **战略转型(2026-05-29 拍板)**：传统不再冲分,**主线 = ① 交付接线收口 + ② DL(Windows 4060)**。传统的 HPO / 小波 / MLP **保留为后续方向、推迟**。
 >
-> **交付接线进度（2026-05-29 更新）**：两成员融合 + 并集特征 + 零缓存已接通、真实数据跑通、单测全过、commit `e005f62`@`feat/submission-blend-raw-mean`。**关键设计变更：融合口径从 zscore 锁定到 `raw_mean`**——老师精度分 = MSE+Pearson+R² 各 1/3(`meow/MEOW金融时序预测2.0.docx`)，zscore 输出 std≈1 毁 MSE/R²，raw 平均保量纲且 corr 不损(P5: raw 0.0762≈zscore 0.0763)。**剩余下一步**：内存精简(全窗口 fit ~30GB→~20GB)+ Dec 演练(上 ≥32GB 机器,本机 16GB 跑不动全窗口)+ 提交版减注释。详见待办队列「交付接线」四行 + §「交付接线收口」。
+> **交付接线进度（2026-05-31 更新）**：两成员融合 + 并集特征 + 零缓存已接通、真实数据跑通、单测全过、commit `e005f62`@`feat/submission-blend-raw-mean`。**关键设计变更：融合口径从 zscore 锁定到 `raw_mean`**——老师精度分 = MSE+Pearson+R² 各 1/3(`meow/MEOW金融时序预测2.0.docx`)，zscore 输出 std≈1 毁 MSE/R²，raw 平均保量纲且 corr 不损(P5: raw 0.0762≈zscore 0.0763)。**2026-05-31 已完成 Windows 全窗口 Dec 演练**：`fit(Jun–Nov)+eval(Dec)` 得到 `Pearson=0.0803`、`R²=0.00465`、`MSE≈2.364e-05`，全程峰值 RSS `22.43 GB`；说明正式提交通道全窗口可跑通、量纲与内存都健康。考虑到 rolling / holdout 协议已尽量约束泛化，这个 Dec sanity 结果支持“交老师隐藏集时应仍处于可交区间”，但**不把 Dec 分数当成选型依据**。**当前新的收口缺口**：交付链虽然能完整跑通，但训练出的成员权重/模型状态与 12 月逐行预测结果尚未落盘，不利于赛后复盘、精确复算 MSE 与交付追踪；下一步优先补这条可观测性。详见待办队列更新与 `docs/实验记录.md` 2026-05-31 条目。
 >
-> **传统样本外验证已全部收口（2026-05-29）**：`M_lgbm_d4` Nov holdout **0.08967** vs R02 **0.06952**(run `20260529_p43_lgbm_d4_nov_review`)、X1 已过 0.07367。两成员各自过样本外 → 等权零参融合"可辩护默认"。**12 月 Final Holdout 全程不碰**——留给"最终唯一代表(传统 or DL)选定后"一次性确认(§4.8;Dec 演练那次即动用)。
+> **传统样本外验证已全部收口（2026-05-31 口径更新）**：`M_lgbm_d4` Nov holdout **0.08967** vs R02 **0.06952**(run `20260529_p43_lgbm_d4_nov_review`)、X1 已过 0.07367；`2026-05-31` 又完成一次**全窗口 Dec 交付演练**（Pearson `0.0803` / R² `0.00465` / MSE `≈2.364e-05`）。两成员各自过样本外、交付链也已用 12 月 sanity 跑通 → 现阶段重点从“是否能交”转为“是否还要继续冲更高上限（DL）”。
 >
 > **交付接线的注意事项见下「交付接线收口 — 注意事项」节。竞赛背景 + roadmap + 详细任务见下。**
 
@@ -22,6 +22,15 @@
 - 一句话洞察：`M_lgbm_d4` 的“gap 偏热”并没有在 11 月外推里兑现成塌方，说明它学到的不是只在 6–10 月局部窗口生效的假信号，而是比 R02 更强的非线性排序结构
 - 结果路径：`results/eval_protocol/20260529_p43_lgbm_d4_nov_review/`
 - 下一步：把 `X1 + M_lgbm_d4` 融合接进 `submission_pipeline` / `meow.py`（**已完成,融合口径锁 `raw_mean` 而非 zscore——见「交付接线收口」第 2 条:老师精度分 MSE/R²/corr 各 1/3,zscore 毁 MSE/R²**）
+
+### 2026-05-31 运行记录
+
+- `run_id=20260531_submission_full_window_windows`，suite=`submission full-window rehearsal`，口径=`fit(20230601,20231130) + eval(20231201,20231229)`，机器=`Windows / 31.6 GB RAM`
+- 三指标：`Pearson=0.0803`、`R²=0.00465`、`MSE≈2.364e-05`（日志原始打印因老师格式限制显示为 `MSE=0.00`，按同一公式与 12 月真实标签方差回推）
+- 内存：`fit` 阶段峰值 RSS `22.43 GB`；训练窗预分配 `8548841 × 433`（约 `14.8 GB`），`eval(Dec)` 预分配 `1462884 × 433`（约 `2.5 GB`）
+- 一句话洞察：这次演练证明正式提交通道在“全窗口现算特征 + 两成员训练 + 12 月评测”下已经达到**能完整交付且量纲健康**的状态；结合前面 rolling / 11 月 holdout 的泛化约束，这个 Dec 结果更像“交付 sanity 过线”而不是偶然撞出的单次高点
+- 日志：`logs/submission_full_window_20260531_173303.log`
+- 工具修复：`experiments/run_submission_full_window.py` 已修复采样线程 `join()` 收尾 bug 与 `stdout/stderr` 恢复顺序，后续同脚本可正常打印 `FINAL 汇总` 并 `exit 0`
 
 ### 竞赛背景与算力分工（2026-05-28）
 
@@ -167,7 +176,7 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 
 ## 交付接线收口 — 进度与口径（2026-05-29 更新）
 
-> 现状：`meow.py` 壳层(fit/predict/eval)已接进 `src/submission_pipeline.py`、no-cache 已强制、两成员融合(X1 ridge + lgbm_d4)+并集特征已落地。**融合口径已从 zscore 切到 `raw_mean`**(见第 2 条),小窗口冒烟通过(corr 0.106 / R² 0.0065 / MSE≈0,量纲正确)。**内存精简(中档:预分配流式 + 末位释放源帧)已落地、本机小窗口验等价+冒烟通过(见第 7 条),持续峰 ~30→~20GB；剩余 = 全量峰上 ≥32GB 机器实测 + 正式 Dec 演练。**
+> 现状：`meow.py` 壳层(fit/predict/eval)已接进 `src/submission_pipeline.py`、no-cache 已强制、两成员融合(X1 ridge + lgbm_d4)+并集特征已落地。**融合口径已从 zscore 切到 `raw_mean`**(见第 2 条),小窗口冒烟通过(corr 0.106 / R² 0.0065 / MSE≈0,量纲正确)。**2026-05-31 全窗口 Dec 演练已完成**：Windows 31.6GB 机器上 `fit(Jun–Nov)+eval(Dec)` 成功跑通，`Pearson=0.0803 / R²=0.00465 / MSE≈2.364e-05`，全程峰值 `22.43 GB`，位于中档内存预期内。剩余主任务收敛为：**在不改老师 `meow.py/eval.py` 评分口径的前提下，为我们接管的提交后端补“训练权重/模型状态 + 评测预测结果”落盘能力**；之后再处理提交版减注释与是否继续转 DL。
 
 1. **serve 端归一化必须用「新数据自算」、严禁冻结训练期先验**：若用到当日截面统计(如 zscore 诊断模式),mean/std 必须从**老师传进来的当天那批数据自身**实时算,绝不能把训练集统计量存成先验。注：默认 `raw_mean` 不做截面标准化、天然无此风险;此条对 `per_day_zscore_mean` 诊断模式仍适用。
 2. **融合口径 = `raw_mean`（等权 raw 平均，已锁）**：两成员都在 raw `fret12` 上以平方损失训练,输出本就同量纲;直接等权平均 → **输出留在 `fret12` 量纲,MSE/R² 才有意义**。⚠️ **关键**:老师精度分(30) = **MSE + Pearson + R² 各占 1/3**(见 `meow/MEOW金融时序预测2.0.docx`),per-day zscore 会把输出推到 std≈1、毁掉 MSE/R²(2/3 精度分归零)。P5 实测 raw 0.0762 ≈ zscore 0.0763 → 切 raw 不损 corr。`per_day_zscore_mean` 仅留作诊断对照(`SubmissionSpec.blend_mode` 可切)。
@@ -197,13 +206,14 @@ C2/O4 单独 expanding 补跑完（runs `20260527_c2_gate_v1` / `20260527_o4_gat
 | **lgbm_d4 Nov 验证** | run `20260529_p43_lgbm_d4_nov_review` 已完成：`M_lgbm_d4` Nov holdout **0.08967** vs R02 **0.06952**，样本外明显更强、未塌；传统侧样本外验证全部收口 | ✅ 完成 |
 | **交付接线（主线①）— 接线+口径** | 两成员融合(X1 ridge + M_lgbm_d4)+并集特征(433列)+零缓存已接进 `submission_pipeline`/`meow.py`，真实数据 end-to-end 跑通。**融合口径已从 zscore 锁定到 `raw_mean`**（救 MSE/R²，见「交付接线收口」第 2 条）。小窗口冒烟通过(corr 0.106/R² 0.0065/MSE≈0)。commit `e005f62`@`feat/submission-blend-raw-mean` | ✅ 完成 |
 | **交付接线 — 内存精简（下一步①）** | **中档方案已落地(2026-05-29)**：① concat 2× 改预分配流式填充(`_build_window_frames`+`countDate` 读 h5 轴元信息拿行数)→build 峰 29→15GB；② `fit_window` 消费式、lgbm 末位训练前释放整窗源帧 + 直接喂 `_fit_model_core` numpy(省成员级 pandas 子表+冗余 copy)→训练持续峰 28→19GB；端到端持续峰 ~30→~20GB(达中档目标，残留 lgbm 列抽 numpy 瞬时 ~28GB 尖峰，32GB 可survive)。**不动模型/不降采样/不缩窗口**。新增 2 单测(释放等价+流式构造等价)、全 41 测过、`meow.py` 小窗口端到端冒烟过。⚠️ **全量峰待 ≥32GB 机器实测**(本机 16GB 跑不了全窗口) | ✅ 编码+基本测试完成（全量峰待 win 验） |
-| **交付接线 — Dec 演练（下一步②）** | 上 ≥32GB 机器(Windows 4060 若够内存最佳)跑 `fit(Jun,Nov)+eval(Dec)`：确认两成员不 OOM + 三指标(corr/MSE/R²)都健康 + 训练推理零 skew + **核对内存峰值(持续 ~20GB、全程 ≤ ~28GB)**。**已备好跑法**：`python experiments/run_submission_full_window.py`(跨平台 psutil 同进程采样+Tee 落日志,fire-and-forget)；迁移+运行+核对口径见 `docs/交付演练SOP_Windows全窗口.md`。脚本已本机小窗口冒烟过,全量峰待 win 实测。**Dec 只当 sanity、不回灌选型**(§4.8)；这会动用 12 月 Final Holdout 一次性确认 | 🔜 下一步（跑法已就绪） |
-| **交付接线 — 提交版减注释（下一步③）** | 老师评分明确"鼓励零注释/仅必要处注释"且查重(`meow/MEOW金融时序预测2.0.docx`)。**待做**：给 `meow/`+`src/` 提交路径单独出一版精简注释（与全局"详细中文注释"规则在本提交上冲突，提交前专门处理）| 🔜 下一步 |
+| **交付接线 — Dec 演练（原下一步②）** | `2026-05-31` 已在 `31.6 GB` Windows 机器完成：`fit(20230601,20231130)+eval(20231201,20231229)`，结果 `Pearson=0.0803 / R²=0.00465 / MSE≈2.364e-05`，`fit` 峰值 RSS `22.43 GB`，训练推理链路完整、量纲健康、未 OOM。日志：`logs/submission_full_window_20260531_173303.log`。**Dec 只作 sanity、不回灌选型**(§4.8)；这次已动用 12 月 Final Holdout，一律只记结果不反向调参。 | ✅ 完成 |
+| **交付接线 — 权重/预测落盘（当前下一步）** | 在**不修改老师 `meow.py` 入口风格、不修改 `meow/eval.py` 打分逻辑**的前提下，只在我们接管的 `src/submission_pipeline.py` / `meow/mdl.py` 侧增加可选落盘：① `fit` 后保存成员模型权重/状态与特征列清单；② `eval` 时保存 12 月逐行 `date/symbol/interval/fret12/forecast` 与成员分量预测。目标：支持赛后复盘、精确复算 MSE、定位 blend 行为，同时不污染老师默认运行口径。 | 🔜 当前下一步 |
+| **交付接线 — 提交版减注释（顺延）** | 老师评分明确"鼓励零注释/仅必要处注释"且查重(`meow/MEOW金融时序预测2.0.docx`)。**待做**：给 `meow/`+`src/` 提交路径单独出一版精简注释（与全局"详细中文注释"规则在本提交上冲突，提交前专门处理）| 🅿️ 顺延 |
 | **DL 分支（主线②，Windows）** | 4060/PyTorch：序列管道（防泄漏开窗+归一化）→ LSTM（特征当序列，低风险）证序列有料 → DeepLOB raw-LOB（高风险）；**过同协议 + 11月 holdout 才能当代表**；05-31 回退点。提交端注意：老师 `fit()` 会现场重训，DL 需 GPU+训练时长，或确认带预训练权重是否被规格允许 | 待开 |
 | 传统后续优化（推迟，保留方向） | 战略转型后**推迟**，有空才碰、上限有限：**① lgbm HPO**（num_leaves/lr+n_est/feature_fraction/min_child/L1L2，+0.003~0.008，0 holdout，性价比最高，要往大数据规模调）；**② 小波→GBDT**（老师 roadmap，+0~0.004，新 builder+防泄漏，ROI 低）；**③ MLP**（融合成员/加权，分数≈0，纯报告贡献度）。SVM/蒸馏/增量已分诊跳过 | 🅿️ 推迟 |
 | P5-b OOF stacking | **仅当**加权平均明显不够：二层小线性融合器，**必须用 OOF**（§7.9）；黑箱、难辩护，慎用 | 🅿️ 推迟 |
 | 🚩红线（Review 已用） | X1 进 11 月 Review Holdout（§4.8）：**已通过——X1 0.07367 vs R02 0.06952，+0.0042**（run `20260527_x1_review_v1`）；11 月预算已耗 1 次 | ✅ 完成 |
-| 🚩红线（Final 未碰） | Final Holdout（12 月）全程未碰，**只在最终代表选定后一次性确认**、看完不改提交决策（§4.8） | 未动 |
+| 🚩红线（Final 已用尽） | Final Holdout（12 月）已于 `2026-05-31` 交付演练中一次性使用；结果只记录、不回灌选型、不再据此改模型（§4.8） | ✅ 已执行并封存 |
 | 清理 | 失败 stage `p35_interactions` 已归档（builder 移 .archive、摘 stage、删 spec I1、缓存移 .archive） | ✅ 完成 |
 
 ### P4-1 落地（2026-05-27，import + 12 项 unittest 通过，未跑实验）

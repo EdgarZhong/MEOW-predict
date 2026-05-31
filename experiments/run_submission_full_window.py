@@ -82,7 +82,9 @@ class PeakSampler(threading.Thread):
         self._poll = poll_sec
         self._heartbeat = heartbeat_sec
         self._proc = psutil.Process(os.getpid())
-        self._stop = threading.Event()
+        # 不能命名为 _stop：Thread.join() 内部会调用 Thread._stop() 方法；
+        # 若这里用同名 Event 覆盖，join 收尾时会触发 “Event object is not callable”。
+        self._stop_event = threading.Event()
         self.peak_gb = 0.0
 
     def _rss_gb(self):
@@ -96,7 +98,7 @@ class PeakSampler(threading.Thread):
 
     def run(self):
         last_hb = 0.0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             cur = self._rss_gb()
             if cur > self.peak_gb:
                 self.peak_gb = cur
@@ -104,10 +106,10 @@ class PeakSampler(threading.Thread):
             if now - last_hb >= self._heartbeat:
                 _log("[mem] current={:.2f} GB  peak={:.2f} GB".format(cur, self.peak_gb))
                 last_hb = now
-            self._stop.wait(self._poll)
+            self._stop_event.wait(self._poll)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 def _log(msg):
@@ -148,56 +150,67 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / "submission_full_window_{}.log".format(stamp)
     log_fp = log_path.open("w", encoding="utf-8")
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
 
     # tee：控制台 + 文件，捕获一切（含 meow log 默认的 print 输出）。
     sys.stdout = Tee(sys.__stdout__, log_fp)
     sys.stderr = Tee(sys.__stderr__, log_fp)
 
-    vm = psutil.virtual_memory()
-    _log("==== 交付管线全窗口演练开始 ====")
-    _log("日志文件：{}".format(log_path))
-    _log("平台：{}    Python：{}    CPU逻辑核：{}".format(
-        sys.platform, sys.version.split()[0], psutil.cpu_count()))
-    _log("物理内存总量：{:.1f} GB".format(vm.total / 1024 ** 3))
-    _log("数据目录：{}".format(data_dir))
-    _log("训练窗口：{}–{}    评测窗口：{}–{}".format(
-        train_start, train_end, eval_start, eval_end))
-    _log("预期：fit 持续峰 ~20GB；lgbm 列抽 numpy 处瞬时尖峰可达 ~28GB；32GB 可 survive。")
-    _log("内存采样：每 {:.1f}s 取样、每 {:.1f}s 打印心跳".format(poll_sec, hb_sec))
-    if vm.total / 1024 ** 3 < 31.0:
-        _log("⚠️ 本机物理内存 < 32GB，全窗口可能 OOM；建议换 ≥32GB 机器跑。")
+    sampler = None
+    peak_after_fit = 0.0
+    try:
+        vm = psutil.virtual_memory()
+        _log("==== 交付管线全窗口演练开始 ====")
+        _log("日志文件：{}".format(log_path))
+        _log("平台：{}    Python：{}    CPU逻辑核：{}".format(
+            sys.platform, sys.version.split()[0], psutil.cpu_count()))
+        _log("物理内存总量：{:.1f} GB".format(vm.total / 1024 ** 3))
+        _log("数据目录：{}".format(data_dir))
+        _log("训练窗口：{}–{}    评测窗口：{}–{}".format(
+            train_start, train_end, eval_start, eval_end))
+        _log("预期：fit 持续峰 ~20GB；lgbm 列抽 numpy 处瞬时尖峰可达 ~28GB；32GB 可 survive。")
+        _log("内存采样：每 {:.1f}s 取样、每 {:.1f}s 打印心跳".format(poll_sec, hb_sec))
+        if vm.total / 1024 ** 3 < 31.0:
+            _log("⚠️ 本机物理内存 < 32GB，全窗口可能 OOM；建议换 ≥32GB 机器跑。")
 
-    sampler = PeakSampler(poll_sec=poll_sec, heartbeat_sec=hb_sec)
-    sampler.start()
+        sampler = PeakSampler(poll_sec=poll_sec, heartbeat_sec=hb_sec)
+        sampler.start()
 
-    t0 = time.time()
-    MeowEngine = _load_meow_engine()
-    engine = MeowEngine(h5dir=data_dir, cacheDir=None)
+        t0 = time.time()
+        MeowEngine = _load_meow_engine()
+        engine = MeowEngine(h5dir=data_dir, cacheDir=None)
 
-    _log("===== PHASE fit START =====")
-    tf = time.time()
-    engine.fit(train_start, train_end)
-    peak_after_fit = sampler.peak_gb
-    _log("===== PHASE fit DONE  耗时 {:.0f}s  fit后峰值={:.2f} GB =====".format(
-        time.time() - tf, peak_after_fit))
+        _log("===== PHASE fit START =====")
+        tf = time.time()
+        engine.fit(train_start, train_end)
+        peak_after_fit = sampler.peak_gb
+        _log("===== PHASE fit DONE  耗时 {:.0f}s  fit后峰值={:.2f} GB =====".format(
+            time.time() - tf, peak_after_fit))
 
-    _log("===== PHASE eval START =====")
-    te = time.time()
-    engine.eval(eval_start, eval_end)
-    _log("===== PHASE eval DONE  耗时 {:.0f}s =====".format(time.time() - te))
+        _log("===== PHASE eval START =====")
+        te = time.time()
+        engine.eval(eval_start, eval_end)
+        _log("===== PHASE eval DONE  耗时 {:.0f}s =====".format(time.time() - te))
 
-    sampler.stop()
-    sampler.join(timeout=5)
+        sampler.stop()
+        sampler.join(timeout=5)
 
-    # 显眼的 FINAL 汇总：只把这几行带回 Mac 即可判断峰值是否达标。
-    _log("======================== FINAL 汇总 ========================")
-    _log("总耗时：{:.0f}s".format(time.time() - t0))
-    _log("FINAL PEAK RSS（全程最高）：{:.2f} GB".format(sampler.peak_gb))
-    _log("  其中 fit 阶段峰值：{:.2f} GB".format(peak_after_fit))
-    _log("核对口径：持续心跳应稳定在 ~15–20GB；全程峰值（含瞬时）≤ ~28GB 即符合中档预期。")
-    _log("============================================================")
-    log_fp.flush()
-    log_fp.close()
+        # 显眼的 FINAL 汇总：只把这几行带回 Mac 即可判断峰值是否达标。
+        _log("======================== FINAL 汇总 ========================")
+        _log("总耗时：{:.0f}s".format(time.time() - t0))
+        _log("FINAL PEAK RSS（全程最高）：{:.2f} GB".format(sampler.peak_gb))
+        _log("  其中 fit 阶段峰值：{:.2f} GB".format(peak_after_fit))
+        _log("核对口径：持续心跳应稳定在 ~15–20GB；全程峰值（含瞬时）≤ ~28GB 即符合中档预期。")
+        _log("============================================================")
+    finally:
+        if sampler is not None and sampler.is_alive():
+            sampler.stop()
+            sampler.join(timeout=5)
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        log_fp.flush()
+        log_fp.close()
 
 
 if __name__ == "__main__":
