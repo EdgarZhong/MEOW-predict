@@ -73,14 +73,14 @@ SequenceTrainer (src/dl_trainer.py)  [纯编排, torch-free]
 
 ### 2.3 换模型时：什么不变、什么变
 
-以 `LSTM-on-features`（433 手工特征当通道）→ `DeepLOB-on-rawLOB`（原始订单簿当通道）为例：
+以 `LSTM-on-features`（433 手工特征当通道）→ `TCN-on-原始微结构`（~59 原始微结构通道，见 §8.0）为例：
 
 | | 是否改动 | 说明 |
 |---|---|---|
-| **InputAdapter** | ✅ 变 | 通道定义 + 语义预处理（特征列 → 原始 LOB 各档价/量；价格相对归一在此做） |
-| **ModelCartridge** | ✅ 变 | nn.Module 结构 + 训练循环 |
+| **InputAdapter** | ✅ 变 | 通道定义 + 语义预处理（特征列 → 原始微结构各通道；价相对 mid / 量 log1p 在此做） |
+| **ModelCartridge** | ✅ 变 | nn.Module 结构 + 训练循环（LSTM → TCN） |
 | Window Indexer | ❌ 不变 | "不跨日、因果对齐、按 step 滑" 与通道含义无关 |
-| Normalizer | ❌ 不变（机制） | 仍是 fit-on-train 白化；DeepLOB 若用价格相对归一，则把 Normalizer 配成 identity |
+| Normalizer | ❌ 不变（机制） | 仍是 fit-on-train 白化；adapter 已做语义归一时，statistical 白化照样在脊柱跑（zscore），二者职责分明 |
 | 协议（walk-forward / 三段 / embargo） | ❌ 不变 | |
 | 4 指标 / leaderboard | ❌ 不变 | |
 | HPO 搜索环 / 种子集成 | ❌ 不变 | |
@@ -101,8 +101,10 @@ class InputAdapter:
 ```
 
 - **不跨日**：每次只吃"一天"的 raw，禁止把多日 raw 一次性喂进来（避免跨日串值，与 `SubmissionFeaturePipeline` 逐日现算口径一致）。
-- **语义归一化归这里**：如原始 LOB 按当下 mid-price 做相对归一，属"语义预处理"，放 adapter；统计白化才交给脊柱 Normalizer。
-- **首个实现 = FeatureAdapter**：包装现有 433 特征管线（`SubmissionFeaturePipeline` / `feature_registry`），把特征列当通道，零新特征公式。
+- **语义归一化归这里**：如原始价按当下 mid-price 做相对归一，属"语义预处理"，放 adapter；统计白化才交给脊柱 Normalizer。
+- **两个实现（已落地，torch-free）**：
+  - `FeatureAdapter`（D1 用）：包装现有 433 特征管线（`SubmissionFeaturePipeline` / `feature_registry`），把手工特征列当通道，零新特征公式。绑 `LSTM` 卡带。
+  - `RawChannelAdapter`（D2 主攻 / TCN 用）：把 ~59 个原始微结构通道（§8.0）做**最小语义归一**当通道，让网络自己学交互：① 价（各档买卖价 / OHLC / 成交高低 / vwad）→ `p/midpx - 1`（行内，价=0 时置 0）；② `midpx` 本身 → 按 `(symbol)` 组内日内对数收益（`log midpx_t - log midpx_{t-1}`，首步 0，因果不跨日跨票）；③ 量 / 笔数 / 额 → `log1p` 驯厚尾。**刻意不在 adapter 里手搓 imbalance/OFI**——那是 FeatureAdapter 的活，走 raw 这条线就是要 TCN 自己学。绑 `TCN` 卡带。
 
 ### 3.2 ModelCartridge（模型卡带，唯一 torch）
 
@@ -195,6 +197,13 @@ class ModelCartridge:
 
 > `search_space` 是模型私有声明（跟卡带走）；"本次 run 搜哪几个、收窄到什么范围、几个 trial"是 `SearchConfig`（跟 run 走，见 §7）。
 
+**实现落地（`src/dl_search.py`，torch-free）**：
+
+- `sample_hparams` 读 `cartridge.search_space` 的迷你 spec（`choice` / `int` / `uniform` 三型）随机采样，`SearchConfig.search_overrides` 按 knob 收窄/替换。
+- **`seq_len` 是 trainer 级旋钮、`hidden_size`/`num_layers` 是卡带级 hparams**：`seq_len` 决定 `SequenceDataset` 开窗（要重建数据集），故 Searcher 把采到的 `seq_len` 喂 `SequenceTrainer(seq_len=...)`，其余进 `cartridge.fit(hparams=...)`。这条边界写死在 Searcher 里。
+- `Searcher` 跑 trial 环：每 trial 采一组结构超参 → 海选档单切分 × 1–2 种子跑 fold → `summarize_folds` 取 pooled+最坏折 → 按 `val_corr` 排名 → 落 `trials.csv` + `best_config.json`。
+- **早杀** = HPO 级（杀整个 trial）的可选加速：`EarlyKillPolicy` 留接口、D0 为 no-op 桩（读 `TrainRecord` 曲线判断的逻辑等海选真撞 GPU 上限再补，规格 §11）。
+
 ---
 
 ## 7. 配置管理：分布式声明 + 中央组装
@@ -204,6 +213,8 @@ class ModelCartridge:
 - **每层声明属于自己职责的配置块**（谁的活谁定义旋钮）。
 - **Orchestrator 只负责组装**：把各块拼成一份 `RunConfig` → 校验一致性 → 冻结 → 派发 → 盖进 run_id；外加它独占的 run 级/执行级配置。
 - **反模式警告**：不要把所有配置塞进 Orchestrator 写成 god-object——那会让"换模型不动脊柱"作废。
+
+**实现落地（`experiments/run_dl.py`，torch-free）**：`Orchestrator` 吃一份已组装的 `RunConfig`，按 registry 建 `adapter` + `cartridge_factory`、按 `MeowDataLoader` 建 `raw_loader`（测试可注入合成 loader）、按 `protocol` 派生折；dump `config.json`（含 `config_fingerprint`）到 `out_dir/<run_id>/`；按 `stage` 分派——`SEARCH` → 交 `Searcher`（落 `trials.csv` + `best_config.json`）、`VALIDATION` → 定参跑 expanding 少折 × 多种子（落 `fold_metrics.csv` + `summary.json`）。它不写任何块旋钮，只组装 + 派发 + 落盘。
 
 ### 7.2 配置归属表
 
@@ -270,13 +281,24 @@ config/
 
 ## 8. 数据喂入泛化性
 
+### 8.0 数据实情（决定路线，接 PyTorch 前查真实 h5 定）
+
+查 `data/20230601.h5`（62 列、~309 票/日、~226 interval/票）得到的硬约束：
+
+- **没有连续 LOB**：盘口只有 4 个稀疏聚合档位（`bid0/4/9/19` + `ask` 同构）+ 聚合 size（`bsize0 / bsize0_4 / bsize5_9 / bsize10_19`）+ turnover ratio（`btr0_4 / atr0_4 …`），**不是 DeepLOB 假设的连续 10 档价量网格**。→ **DeepLOB-on-rawLOB 退役**（无对应输入，照搬 Inception 网格没意义）。
+- **能喂的 = ~59 个原始微结构通道**：价（`midpx / lastpx / OHLC` + 4 档买卖价）、量（聚合 size / turnover ratio）、订单流（主动买卖 + 挂单 + 撤单的笔数 / 量 / 额 / 高低 / vwad）。
+- **序列 = 某票某日 ~226 步日内路径**，绝不跨日。
+- **D2 主攻收敛**：`TCN-on-原始微结构`（RawChannelAdapter + TCN 卡带）。理由见 `NOTE.md`「为什么 TCN」：因果自带 + 训练并行省 GPU + 膨胀卷积归纳偏置贴订单流；架构是小杠杆，把算力砸在输入/归一化/结构搜索。`DEEPLOB` 枚举保留为历史词位但标退役。
+
+### 8.1 张量形态与泛化缝
+
 - 主流序列模型标准输入 = `[B, L, C]`（批 × 序列长 × 通道）。
 - 我们的"序列" = **某票某日的日内 interval 序列**，`L`=日内 bar 数、`C`=通道，**绝不跨日**。
 - 业界改进与本框架适配能力：
 
 | 方向 | 例子 | 当前契约能否直接适配 |
 |---|---|---|
-| 换通道内容 | DeepLOB 原始 LOB / PatchTST patch | ✅ 直接适配，换 InputAdapter 即可，脊柱零改 |
+| 换通道内容 | TCN 原始微结构通道 / PatchTST patch | ✅ 直接适配，换 InputAdapter 即可，脊柱零改 |
 | 多粒度多分辨率 | 1min+5min+日级多张张量 | ⚠️ 不直接：当前单张 [L,C] 不够 |
 | 截面/图结构 | 跨票 attention / 图网络 | ⚠️ 不直接：缺邻接关系输入 |
 
@@ -312,7 +334,9 @@ DL 评测就两段（§5.2）：**海选（便宜搜超参）→ expanding 认�
 
 ## 11. 未决 / 待办
 
-- **D0 实现**：按 §9 顺序落地（本规格定稿后即可开工）。
+- **D0 地基**：✅ 已落地（§9 六件 + 17 test，torch-free / Mac CPU 跑通）。
+- **接 PyTorch 前的基础设施**：✅ 已落地（torch-free）——`RawChannelAdapter`（§3.1/§8.0）、`src/dl_search.py` HPO Searcher（§6）、`experiments/run_dl.py` Orchestrator（§7）、`tests/test_dl_infrastructure.py` 端到端测试。`ModelKind` 加 `TCN`、`DEEPLOB` 标退役；`AdapterKind` 加 `RAW_CHANNELS`。
+- **TCN 卡带本体（等 4060）**：`models/dl_models.py` 加 `TCNCartridge`（nn.Module + 训练循环 + 早停），复用 `STRUCTURE_SEARCH_SPACE`、绑 `RAW_CHANNELS`；脊柱 / Orchestrator / Searcher / adapter 一律不动。
 - **传统交付 fit/predict 签名核验**：遗留另会话办（见 `CLAUDE.md` 看板），与 DL 地基不冲突。
-- **早杀实现**：D0 先留 TrainRecord 钩子，海选真感到 GPU 不够再补。
+- **早杀实现**：先留 `EarlyKillPolicy` 钩子（no-op 桩），海选真撞 GPU 上限再补。
 - **多张量/图输入**：暂不实现，按 §8 留缝。

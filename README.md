@@ -28,6 +28,7 @@ MEOW--predict/
 │   ├── sequence_dataset.py    # WindowIndexer + Normalizer + SequenceDataset（惰性 [B,L,C]，不跨日/不跨票）
 │   ├── dl_protocol.py         # DL 协议引擎（walk-forward 三段切分 + embargo + 4 指标 + 防泄漏检查）
 │   ├── dl_trainer.py          # SequenceTrainer(BaseTrainer)：编排 adapter→indexer→normalizer→cartridge
+│   ├── dl_search.py           # HPO Searcher（采样器 choice/int/uniform + overrides 收窄 + 早杀钩子 + 排名）
 │   ├── feat_legacy.py         # teacher 原始 6 特征（legacy 对照）
 │   ├── dl.py / mdl.py / eval.py / tradingcalendar.py / log.py  # 老师原始数据/模型/评估模板 + 日历/日志
 ├── config/                    # DL 配置块（frozen dataclass + 枚举顶部；平铺 import）
@@ -38,9 +39,10 @@ MEOW--predict/
 │   ├── exec_config.py         # ExecConfig（seeds / device / resume / reuse_checkpoint / out_dir）
 │   └── run_config.py          # RunConfig 组装 + 跨块校验 + config_fingerprint
 ├── models/                    # DL 可换卡带（唯一允许 torch 的层；平铺 import）
-│   ├── dl_models.py           # InputAdapter 接口 + IdentityAdapter / FeatureAdapter + numpy 参考模型
+│   ├── dl_models.py           # InputAdapter（Identity/Feature433/RawChannel）+ numpy 参考模型（Zero/Last/Pool）+ STRUCTURE_SEARCH_SPACE
 │   └── registry.py            # 枚举值 → 实现类的注册表（required_adapter 校验源）
 ├── experiments/               # 实验入口脚本
+│   ├── run_dl.py              # DL Orchestrator（组装+冻结 RunConfig+dump JSON+SEARCH→Searcher / VALIDATION→认证；CLI smoke）
 │   ├── p0_eval_protocol.py    # 传统 Rolling 评测基准（daily/gate/ridge/quick/full suite）
 │   ├── p05_lock_ridge_alpha_and_winsorize.py # alpha + winsorize 扫锁
 │   ├── run_with_memory_guard.py # 通用 RSS 内存看门狗包装器（仅 Unix）
@@ -48,7 +50,8 @@ MEOW--predict/
 │   └── legacy/                # 历史脚本（可运行、不主动改）
 ├── meow/                      # 老师提交目录（python meow.py 入口；正式提交通道）
 ├── tests/                     # 单元测试（unittest）
-│   └── test_dl_pipeline.py    # DL D0 六项验收闸（端到端/参考模型低分/无泄漏/不跨日跨票/归一化/config）
+│   ├── test_dl_pipeline.py    # DL D0 六项验收闸（端到端/参考模型低分/无泄漏/不跨日跨票/归一化/config）
+│   └── test_dl_infrastructure.py # RawChannelAdapter / 采样器 / 早杀钩子 / Searcher / Orchestrator 端到端
 ├── data/                      # 原始 .h5 数据（gitignored）；data/features/ 特征缓存（gitignored）
 ├── results/                   # 实验结果 CSV（gitignored）
 ├── .archive/                  # 废弃/归档文件（gitignored，不主动追踪）
@@ -57,15 +60,16 @@ MEOW--predict/
 
 ## DL 工程地基（脊柱 + 卡带）
 
-DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**脊柱**，把**输入适配 + 模型本体**做成可换**卡带**；PyTorch 封死在卡带内，脊柱全程 torch-free。换模型（LSTM-on-features → DeepLOB-on-rawLOB）只动两块卡带，脊柱零改。
+DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**脊柱**，把**输入适配 + 模型本体**做成可换**卡带**；PyTorch 封死在卡带内，脊柱全程 torch-free。换模型（LSTM-on-features → TCN-on-原始微结构）只动两块卡带，脊柱零改。主攻 = **TCN 喂 ~59 原始微结构通道**（数据无连续 LOB，DeepLOB 退役，见规格 §8.0 / `NOTE.md`「为什么 TCN」）。
 
 - **脊柱**（`src/sequence_dataset.py` / `src/dl_protocol.py` / `src/dl_trainer.py`）：
   - 序列粒度 = 「同一票同一天」的日内 interval 序列（`[B, L, C]`），**绝不跨日、绝不跨票**；标签因果对齐窗末、warmup 不足窗丢弃。
   - 评测 = 三段切分 `[ train_core | earlystop-val | embargo | scoring-val ]`；4 指标（corr/MSE/R²/daily-IC）口径与传统侧 `experiment_runner` 逐字对齐。
   - 防泄漏三道物理保证：窗口不跨界 + 标签因果对齐 + Normalizer 只用训练统计；由 numpy 参考模型（末步线性）兜底探测。
 - **卡带**（`models/dl_models.py`）：
-  - `InputAdapter`：`FeatureAdapter`（包装 433 特征管线，零新公式）/ `IdentityAdapter`（调试 & 合成测试）。
-  - `ModelCartridge`：D0 仅含 torch-free numpy 参考模型（恒 0 / 末步线性，作防泄漏探测器与 corr 基线）；LSTM / DeepLOB 等 4060 + PyTorch 就绪后再加。
+  - `InputAdapter`：`FeatureAdapter`（包装 433 特征管线，零新公式，绑 LSTM）/ `RawChannelAdapter`（~59 原始微结构通道最小语义归一：价相对 mid / midpx 日内对数收益 / 量 log1p，绑 TCN）/ `IdentityAdapter`（调试 & 合成测试）。
+  - `ModelCartridge`：现仅含 torch-free numpy 参考模型——`ReferenceZero`（corr 基线）/ `ReferenceLast`（末步线性，防泄漏探测器）/ `ReferencePool`（窗口均值池化线性，声明 `STRUCTURE_SEARCH_SPACE` 当 HPO 被测对象 + TCN 模板）；`TCN` / `LSTM` 卡带等 4060 + PyTorch 就绪后再加，脊柱不动。
+- **基础设施**（`src/dl_search.py` / `experiments/run_dl.py`，torch-free）：`Searcher` 随机搜结构 3 旋钮（`seq_len` 走 trainer、`hidden_size`/`num_layers` 走卡带 hparams）+ 排名 + 早杀钩子桩；`Orchestrator` 组装+冻结 RunConfig+dump JSON，按 `stage` 派 SEARCH（海选，落 `trials.csv`/`best_config.json`）/ VALIDATION（定参认证，落 `fold_metrics.csv`/`summary.json`）。
 - **配置**（`config/`）：分布式声明 + 中央组装；`RunConfig` 为 frozen dataclass（= config-lock 机械实现），`assemble_run_config` 在组装期校验 required_adapter / 阶段搭配 / 数据窗口，并算 `config_fingerprint` 防漂移。
 
 设计真相源：`docs/specs/DL实验设计规格.md`。
@@ -77,7 +81,7 @@ DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**�
 - 可选：`psutil`（交付链内存采样演练 `run_submission_full_window.py` 必需）
 - DL 卡带（D1/D2，待 4060）：将额外需要 `torch`（GPU / PyTorch）；D0 地基不需要
 
-**import 约定**：`src/` / `config/` / `models/` 三个目录均为**平铺**（非包），入口需把三者都加入 path —— 运行脚本用 `PYTHONPATH=src:config:models`；`tests/test_dl_pipeline.py` 已在文件头自行插入这三个目录，直接 `python -m unittest` 即可。
+**import 约定**：`src/` / `config/` / `models/` 三个目录均为**平铺**（非包），入口需把三者都加入 path —— 运行脚本用 `PYTHONPATH=src:config:models`（Orchestrator 还需 `experiments`，或直接 `python experiments/run_dl.py`，其文件头已自插 path）；`tests/test_dl_pipeline.py` 与 `tests/test_dl_infrastructure.py` 均在文件头自行插入目录，直接 `python -m unittest` 即可。
 
 ## 运行方式
 
@@ -85,8 +89,15 @@ DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**�
 # 从项目根目录运行
 cd MEOW--predict
 
-# —— DL D0 地基验收单测（torch-free，秒级，Mac CPU 可跑）——
-python -m unittest tests.test_dl_pipeline -v
+# —— DL 地基 + 基础设施验收单测（torch-free，秒级，Mac CPU 可跑）——
+python -m unittest tests.test_dl_pipeline -v          # D0 六项验收闸
+python -m unittest tests.test_dl_infrastructure -v    # RawChannelAdapter / Searcher / Orchestrator
+
+# —— DL Orchestrator 海选 smoke（torch-free 参考卡带 + 真实数据抽样，验证端到端）——
+PYTHONPATH=src:config:models:experiments python experiments/run_dl.py \
+  --stage search --model reference_pool --adapter raw_channels \
+  --start 20230601 --end 20230623 --min-train-days 8 --val-window 3 \
+  --trials 3 --max-symbols 10 --out-dir results/dl
 
 # —— 传统侧实验 ——
 # 快速验证（2折 × short profile，约 2 分钟）

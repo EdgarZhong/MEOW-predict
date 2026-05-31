@@ -17,8 +17,9 @@ from typing import Tuple
 
 class AdapterKind(Enum):
     """输入适配器合法词表。"""
-    FEATURE_433 = "feature_433"   # 包装现有 433 特征管线（SubmissionFeaturePipeline），特征列当通道
-    IDENTITY = "identity"         # 直接把指定 raw 数值列当通道（调试 / 防泄漏合成测试用）
+    FEATURE_433 = "feature_433"     # 包装现有 433 特征管线（SubmissionFeaturePipeline），特征列当通道（D1/LSTM）
+    RAW_CHANNELS = "raw_channels"   # ~59 原始微结构通道做最小语义归一当通道（D2/TCN，规格 §3.1/§8.0）
+    IDENTITY = "identity"           # 直接把指定 raw 数值列当通道（调试 / 防泄漏合成测试用）
 
 
 @dataclass(frozen=True)
