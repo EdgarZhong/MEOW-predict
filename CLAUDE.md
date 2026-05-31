@@ -1,13 +1,14 @@
 # CLAUDE.md — 当前阶段进度与任务看板
 
-更新日期：2026-05-31
+更新日期：2026-06-01
 
-## 当前阶段：DL 主线已进入首轮 TCN 海选（后台运行中，待读第一批 trial）
+## 当前阶段：TCN expanding validation 进行中 + GRU 卡带实现完成
 
 > **战略**：传统侧已收口、可提交（保底代表已锁）；主线 = ① 交付接线收口（仅剩签名核验/减注释尾巴）+ ② **DL 冲 0.12**（Windows 4060 / PyTorch）。
 > **DL 地基设计已定稿** → `docs/specs/DL实验设计规格.md`（固定脊柱 + 可换卡带 / 海选+expanding 评测 / 配置管理 / D0 交付物 + §8.0 数据实情）。当前在 `feat/dl-foundation` 分支。
 > **路线收敛（接卡前查真实 h5 定）**：数据**无连续 LOB**（只 4 稀疏聚合档）→ **DeepLOB 退役**；能喂的 = **~59 原始微结构通道**；**第一个猛药 = TCN-on-原始微结构**（理由见 `NOTE.md`「为什么 TCN」：架构是小杠杆、因果自带、省 GPU、归纳偏置贴订单流）。
-> **本会话新增完成（2026-05-31 晚）**：`models/dl_models.py` 已补 **`TCNCartridge`**（PyTorch nn.Module + 因果膨胀卷积残差块 + 训练循环 + earlystop），`experiments/run_dl.py` 已把 `ExecConfig.device` 真正注入卡带；`tests/test_dl_infrastructure.py` 新增 TCN 最小接线测试。**验证**：① `python -m unittest tests.test_dl_infrastructure.TestTCNCartridge -v` 通过；② 真实数据 1 折 1 epoch smoke 通过：`python experiments/run_dl.py --stage validation --model tcn --adapter raw_channels ... --hparams "device=cuda,seq_len=16,hidden_size=16,num_layers=2,max_epochs=1,..."` 成功跑完，说明 **CUDA 路径已实际走通**（若不可用会当场报错）。
+> **TCN 首轮海选结论（2026-06-01 读榜）**：4 个 trial，2 正 2 负；best = trial 1（seq_len=32, hidden=32, num_layers=4, val_corr=0.01653）；第二正 trial（seq_len=32, hidden=128, num_layers=2, val_corr=0.01305）；两个 seq_len=48 均负（-0.00541 / -0.00453）。**关键信号**：① 未全线崩 → 管线 / 训练循环无根性问题；② seq_len=32 >> seq_len=48 → 短窗适合原始微结构噪声域；③ val_corr 绝对值仍低，**本阶段不与传统靶子对打、只做管线 sanity**。结论：best config 直接进 expanding validation，不再盲搜。
+> **当前正在跑**：TCN expanding validation（Windows 4060，后台进行中）。**同步落地**：`GRUCartridge`（第二卡带，绑 FeatureAdapter-433，让 GRU 吃 433 工程特征）已实现 + 测试，等 Windows 空出来后即可开启 GRU 海选，双路并行比较"架构 × 输入"两个轴。
 > **传统全量交付演练已拿到结果（2026-05-31）**：用户已在另一侧跑完全窗口 `fit(Jun–Nov) + eval(Dec)`，指标为 **Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。口径：这次属于**最终 sanity 演练**，说明提交链 `raw_mean` 量纲健康、端到端可跑；**按红线不据此再回改传统代表选型**。
 > **TCN 首轮海选已启动（2026-05-31 晚，后台）**：run_id=`20260531_search_tcn_raw_v1`，命令口径：`stage=search` / `model=tcn` / `adapter=raw_channels` / `trials=4` / `seeds=42` / `device=cuda` / `max_epochs=4` / `patience=2` / `batch_size=256`。当前按 `single_split` 取**第一折**海选，实际窗口：**train_core=20230601–20230720（34d） / earlystop=20230721–20230728（6d） / embargo=20230731 / scoring=20230801–20230807（5d）**。资源观察：启动后 Python RSS 约 3–5GB、GPU 显存约 2.9GB，暂未见内存/显存报警。
 > **未提交**：本会话改动仍在工作区（用户决定提交时机）。**下一步 = 等 `20260531_search_tcn_raw_v1` 跑完先读 `trials.csv + best_config.json`，再决定是否直接进 expanding 认证（validation）**；脊柱/Orchestrator/Searcher/adapter 不再改，除非正式跑数暴露新问题。
@@ -47,8 +48,8 @@
 | **DL D0 地基实现（主线②）** | torch-free、Mac CPU 跑通，按 spec §9 全部落地：① `src/sequence_dataset.py`（WindowIndexer 惰性[B,L,C]/不跨日/不跨票/因果对齐/warmup + Normalizer fit-on-train/可 identity + subset_by_dates）② `src/dl_protocol.py`（DLFold 三段切分/embargo/4指标逐字对齐 experiment_runner/assert_folds_causal/summarize_folds）③ `src/dl_trainer.py`（`SequenceTrainer(BaseTrainer)`，鸭子类型注入 adapter+cartridge_factory+raw_loader，产 `FoldResult`）④ `models/dl_models.py`（InputAdapter 接口+IdentityAdapter+FeatureAdapter 包装433+numpy 参考模型 ReferenceZero/Last 当泄漏探测器）+`models/registry.py`（枚举→类注册+required_adapter 校验）⑤ `config/` 6 文件（frozen dataclass+枚举顶部 + `RunConfig` 组装/校验/fingerprint）⑥ `tests/test_dl_pipeline.py`（六项验收闸 **17 test 全过**：端到端/参考模型低分/无泄漏因果/不跨日跨票/归一化只用训练统计/config 校验 + 真实 h5 FeatureAdapter）。**import 约定：src/config/models 三目录平铺，入口 `PYTHONPATH=src:config:models`** | ✅ 完成（本会话，未提交） |
 | **DL 基础设施实施** | `experiments/run_dl.py`（Orchestrator：组装+冻结 RunConfig+dump JSON+SEARCH→Searcher / VALIDATION→定参认证+落 trials/fold_metrics/summary）+ `src/dl_search.py`（采样器 choice/int/uniform + overrides 收窄 + EarlyKillPolicy 钩子桩 + Searcher 排名）+ `RawChannelAdapter`（59 通道）。**seq_len 走 trainer、hidden/layers 走卡带 hparams** 边界写死在 Searcher。21 test 全过 + 真实数据 CLI smoke 跑通。早杀实现仍推后（无 epoch 可杀，等 torch 卡带回调） | ✅ 完成（本会话，未提交） |
 | **README 重写** | 已重写为「DL 工程地基说明 + 代码/文档索引」（DL 规格入口、`config/`/`src/dl_*`/`models/` 结构、import 约定、依赖说明 torch[D1/D2]/psutil[演练]、DL 测试运行方式） | ✅ 完成（本会话，未提交） |
-| **TCN 卡带本体（主攻）** | `models/dl_models.py` 已加 `TCNCartridge`（nn.Module + 因果膨胀卷积残差块 + 训练循环 + 早停，复用 `STRUCTURE_SEARCH_SPACE`、绑 `RAW_CHANNELS`），`run_dl.py` 已打通 device 注入。**验证**：TCN 单测通过 + 真实数据 1 折 1 epoch `device=cuda` smoke 通过。**当前状态**：首轮海选 `20260531_search_tcn_raw_v1` 已后台启动，待产出 `trials.csv / best_config.json` | 🔄 运行中 |
-| **D1 LSTM 卡带（低风险对照，4060 后）** | LSTM 卡带（433 特征当序列，绑 `FEATURE_433`）作对照；`DEEPLOB` 已退役（数据无连续 LOB，规格 §8.0） | 待开（等卡） |
+| **TCN 卡带本体（主攻）** | `models/dl_models.py` 已加 `TCNCartridge`（nn.Module + 因果膨胀卷积残差块 + 训练循环 + 早停，复用 `STRUCTURE_SEARCH_SPACE`、绑 `RAW_CHANNELS`），`run_dl.py` 已打通 device 注入。**海选结论**：4 trial 2 正 2 负，best val_corr=0.01653（seq_len=32, hidden=32, num_layers=4），seq_len=48 全负。**当前状态**：best config 进 expanding validation，后台运行中 | 🔄 expanding 进行中 |
+| **GRU 卡带（第二卡带，FeatureAdapter）** | `GRUCartridge`（`nn.GRU` + 取末步隐藏态 + MSE 训练循环 + 早停）已实现，绑 `AdapterKind.FEATURE_433`（复用 433 工程特征管线），`ModelKind.GRU` 枚举新增。**设计逻辑**：GRU 两门参数少、金融短序列（seq_len≈32）上与 LSTM 持平/更快；喂 433 特征而非 59 raw 通道 = 用传统特征工程给 DL 当先验，与 TCN-on-raw 形成"架构 × 输入"对照实验。**验证**：3 项单测（required_adapter / fit+predict / 不物化全窗口）本机 CPU 通过。**下一步**：Windows 空出来后开 GRU 海选（`--model gru --adapter feature_433`） | ✅ 实现完成，待海选 |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待 ≥32GB 机器实测（本机 16GB 跑不了全窗口） | 🔜 待机器 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |

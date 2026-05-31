@@ -27,7 +27,8 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from dl_models import (  # noqa: E402
-    RawChannelAdapter, ReferencePoolCartridge, IdentityAdapter, STRUCTURE_SEARCH_SPACE, TCNCartridge,
+    RawChannelAdapter, ReferencePoolCartridge, IdentityAdapter, STRUCTURE_SEARCH_SPACE,
+    TCNCartridge, GRUCartridge,
     _PRICE_REL_COLS, _LOG_VOLUME_COLS, _RATIO_COLS,
 )
 from dl_search import EarlyKillPolicy, Searcher, sample_hparams  # noqa: E402
@@ -451,6 +452,78 @@ class TestOrchestrator(unittest.TestCase):
             )
             summary = self._orch(rc, df).run()
             self.assertEqual(summary["status"], "no_folds")
+
+
+# ------------------------------------------------------------------ #
+# 4.6) GRU 卡带（需要 torch，但只测最小接线）
+# ------------------------------------------------------------------ #
+
+class TestGRUCartridge(unittest.TestCase):
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 GRU 接线测试")
+    def test_required_adapter_is_feature_433(self):
+        from adapter_config import AdapterKind
+        self.assertEqual(GRUCartridge.required_adapter, AdapterKind.FEATURE_433)
+
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 GRU 接线测试")
+    def test_fit_and_predict_on_cpu(self):
+        # 用合成双通道数据走 IdentityAdapter → SequenceDataset 链路，
+        # 测卡带接线可训、可预测、输出有限值（不测 FeatureAdapter，后者需真实 h5）。
+        dates = [20230601, 20230602]
+        df = make_synth_seq(dates, n_symbols=4, n_interval=15, label="current", seed=99)
+        arrays = build_sequence_arrays(df, IdentityAdapter(["c0", "c1"]))
+        normalizer = Normalizer("zscore").fit(arrays.features)
+        ds = SequenceDataset(arrays, seq_len=4, normalizer=normalizer)
+
+        cart = GRUCartridge()
+        record = cart.fit(
+            ds, ds,
+            hparams={
+                "device": "cpu",
+                "hidden_size": 8,
+                "num_layers": 1,
+                "dropout": 0.0,
+                "batch_size": 16,
+                "max_epochs": 2,
+                "patience": 2,
+            },
+            seed=42,
+        )
+        pred = cart.predict(ds)
+
+        self.assertGreaterEqual(record.best_epoch, 1)
+        self.assertEqual(record.extra["kind"], "gru")
+        self.assertEqual(pred.shape[0], len(ds))
+        self.assertTrue(np.isfinite(pred).all())
+
+    @unittest.skipUnless(_TORCH_AVAILABLE, "未安装 torch，跳过 GRU 接线测试")
+    def test_fit_does_not_materialize_all_windows(self):
+        # GRU fit 同样走 iter_batches 流式，不得调 gather_all()。
+        dates = [20230601]
+        df = make_synth_seq(dates, n_symbols=3, n_interval=10, label="current", seed=55)
+        arrays = build_sequence_arrays(df, IdentityAdapter(["c0", "c1"]))
+        normalizer = Normalizer("zscore").fit(arrays.features)
+        ds = SequenceDataset(arrays, seq_len=4, normalizer=normalizer)
+
+        def _boom():
+            raise AssertionError("fit 不应调用 gather_all() 物化整窗")
+
+        ds.gather_all = _boom  # type: ignore[method-assign]
+
+        cart = GRUCartridge()
+        record = cart.fit(
+            ds, ds,
+            hparams={
+                "device": "cpu",
+                "hidden_size": 4,
+                "num_layers": 1,
+                "dropout": 0.0,
+                "batch_size": 8,
+                "max_epochs": 1,
+                "patience": 1,
+            },
+            seed=7,
+        )
+        self.assertGreaterEqual(record.best_epoch, 1)
 
 
 if __name__ == "__main__":

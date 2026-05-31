@@ -709,3 +709,224 @@ class TCNCartridge(ModelCartridge):
                 pred = self._model(x).detach().cpu().numpy().astype(np.float32)
                 preds.append(pred)
         return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)
+
+
+def _build_gru_module(input_channels: int, hidden_size: int, num_layers: int, dropout: float):
+    """
+    构造轻量 GRU 回归头。
+
+    设计选择与 TCN 对称保守：
+    - nn.GRU（batch_first=True）接收 [B, L, C]，取**末步输出**（等价于最后层最后时刻隐藏态）；
+    - 末步天然因果：GRU 从左到右顺序处理，t=L 时刻已积累全窗上下文，不跨越标签时刻；
+    - 不加 LayerNorm / Attention 等附件——FeatureAdapter 已经过脊柱 zscore 白化，量纲一致；
+    - dropout 仅在 num_layers > 1 时有效（PyTorch 限制，单层 dropout 静默忽略）。
+    """
+    torch, nn, _ = _require_torch()
+
+    class GRURegressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            gru_drop = float(dropout) if int(num_layers) > 1 else 0.0
+            self.gru = nn.GRU(
+                input_size=int(input_channels),
+                hidden_size=int(hidden_size),
+                num_layers=int(num_layers),
+                batch_first=True,
+                dropout=gru_drop,
+            )
+            self.head = nn.Linear(int(hidden_size), 1)
+
+        def forward(self, x):
+            # x: [B, L, C]；GRU 输出 (output[B,L,H], h_n[num_layers,B,H])
+            # output[:, -1, :] == h_n[-1]（最后层、最后时刻），语义更直观。
+            output, _ = self.gru(x)
+            last = output[:, -1, :]          # [B, H]
+            return self.head(last).squeeze(-1)  # [B]
+
+    return GRURegressor()
+
+
+@register_model(ModelKind.GRU)
+class GRUCartridge(ModelCartridge):
+    """
+    第二卡带：GRU-on-433工程特征。
+
+    与 TCNCartridge 形成"架构 × 输入"对照：
+    - TCN 喂 59 个原始微结构通道，让网络自学交互；
+    - GRU 喂 433 个工程特征，把传统特征工程的先验直接注入 DL。
+
+    required_adapter 固定 FEATURE_433：
+    - 用传统侧已沉淀的截面归一化特征（cross-z / cross-rank / OFI / 动量等）；
+    - FeatureAdapter 复用 SubmissionFeaturePipeline，train/serve 同口径，无 skew 风险。
+
+    训练策略与 TCNCartridge 完全一致（MSE + AdamW + 早停 + 梯度裁剪），降低对照噪声。
+    """
+
+    search_space: ClassVar[Dict] = STRUCTURE_SEARCH_SPACE
+    required_adapter = AdapterKind.FEATURE_433
+
+    def __init__(self):
+        self._torch = None
+        self._model = None
+        self._device = "cpu"
+        self._fallback_bias = 0.0
+        self._fitted = False
+
+    @classmethod
+    def from_config(cls, model_config) -> "GRUCartridge":
+        return cls()
+
+    @staticmethod
+    def _default_hparams(hparams: Dict) -> Dict:
+        merged = {
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.10,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "batch_size": 256,
+            "max_epochs": 20,
+            "patience": 4,
+            "grad_clip": 1.0,
+            "device": "auto",
+        }
+        merged.update(dict(hparams or {}))
+        return merged
+
+    def _eval_loss(self, ds, loss_fn) -> float:
+        torch = self._torch
+        if len(ds) == 0:
+            return float("inf")
+        total = 0.0
+        count = 0
+        self._model.eval()
+        with torch.no_grad():
+            for xb, yb in ds.iter_batches(batch_size=512, shuffle=False):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
+                pred = self._model(x)
+                total += float(loss_fn(pred, y).item()) * len(yb)
+                count += len(yb)
+        return total / max(count, 1)
+
+    def fit(self, train_ds, earlystop_ds, hparams: Dict, seed: int) -> TrainRecord:
+        torch, nn, _ = _require_torch()
+        cfg = self._default_hparams(hparams)
+        self._torch = torch
+        self._device = _resolve_torch_device(torch, cfg.get("device", "auto"))
+
+        t0 = time.time()
+        if len(train_ds) == 0:
+            self._model = None
+            self._fitted = True
+            self._fallback_bias = 0.0
+            return TrainRecord(
+                train_curve=[0.0],
+                earlystop_curve=[0.0] if len(earlystop_ds) else [],
+                best_epoch=0, n_epochs=1,
+                fit_seconds=time.time() - t0,
+                extra={"kind": "gru", "empty": True, "device": self._device},
+            )
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+        self._model = _build_gru_module(
+            input_channels=train_ds.n_channels,
+            hidden_size=int(cfg["hidden_size"]),
+            num_layers=int(cfg["num_layers"]),
+            dropout=float(cfg["dropout"]),
+        ).to(self._device)
+
+        optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=float(cfg["lr"]),
+            weight_decay=float(cfg["weight_decay"]),
+        )
+        loss_fn = nn.MSELoss()
+        batch_size = int(cfg["batch_size"])
+        max_epochs = int(cfg["max_epochs"])
+        patience = int(cfg["patience"])
+        grad_clip = float(cfg["grad_clip"])
+
+        best_metric = float("inf")
+        best_epoch = 0
+        best_state = None
+        no_improve = 0
+        train_curve: List[float] = []
+        early_curve: List[float] = []
+
+        # 兜底偏置：只取 label 列均值，不物化整窗 X[B,L,C]。
+        train_labels = train_ds.label_frame()["fret12"].to_numpy(dtype=np.float32)
+        self._fallback_bias = float(np.mean(train_labels)) if len(train_labels) else 0.0
+
+        for epoch in range(1, max_epochs + 1):
+            self._model.train()
+            total = 0.0
+            count = 0
+            for xb, yb in train_ds.iter_batches(batch_size=batch_size, shuffle=True, seed=int(seed) + epoch):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
+                optimizer.zero_grad(set_to_none=True)
+                pred = self._model(x)
+                loss = loss_fn(pred, y)
+                loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=grad_clip)
+                optimizer.step()
+                total += float(loss.item()) * len(yb)
+                count += len(yb)
+
+            train_loss = total / max(count, 1)
+            train_curve.append(train_loss)
+
+            if len(earlystop_ds) > 0:
+                metric = self._eval_loss(earlystop_ds, loss_fn)
+                early_curve.append(metric)
+            else:
+                metric = train_loss
+
+            if metric + 1e-8 < best_metric:
+                best_metric = metric
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+
+        self._fitted = True
+        return TrainRecord(
+            train_curve=train_curve,
+            earlystop_curve=early_curve,
+            best_epoch=best_epoch,
+            n_epochs=len(train_curve),
+            fit_seconds=time.time() - t0,
+            extra={
+                "kind": "gru",
+                "device": self._device,
+                "hidden_size": int(cfg["hidden_size"]),
+                "num_layers": int(cfg["num_layers"]),
+            },
+        )
+
+    def predict(self, ds) -> np.ndarray:
+        if len(ds) == 0:
+            return np.zeros(0, dtype=np.float32)
+        if not self._fitted or self._model is None:
+            return np.full(len(ds), self._fallback_bias, dtype=np.float32)
+
+        torch = self._torch
+        preds: List[np.ndarray] = []
+        self._model.eval()
+        with torch.no_grad():
+            for xb, _ in ds.iter_batches(batch_size=512, shuffle=False):
+                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
+                pred = self._model(x).detach().cpu().numpy().astype(np.float32)
+                preds.append(pred)
+        return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)
