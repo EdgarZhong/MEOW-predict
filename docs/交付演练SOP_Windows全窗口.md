@@ -15,36 +15,40 @@
 
 ## Part A — 迁移到 Windows
 
-### A1. 取仓库
-二选一：
-- **git（推荐）**：在 Windows 上 `git clone <仓库地址>`，再 `git checkout master`（内存精简已在 master）。
-- **直接拷贝**：把整个 `MEOW--predict/` 目录拷到 Windows（U 盘 / 网盘 / scp 均可）。
+### A1. 拷贝仓库
 
-### A2. 放数据
-把训练+评测全窗口的 h5 放到仓库的 `data/` 下（或放别处、运行时用 `MEOW_DATA_DIR` 指过去）：
-- 训练：`20230601` ~ `20231130` 之间**所有交易日**的 `<date>.h5`
-- 评测：`20231201` ~ `20231229` 之间**所有交易日**的 `<date>.h5`
-- 缺任何一个交易日的文件，运行会直接报错（`loadDate`/`countDate` 找不到文件）。Mac 本机 `data/` 现有 144 个 h5 已覆盖全窗口，可直接整目录拷过去。
+在 Mac 上打包（排除 Python 缓存和特征缓存）：
+```bash
+cd ~/code
+tar czf MEOW--predict.tar.gz \
+  --exclude='__pycache__' \
+  --exclude='data/features' \
+  MEOW--predict/
+```
+把生成的 `MEOW--predict.tar.gz` 传到 Windows（U 盘 / 网盘 / scp 均可），解压即用。
+
+包含内容：全部代码 + `.git/` 历史 + `data/*.h5` 原始数据 + `results/` + `logs/` + `.archive/`。
+排除内容：`__pycache__`（跨平台无意义）、`data/features/`（特征缓存，交付链不依赖，运行时自动现算）。
+
+### A2. 数据确认
+拷贝后 `data/` 目录下应有 144 个 `.h5` 文件，覆盖 `20230601` ~ `20231229` 所有交易日。
+缺任何一个交易日的文件，运行会直接报错。
 
 ### A3. Python 环境（PowerShell）
-用 Python 3.13（与开发环境一致）。在仓库根目录：
 ```powershell
-py -3.13 -m venv .venv
+cd MEOW--predict
+py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
-pip install numpy pandas scikit-learn lightgbm tables psutil
+pip install -r requirements.txt
+# 演练脚本额外需要 psutil（采样内存峰值用，不进正式提交依赖）
+pip install psutil
 ```
-说明：
-- `tables` = PyTables（读 h5 必需，且本次内存优化靠它只读 `axis1` 轴元信息廉价拿行数）。
-- `lightgbm` pip wheel 自带 CPU 版即可（提交链用的是 CPU lgbm，不需要 GPU）。
-- `psutil` 仅演练脚本用于采样内存峰值，不进正式提交依赖。
 
 ### A4. 装好自检（可选但建议）
 ```powershell
-python -c "import numpy,pandas,sklearn,lightgbm,tables,psutil;print('deps ok')"
-python -m unittest tests.test_submission_pipeline
+python -c "import numpy,pandas,sklearn,lightgbm,tables;print('deps ok')"
 ```
-单测应全过（含 `test_fit_window_matches_fit` / `test_streaming_build_matches_naive_concat`）。
 
 ---
 
@@ -55,7 +59,7 @@ python -m unittest tests.test_submission_pipeline
 python experiments\run_submission_full_window.py
 ```
 - 默认就是全窗口：训练 `20230601–20231130`、评测 `20231201–20231229`。
-- 数据若不在 `data/` 下，先设：`$env:MEOW_DATA_DIR = "D:\path\to\data"`，再跑上面那条。
+- 数据若不在 `data/` 下，打开 `meow/meow.py` 底部把 `h5dir = ...` 改成实际路径即可。
 - 全程自动：现算特征 → fit 两成员（X1 先、lgbm 末位）→ eval(Dec) → 打印峰值汇总。
 - **耗时**：取决于 CPU，整窗 lgbm + ridge 训练大致十几分钟到半小时量级，放着别管。
 

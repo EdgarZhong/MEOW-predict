@@ -129,13 +129,11 @@ class MeowEngine(object):
 
 
 if __name__ == "__main__":
-    # 默认优先读环境变量，便于老师或本地脚本临时覆盖数据路径；
-    # 若未设置，则直接回退到仓库根目录下的 `data/`，保证在本仓库里 `python meow.py` 可直接跑。
-    default_h5dir = os.environ.get("MEOW_DATA_DIR", str((THIS_DIR.parent / "data").resolve()))
-    train_start = int(os.environ.get("MEOW_TRAIN_START", "20230601"))
-    train_end = int(os.environ.get("MEOW_TRAIN_END", "20231130"))
-    eval_start = int(os.environ.get("MEOW_EVAL_START", "20231201"))
-    eval_end = int(os.environ.get("MEOW_EVAL_END", "20231229"))
-    engine = MeowEngine(h5dir=default_h5dir, cacheDir=None)
-    engine.fit(train_start, train_end)
-    engine.eval(eval_start, eval_end)
+    # ========== 老师改这里 ==========
+    # h5dir: 所有 .h5 数据文件所在目录（训练+评测共用同一目录，按日期参数区分）
+    # fit(start, end): 训练区间
+    # eval(start, end): 评测区间
+    h5dir = str((THIS_DIR.parent / "data").resolve())  # ← 改成实际数据目录路径
+    engine = MeowEngine(h5dir=h5dir, cacheDir=None)
+    engine.fit(20230601, 20231130)
+    engine.eval(20231201, 20231229)

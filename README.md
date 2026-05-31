@@ -40,10 +40,31 @@ MEOW--predict/
     └── archived/              # 历史快照（只读）
 ```
 
+## Quick Start（老师验收用）
+
+只需三步：
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 打开 meow/meow.py，修改 __main__ 中的 h5dir 指向数据目录
+#    所有 .h5 文件（6-12月）放在同一个目录即可，训练/评测按日期参数自动区分
+
+# 3. 运行
+cd meow && python meow.py
+```
+
+运行后会依次执行：
+- `fit(20230601, 20231130)` — 用 6-11 月数据训练（两成员融合：Ridge + LightGBM）
+- `eval(20231201, 20231229)` — 用 12 月数据评测，输出 Pearson / R² / MSE
+
+如需修改训练/评测区间，直接改 `meow.py` 底部的日期参数即可。
+
 ## 运行环境
 
-- Python 3.13（mise 全局环境）
-- 依赖：`pip install --system numpy pandas scikit-learn tables`
+- Python >= 3.8
+- 依赖：`pip install -r requirements.txt`（numpy / pandas / scikit-learn / lightgbm / tables）
 
 ## 运行方式
 
