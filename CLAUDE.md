@@ -98,12 +98,13 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 | **新评测协议落 run_config** | `AGENTS.md §十一` 协议已落代码：`Stage.SWEEP` 一命令两档（档1 小网格×近2折×2seed 按最坏折选冠军 → 档2 冠军×5折×3seed）+ `build_dl_folds(fold_select="recent")`（自 Dec 倒贴五段不重合、锚定扩展、embargo 已等价 purge）+ `enumerate_grid`（确定性网格）+ 最坏折/R² 双镜头读数 + `--device/--grid-*` CLI。34 test 全过 + 真实数据 CLI 端到端跑通 | ✅ 完成 |
 | **截面模型方案（主攻）** | **方案已拍板落档**（`NOTE.md`「截面模型怎么设计」+ 规格 §8.2）：因子化两腿 = 共享 GRU 时序腿（每票日内路径编码）+ set-attention 截面腿（跨票、置换等变零身份、残差接）+ per-票头；`MSE+λ·corr` 截面对齐；张量契约 `[L,C]`→整截面 `[N,L,C]`+mask（WindowIndexer 按 (date,interval) 聚票、Normalizer 加截面 z）。业界 STGNN/关系排序同构、为什么不用时空联合/图网络已记 | ✅ 方案完成 |
 | **截面模型卡带（主攻，待实现）** | 实现 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 FEATURE_433）+ WindowIndexer/Normalizer 截面泛化，接已跑通的 SWEEP；下一程。时间盒：周中 ③ + ② 都无正信号超传统保底则回落保底 | 🔜 下一程 |
-| **GRU-on-433 基线 + 损失对齐** | **正式跑进行中**（run `20260601_sweep_gru433_v1`，2026-06-01 13:43 起）：走 SWEEP 新 rolling、纯 MSE（λ=0），档1筛选已完成 7/8 组合（`trials.csv` 约 19:10 落、`summary.json` 约 23:30+ 落）；资源全程健康（GPU 78–94% / 显存 6.4/8GB / RSS ~21GB，无 OOM）。早上看：均值 vs 0.0776、最坏折 vs 0.0491、R² 是否逼近 0、种子离散。`MSE+λ·corr`(λ∈{0,0.3}) 下一晚加 | 🔄 进行中 |
+| **GRU-on-433 基线 + 损失对齐** | **正式跑进行中**（run `20260601_sweep_gru433_v1`，2026-06-01 13:43 起）：走 SWEEP 新 rolling、纯 MSE（λ=0），档1筛选已完成 7/8 组合（`trials.csv` 约 19:10 落、`summary.json` 约 23:30+ 落）；资源全程健康（GPU 78–94% / 显存 6.4/8GB / RSS ~21GB，无 OOM）。早上看（**先单独看 DL 自身深度、不与传统正式取舍**——折口径不对齐，见 `AGENTS.md §11.9`）：绝对水平、最坏折、R² 是否逼近 0、种子离散；传统 0.0776 / 0.0803 **仅作大致参考判推进方向**。要正式对决须先统一折（传统重评 recent 5 折 或 DL 补 Dec 整月对齐折）。`MSE+λ·corr`(λ∈{0,0.3}) 下一晚加 | 🔄 进行中 |
 | **正式结果同步目录（双机追踪）** | 根目录新增 `tracked_results/`，专门提交“小体量、正式、可复盘”的结果文件；首批纳入 TCN search / TCN expanding / 传统 Dec 全窗口 sanity 指标，供双机同步与后续深挖分析 | ✅ 已建立 |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待实测（**本机已核实 ~34GB**，非旧记 16GB；满足 ≥32GB，可本机试） | 🔜 待实测 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
 | 交付接线 — fit/predict 签名核验 | 对照 `meow/MEOW金融时序预测2.0.docx` 确认 `MeowEngine.fit/eval/predict` 能让老师替换路径跑通（predict 当前接特征帧，老师可能按路径取数）。代码侧已确认无藏划分器、全量训练。**另起会话专办** | 🔜 遗留（另会话） |
+| **run_dl 增量落盘（防中断打水漂）** | 当前 SWEEP 是"全算完才落盘"（档1全跑完才写 `trials.csv`、档2全跑完才写 `summary.json` `run_dl.py:260/289/305`），中途崩则已完成的 fit **全丢**。改为**每 trial / 每折完成即增量追加落盘 + flush**（`trials.csv` 逐 trial、`fold_metrics.csv` 逐折），崩溃也留下已跑部分的价值。**现在不动代码，等 `20260601_sweep_gru433_v1` 跑完再实施** | 🔜 待实现（跑完再做） |
 | 传统后续优化（推迟，保留方向） | lgbm HPO / 小波→GBDT / MLP——上限有限，战略转型后推迟，有空才碰 | 🅿️ 推迟 |
 | 🚩红线（口径更新） | 传统 Final（12 月）三层口径未碰；**DL 新协议（§十一）改用锚定扩展 walk-forward，Dec 进 rolling 当最近折用满**（交付=方法非权重，无权重 lockbox） | 口径已改 |
 
