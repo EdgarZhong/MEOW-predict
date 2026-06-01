@@ -38,6 +38,7 @@ import numpy as np  # noqa: E402
 from dl_protocol import DLFold, assert_folds_causal, build_dl_folds, summarize_folds  # noqa: E402
 from dl_search import EarlyKillPolicy, Searcher, enumerate_grid  # noqa: E402
 from dl_trainer import SequenceTrainer  # noqa: E402
+from feature_store import DEFAULT_FEATURE_DIR  # noqa: E402
 from registry import build_adapter, build_cartridge  # noqa: E402
 from protocol_config import ProfileKind, Stage  # noqa: E402
 
@@ -60,12 +61,18 @@ class Orchestrator:
         *,
         raw_loader: Optional[Callable[[Sequence[int]], object]] = None,
         h5dir: str = "data",
+        feature_dir: str = DEFAULT_FEATURE_DIR,
         adapter=None,
         cartridge_factory: Optional[Callable[[], object]] = None,
     ):
         self.cfg = run_config
+        self.h5dir = h5dir
+        self.feature_dir = feature_dir
         # 依赖注入：默认从 registry + MeowDataLoader 构建；测试可注入合成 loader / 参考卡带。
         self.adapter = adapter if adapter is not None else build_adapter(run_config.adapter)
+        if hasattr(self.adapter, "bind_data_sources"):
+            # 让像 FeatureAdapter 这样的实验型适配器拿到当前 run 的 h5/cache 根目录。
+            self.adapter.bind_data_sources(h5dir=self.h5dir, feature_dir=self.feature_dir)
         self.cartridge_factory = cartridge_factory or (lambda: build_cartridge(run_config.model))
         self.raw_loader = raw_loader or self._default_raw_loader(h5dir)
 
@@ -437,6 +444,8 @@ def main(argv=None):
     ap.add_argument("--grid-layers", default="", help="SWEEP 收窄 num_layers 网格（如 1,2）")
     ap.add_argument("--out-dir", default="results/dl")
     ap.add_argument("--h5dir", default="data")
+    ap.add_argument("--feature-dir", default=DEFAULT_FEATURE_DIR,
+                    help="实验链特征缓存根目录（feature_433 优先从这里读取）")
     ap.add_argument("--max-symbols", type=int, default=20,
                     help="抽前 N 个 symbol 控内存（参考卡带 gather_all 用）；<=0 = 不抽样")
     args = ap.parse_args(argv)
@@ -445,7 +454,12 @@ def main(argv=None):
     raw_loader = None
     if args.max_symbols and args.max_symbols > 0:
         raw_loader = _wrap_max_symbols(args.h5dir, args.max_symbols)
-    orch = Orchestrator(rc, raw_loader=raw_loader, h5dir=args.h5dir)
+    orch = Orchestrator(
+        rc,
+        raw_loader=raw_loader,
+        h5dir=args.h5dir,
+        feature_dir=args.feature_dir,
+    )
     summary = orch.run()
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return summary

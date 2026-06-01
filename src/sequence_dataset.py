@@ -165,6 +165,94 @@ def build_sequence_arrays(
     )
 
 
+def build_sequence_arrays_from_frames(
+    xdf: pd.DataFrame,
+    ydf: Optional[pd.DataFrame],
+    channels: Sequence[str],
+    target_col: str = TARGET_COL,
+    meta_cols: Sequence[str] = META_COLS,
+) -> SequenceArrays:
+    """
+    用“已加载好的特征表 + 标签表”直接组装 ``SequenceArrays``。
+
+    这个入口是给**实验链的磁盘特征缓存**准备的：
+    - 传统评测 / 新 DL 实验都可以先把 433 特征落到 ``data/features/``；
+    - 之后按日期从 ``FeatureLoader`` 直接读 ``xdf/ydf``，这里负责把它们收口成
+      DL 脊柱统一消费的 ``SequenceArrays``；
+    - 这样做能避免每个 fold 再从 raw 重算 433 特征，同时又不碰正式提交链
+      ``meow.py`` 的“raw 现算”契约。
+
+    约束与校验：
+    - ``xdf`` / ``ydf`` 都必须遵守主链统一行序：``(date, symbol, interval)`` 稳定排序。
+    - ``xdf`` 里必须完整包含 ``channels`` 指定的列，且按传入顺序锁定 C 维布局。
+    - ``ydf`` 可为 ``None``；这代表 serve/无标签场景，函数会按既有口径补全 0 标签并把
+      ``has_label`` 记为 ``False``。
+    """
+    meta_cols = list(meta_cols)
+    missing_meta = [col for col in meta_cols if col not in xdf.columns]
+    if missing_meta:
+        raise KeyError(f"xdf 缺少必要 meta 列: {missing_meta}")
+
+    missing_channels = [col for col in channels if col not in xdf.columns]
+    if missing_channels:
+        raise KeyError(
+            "xdf 缺少指定通道列，无法组装 SequenceArrays；"
+            f"例如: {missing_channels[:5]}"
+        )
+
+    x_sorted = (
+        xdf.loc[:, meta_cols + list(channels)]
+        .sort_values(meta_cols, kind="mergesort")
+        .reset_index(drop=True)
+        .copy()
+    )
+    features = x_sorted.loc[:, list(channels)].to_numpy(dtype=np.float32, copy=True)
+    dates = x_sorted["date"].to_numpy()
+    symbols = x_sorted["symbol"].to_numpy()
+    intervals = x_sorted["interval"].to_numpy()
+
+    if ydf is None:
+        labels = np.zeros(len(x_sorted), dtype=np.float32)
+        has_label = False
+    else:
+        missing_y_meta = [col for col in meta_cols if col not in ydf.columns]
+        if missing_y_meta:
+            raise KeyError(f"ydf 缺少必要 meta 列: {missing_y_meta}")
+        if target_col not in ydf.columns:
+            raise KeyError(f"ydf 缺少目标列: {target_col}")
+
+        y_sorted = (
+            ydf.loc[:, meta_cols + [target_col]]
+            .sort_values(meta_cols, kind="mergesort")
+            .reset_index(drop=True)
+            .copy()
+        )
+        if len(y_sorted) != len(x_sorted):
+            raise ValueError(
+                "xdf / ydf 行数不一致，无法安全对齐；"
+                f"xdf={len(x_sorted)} ydf={len(y_sorted)}"
+            )
+        if not x_sorted.loc[:, meta_cols].equals(y_sorted.loc[:, meta_cols]):
+            raise ValueError("xdf / ydf 的 (date,symbol,interval) 行序不一致，疑似特征缓存错位")
+        labels = (
+            pd.to_numeric(y_sorted[target_col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32)
+        )
+        has_label = True
+
+    return SequenceArrays(
+        features=features,
+        labels=labels,
+        dates=dates,
+        symbols=symbols,
+        intervals=intervals,
+        channels=list(channels),
+        has_label=has_label,
+    )
+
+
 def subset_by_dates(arrays: SequenceArrays, dates: Sequence[int]) -> SequenceArrays:
     """
     按交易日子集切 ``SequenceArrays``（保持原行序）。
@@ -268,32 +356,98 @@ class Normalizer:
         self._std: Optional[np.ndarray] = None    # [C]
         self._fitted = False
 
+    # 分块步长：fit/transform 都按这个行数切块处理，把任一中间副本的峰值钉在
+    # ``CHUNK_ROWS × C`` 量级（百 MB），与训练集总行数（百万级）解耦。
+    CHUNK_ROWS = 200_000
+
     # ---- 单张张量的核心实现（多张量时对每个 key 复用） ---- #
-    def _fit_single(self, features: np.ndarray) -> None:
-        x = np.nan_to_num(np.asarray(features, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        self._mean = x.mean(axis=0)
-        std = x.std(axis=0)
+    def _fit_chunks_single(self, feature_chunks) -> None:
+        """
+        **分块累计** per-channel mean/std，绝不物化整张 nan_to_num 副本。
+
+        旧实现 ``nan_to_num(整张[N,C])`` 会再造一份 ~14GB（119 天全票折）副本，直接把
+        内存打穿。这里改为逐块（``CHUNK_ROWS`` 行）nan_to_num + float64 累加 count/sum/
+        sumsq，最后合成 mean/std——统计值与整块计算逐位等价，但中间副本只有百 MB 级。
+
+        ``feature_chunks``：一组 ``[n_i, C]`` 数组（如 [core.features, es.features]），
+        被当作"训练区拼起来"一并统计，但**不真的 concatenate**，省掉一份全量副本。
+        """
+        C = None
+        count = 0
+        ssum = None
+        sqsum = None
+        for arr in feature_chunks:
+            if arr is None:
+                continue
+            a = np.asarray(arr)
+            if a.shape[0] == 0:
+                continue
+            if C is None:
+                C = a.shape[1]
+                ssum = np.zeros(C, dtype=np.float64)
+                sqsum = np.zeros(C, dtype=np.float64)
+            for s in range(0, a.shape[0], self.CHUNK_ROWS):
+                blk = np.nan_to_num(
+                    a[s:s + self.CHUNK_ROWS].astype(np.float32, copy=False),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+                count += blk.shape[0]
+                ssum += blk.sum(axis=0, dtype=np.float64)
+                sqsum += np.square(blk, dtype=np.float64).sum(axis=0)
+        if C is None or count == 0:
+            # 无任何训练数据：留空 mean/std，transform 时退化为只 nan_to_num、不缩放。
+            self._mean = None
+            self._std = None
+            return
+        mean = ssum / count
+        var = np.maximum(sqsum / count - mean ** 2, 0.0)
+        std = np.sqrt(var)
         # 常量/近常量通道：std 置 1，等价于"只去均值不缩放"，避免除零爆炸。
         std = np.where(std < self.eps, 1.0, std)
+        self._mean = mean
         self._std = std
 
-    def _transform_single(self, features: np.ndarray) -> np.ndarray:
-        x = np.nan_to_num(np.asarray(features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        if self.mode == "identity":
-            return x
-        return ((x - self._mean) / self._std).astype(np.float32)
+    def _transform_single(self, features: np.ndarray, inplace: bool = False) -> np.ndarray:
+        """
+        逐块原地白化。
+
+        ``inplace=True``（训练热路径用）：直接在传入的 ``features`` 缓冲上改写，
+        **不再产生第二份 [N,C] 副本**——这是把 119 天折峰值从"好几份 14GB"压到"一份"
+        的关键。调用方需保证这份 ``features`` 之后不再以原始值复用（脊柱已满足）。
+        """
+        x = np.asarray(features, dtype=np.float32)
+        if not inplace:
+            x = x.copy()
+        do_scale = self.mode == "zscore" and self._mean is not None and self._mean.shape[0] == x.shape[1]
+        mean_f32 = self._mean.astype(np.float32) if do_scale else None
+        std_f32 = self._std.astype(np.float32) if do_scale else None
+        # 逐块：块内 nan_to_num(copy=False 原地) + 仿射原地，全程不产生整张临时。
+        for s in range(0, x.shape[0], self.CHUNK_ROWS):
+            blk = x[s:s + self.CHUNK_ROWS]
+            np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            if do_scale:
+                blk -= mean_f32
+                blk /= std_f32
+        return x
 
     # ---- 对外接口 ---- #
     def fit(self, features: np.ndarray) -> "Normalizer":
         if self.mode == "zscore":
-            self._fit_single(features)
+            self._fit_chunks_single([features])
         self._fitted = True
         return self
 
-    def transform(self, features: np.ndarray) -> np.ndarray:
+    def fit_chunked(self, feature_chunks) -> "Normalizer":
+        """对一组特征块（不 concatenate）统一 fit，省掉一份全量训练副本。"""
+        if self.mode == "zscore":
+            self._fit_chunks_single(list(feature_chunks))
+        self._fitted = True
+        return self
+
+    def transform(self, features: np.ndarray, inplace: bool = False) -> np.ndarray:
         if self.mode == "zscore" and not self._fitted:
             raise RuntimeError("Normalizer(zscore) 未 fit 就 transform —— 可能泄漏或用错顺序")
-        return self._transform_single(features)
+        return self._transform_single(features, inplace=inplace)
 
     def fit_transform(self, features: np.ndarray) -> np.ndarray:
         return self.fit(features).transform(features)
@@ -319,6 +473,7 @@ class SequenceDataset:
         arrays: SequenceArrays,
         seq_len: int,
         normalizer: Optional[Normalizer] = None,
+        own_features: bool = False,
     ):
         self.arrays = arrays
         self.seq_len = int(seq_len)
@@ -326,7 +481,10 @@ class SequenceDataset:
         self.label_rows = self._indexer.build_index(arrays)
         # normalizer 默认 identity（未 fit 也能用），实战由协议层注入已 fit 的 zscore。
         self.normalizer = normalizer if normalizer is not None else Normalizer(mode="identity")
-        self._feats = self.normalizer.transform(arrays.features)  # [N, C]，已白化
+        # own_features=True：本 dataset 独占这份 arrays，可**原地**白化、不再另造一份 [N,C]
+        # 副本（训练热路径用，把 119 天全票折的内存峰从"好几份 14GB"压到"一份"）。
+        # 默认 False：拷贝白化，保持旧语义（合成测试可能复用同一 arrays、不容就地改）。
+        self._feats = self.normalizer.transform(arrays.features, inplace=own_features)  # [N, C]，已白化
         # 窗口内相对偏移：[-(L-1), ..., 0]，加在末行号上即整窗行号。
         self._offsets = np.arange(-(self.seq_len - 1), 1, dtype=np.int64)
 
@@ -351,6 +509,24 @@ class SequenceDataset:
     def _gather_rows(self, label_rows: np.ndarray) -> np.ndarray:
         """由窗口末行号批量构造整窗行号矩阵 ``[B, L]``。"""
         return label_rows[:, None] + self._offsets[None, :]
+
+    # ---- GPU-gather 快路径所需的「原料」访问器（脊柱仍 torch-free） ---- #
+    # 背景：小模型（GRU hidden 32~128）在 GPU 上算一拍就完，若每个 batch 还在 CPU 上
+    # 用 numpy fancy-index 现拼 [B, L, C] 再 H2D 拷上卡，GPU 会被 CPU 拼数据饿死、利用率
+    # 长期个位数。解法是把**整张归一化特征矩阵 + 窗口索引**一次性交给卡带，由卡带搬上
+    # GPU、在 GPU 上做窗口 gather。这里只负责暴露 numpy 原料，绝不引入 torch——torch 仍
+    # 封死在卡带内（规格 §2.3「脊柱 torch-free」）。
+    def feature_matrix(self) -> np.ndarray:
+        """已白化的整张特征矩阵 ``[N, C]`` float32（与 gather 出来的窗口同源）。"""
+        return self._feats
+
+    def window_labels(self) -> np.ndarray:
+        """每个合法窗口末行的标签 ``[num_windows]`` float32，与 ``label_rows`` 同序。"""
+        return self.arrays.labels[self.label_rows].astype(np.float32, copy=False)
+
+    def window_offsets(self) -> np.ndarray:
+        """窗内相对偏移 ``[-(L-1), ..., 0]``，加在 ``label_rows`` 上即整窗行号。"""
+        return self._offsets
 
     def gather_all(self) -> Tuple[np.ndarray, np.ndarray]:
         """一次性取全部窗口：``(X[B, L, C] float32, y[B] float32)``。小数据/参考模型用。"""

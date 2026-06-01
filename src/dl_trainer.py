@@ -25,6 +25,7 @@ torch-free 且不反向依赖卡带目录。具体卡带/适配器由 Orchestrat
 from __future__ import annotations
 
 import json
+import sys
 import time
 from typing import Callable, Dict, Optional, Sequence
 
@@ -83,6 +84,30 @@ class SequenceTrainer(BaseTrainer):
 
     # ---- 数据 ---- #
     def _build_arrays(self, dates: Sequence[int]) -> SequenceArrays:
+        """
+        构造某段日期的 ``SequenceArrays``。
+
+        默认路径仍是：
+        ``raw_loader(dates) -> build_sequence_arrays(raw_df, adapter)``。
+
+        但对 ``FeatureAdapter`` 这类已经能**按日期直接从磁盘特征缓存取数**的适配器，
+        优先走 ``adapter.load_sequence_arrays(dates)``，原因有二：
+        1. rolling / sweep 多折高度重叠时，433 特征是最贵的 CPU 开销，不该每折重算；
+        2. 若仍先把整段 raw 读进来，再让适配器自己忽略 raw 去读缓存，会产生“双份 IO +
+           双份内存”的纯浪费。
+
+        兜底策略：
+        - 若缓存入口不存在，或本机尚未建好 ``data/features/``，则回退到旧的 raw 现算链；
+        - 这样测试/提交桥接仍可继续工作，但正式实验只要缓存一旦备好，就自然走快路径。
+        """
+        load_cached = getattr(self.adapter, "load_sequence_arrays", None)
+        if callable(load_cached):
+            try:
+                return load_cached(dates)
+            except FileNotFoundError:
+                # 仅把“缓存尚未准备好”视为可兜底情形；其它异常（列错位、manifest 损坏、
+                # 读文件失败）都应该原样抛出，避免 silently 跑回慢路径掩盖问题。
+                pass
         raw = self.raw_loader(list(dates))
         return build_sequence_arrays(raw, self.adapter)
 
@@ -90,27 +115,54 @@ class SequenceTrainer(BaseTrainer):
     def run_on_dl_fold(self, fold: DLFold, profile_name: str = "dl") -> FoldResult:
         start_ts = time.time()
         try:
-            # 1) 训练区一次现算，按 date 掩码拆 core / earlystop（不重算特征）。
-            train_arrays = self._build_arrays(fold.train_dates)
-            # 2) Normalizer 只用训练区（core+es 都属训练区，无泄漏）fit，再套到全部。
-            normalizer = Normalizer(self.normalizer_mode).fit(train_arrays.features)
-            core_arrays = subset_by_dates(train_arrays, fold.train_core_dates)
-            es_arrays = subset_by_dates(train_arrays, fold.earlystop_dates)  # 空 dates → 空 arrays
+            # 分阶段计时：把每折 wall-clock 拆成「数据准备(GPU 空) vs fit(GPU 忙)」，
+            # 一行打到 stderr（flush，不被重定向缓冲），用来定位"GPU 起来一段又长时间
+            # 沉默"到底沉默在哪——是读盘 / 归一化 / 建集 / 还是算指标。
+            _t: Dict[str, float] = {}
+            _m = time.time()
+            # 1) 直接按 core / earlystop / scoring 三段**分别**现算，避免"先建整训练帧再 subset"
+            #    造成的 14GB + 12GB 双份共存（119 天全票折会因此 OOM）。三段日期互斥，
+            #    core+es 并集 = 原训练区，统计口径不变、无泄漏。
+            core_arrays = self._build_arrays(fold.train_core_dates)
+            # earlystop 可能为空：用空切分得到形状对的空 arrays（_build_arrays 不接受空日期）。
+            es_arrays = (self._build_arrays(fold.earlystop_dates)
+                         if fold.earlystop_dates else subset_by_dates(core_arrays, ()))
             score_arrays = self._build_arrays(fold.scoring_dates)
+            _t["load"] = time.time() - _m; _m = time.time()
+            # 2) Normalizer 只用训练区(core+es)统计，**分块 fit、不 concatenate、不物化整张
+            #    副本**；scoring 不参与统计，无泄漏。
+            normalizer = Normalizer(self.normalizer_mode).fit_chunked(
+                [core_arrays.features, es_arrays.features])
+            _t["norm"] = time.time() - _m; _m = time.time()
 
-            train_core_ds = SequenceDataset(core_arrays, self.seq_len, normalizer)
-            earlystop_ds = SequenceDataset(es_arrays, self.seq_len, normalizer)
-            scoring_ds = SequenceDataset(score_arrays, self.seq_len, normalizer)
+            # 3) 三个 dataset 各自**原地白化**(own_features=True)：本折独占这三份 arrays，
+            #    不再每个 dataset 另造一份 [N,C] _feats 副本。
+            train_core_ds = SequenceDataset(core_arrays, self.seq_len, normalizer, own_features=True)
+            earlystop_ds = SequenceDataset(es_arrays, self.seq_len, normalizer, own_features=True)
+            scoring_ds = SequenceDataset(score_arrays, self.seq_len, normalizer, own_features=True)
+            _t["build_ds"] = time.time() - _m; _m = time.time()
 
             # 3) 每折新建卡带，fit（earlystop 看尾段、绝不碰 scoring），predict。
             cartridge = self.cartridge_factory()
             record = cartridge.fit(train_core_ds, earlystop_ds, self.hparams, self.seed)
+            _t["fit_GPU"] = time.time() - _m; _m = time.time()
             pred_val = cartridge.predict(scoring_ds)
             pred_train = cartridge.predict(train_core_ds)
+            _t["predict"] = time.time() - _m; _m = time.time()
 
             # 4) 4 指标（脊柱在 predict 之后算一次；scoring 在此前一次不碰）。
             vm = evaluate_prediction_bundle(scoring_ds.label_frame(), pred_val)
             tm = evaluate_prediction_bundle(train_core_ds.label_frame(), pred_train)
+            _t["metrics"] = time.time() - _m
+            _gpu_busy = _t["fit_GPU"] + _t["predict"]
+            _total = sum(_t.values()) or 1.0
+            print(
+                f"[fold {fold.fold_id} timing] "
+                + " ".join(f"{k}={v:.1f}s" for k, v in _t.items())
+                + f" | GPU忙占比≈{100.0 * _gpu_busy / _total:.0f}%"
+                + f" (n_train_days={len(fold.train_dates)})",
+                file=sys.stderr, flush=True,
+            )
 
             notes = self.spec.get("notes", "")
             best_epoch = getattr(record, "best_epoch", 0)

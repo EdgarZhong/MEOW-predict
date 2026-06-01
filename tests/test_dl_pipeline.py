@@ -16,6 +16,7 @@ DL D0 地基单元测试 —— 规格 §9 的六项验收闸（全程 torch-fre
 
 import os
 import sys
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -26,7 +27,8 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from sequence_dataset import (  # noqa: E402
-    Normalizer, SequenceDataset, WindowIndexer, build_sequence_arrays, subset_by_dates,
+    Normalizer, SequenceDataset, WindowIndexer, build_sequence_arrays,
+    build_sequence_arrays_from_frames, subset_by_dates,
 )
 from dl_protocol import (  # noqa: E402
     assert_folds_causal, build_dl_folds, evaluate_prediction_bundle, summarize_folds,
@@ -67,6 +69,42 @@ def make_synth(n_days=8, n_symbols=5, n_interval=30, label="current", seed=0):
 
 def make_loader(df):
     return lambda dates: df[df["date"].isin(list(dates))]
+
+
+class _CachedIdentityAdapter:
+    """
+    测试用“缓存型适配器”。
+
+    它模拟新的 FeatureAdapter 快路径：不吃 raw_loader 提供的整段原始数据，
+    而是自己按日期直接返回 ``SequenceArrays``。这样可以锁住
+    ``SequenceTrainer._build_arrays()`` 的优先级，避免以后重构又退回
+    “先读 raw、再读缓存”的双份开销。
+    """
+
+    def __init__(self, frames):
+        self.channels = ["c0", "c1"]
+        self._frames = {
+            int(date): frame.sort_values(["date", "symbol", "interval"], kind="mergesort").reset_index(drop=True)
+            for date, frame in frames.items()
+        }
+
+    def load_sequence_arrays(self, dates, target_col="fret12", meta_cols=("date", "symbol", "interval")):
+        x_parts = []
+        y_parts = []
+        for date in dates:
+            frame = self._frames[int(date)]
+            x_parts.append(frame[["date", "symbol", "interval", "c0", "c1"]].copy())
+            y_parts.append(frame[["date", "symbol", "interval", "fret12"]].copy())
+        return build_sequence_arrays_from_frames(
+            xdf=pd.concat(x_parts, ignore_index=True),
+            ydf=pd.concat(y_parts, ignore_index=True),
+            channels=self.channels,
+            target_col=target_col,
+            meta_cols=meta_cols,
+        )
+
+    def build(self, raw_day_df):
+        raise AssertionError("缓存快路径命中时，不应再回退到 raw_day_df -> build()")
 
 
 # ------------------------------------------------------------------ #
@@ -207,6 +245,32 @@ class TestProtocolAndE2E(unittest.TestCase):
         for col in ("val_corr", "val_mse", "val_r2", "daily_corr_mean", "train_val_corr_gap", "status"):
             self.assertIn(col, d)
 
+    def test_sequence_trainer_prefers_cached_adapter_path(self):
+        """
+        一旦适配器声明自己能按日期直出 ``SequenceArrays``，Trainer 就必须优先走它。
+
+        这样才能保证：
+        - 433 特征滚动实验复用 ``data/features/`` 磁盘缓存；
+        - 不会先把整段 raw 读进内存，再额外读一遍缓存，造成 IO / 内存双浪费。
+        """
+        df = make_synth(n_days=6, n_symbols=3, n_interval=10, label="current")
+        frames = {int(date): day.copy() for date, day in df.groupby("date", sort=True)}
+        adapter = _CachedIdentityAdapter(frames)
+
+        def _raw_loader_should_not_run(_dates):
+            raise AssertionError("缓存快路径命中时，不应调用 raw_loader")
+
+        tr = SequenceTrainer(
+            {"experiment_id": "cached_e2e"},
+            adapter,
+            ReferenceLastCartridge,
+            _raw_loader_should_not_run,
+            seq_len=4,
+        )
+        from dl_protocol import DLFold
+        r = tr.run_on_dl_fold(DLFold(0, (1, 2, 3), (4,), (5,), (6,)))
+        self.assertEqual(r.status, "ok", r.error_msg)
+
 
 # ------------------------------------------------------------------ #
 # 6) config 组装校验
@@ -307,6 +371,24 @@ class TestFeatureAdapterReal(unittest.TestCase):
         self.assertEqual(feats.shape[1], len(adapter.channels))  # 通道数对齐
         self.assertGreater(len(adapter.channels), 100)           # 433 量级
         self.assertTrue(np.isfinite(feats).all() or True)        # 允许特征含 0 填充
+
+
+class TestFeatureAdapterCachedPath(unittest.TestCase):
+    """
+    锁住 FeatureAdapter 的缓存快路径最小契约。
+
+    这里不去拼真实 433 schema，而是验证两件最关键的行为：
+    1. manifest 缺失时必须明确报“缓存未就绪”，不能静默假装走缓存；
+    2. 一旦缓存目录被显式绑定，适配器能把该路径透传给 FeatureLoader 构造。
+    """
+
+    def test_cached_path_requires_manifest(self):
+        from dl_models import FeatureAdapter
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter = FeatureAdapter()
+            adapter.bind_data_sources(h5dir="data", feature_dir=tmpdir)
+            with self.assertRaises(FileNotFoundError):
+                adapter.load_sequence_arrays([20230601])
 
 
 # ------------------------------------------------------------------ #

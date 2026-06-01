@@ -23,9 +23,13 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
 import numpy as np
@@ -85,20 +89,212 @@ class FeatureAdapter(InputAdapter):
     """
     包装现有 433 特征管线：把正式提交特征列当通道（规格 §3.1「首个实现」）。
 
-    复用 ``SubmissionFeaturePipeline.build_feature_frames``（逐日现算、不跨日、不依赖
-    磁盘缓存），因此 train/serve 用同一套现算口径，天然无 train/serve skew。
+    设计成**双通路**：
+    1. **实验 / DL 训练默认优先走 ``data/features/`` 磁盘缓存**：
+       通过 ``FeatureLoader`` 直接按日期取已经构建好的 433 特征，避免 rolling /
+       sweep 每折都把同一批特征从 raw 重算一遍。
+    2. **提交 / 缺缓存兜底仍可 raw 现算**：
+       复用 ``SubmissionFeaturePipeline.build_feature_frames``，保证一旦本机还没建缓存、
+       或单测只给了原始单日 DataFrame，仍能沿既有口径跑通。
+
+    这样做的边界很明确：
+    - **实验链**：追求速度，优先缓存；
+    - **提交链**：追求独立可交付，继续 raw 现算；
+    - 两条路共享同一份 433 列定义（``self.channels``），避免列集合/顺序漂移。
     """
 
     def __init__(self, groups=None):
         # 延迟 import：FeatureAdapter 用到时才拉特征管线（src 在 path）。
+        from feature_store import DEFAULT_FEATURE_DIR
         from submission_pipeline import SubmissionFeaturePipeline, DEFAULT_SUBMISSION_GROUPS
         groups = tuple(groups) if groups else DEFAULT_SUBMISSION_GROUPS
+        self.groups = tuple(groups)
         self._pipeline = SubmissionFeaturePipeline(groups=groups)
+        self._feature_dir = DEFAULT_FEATURE_DIR
+        self._h5dir = "data"
+        self._feature_loader = None
         self.channels = list(self._pipeline.feature_names())
+        # —— 按「交易日」**有界 LRU** 缓存逐日 numpy 结果（性能命脉，见 load_sequence_arrays 注释） —— #
+        # rolling/sweep 里同一组日期会被几十次 fit 反复读：档1 4 网格×2 折×2 seed 把同样
+        # 2 折读 ~16 遍，档2 5 折×3 seed 再读。而单日 433 特征只取决于「日期 + 本适配器固定
+        # 列集」，与 hparams/seed 无关。故按日缓存：命中即跳过整套 h5 读 + pickle select。
+        #
+        # **但缓存必须有界**：单日全票 433 特征 ~120MB，若无限缓存 144 天 = ~17GB，叠上
+        # 每折 ~16GB 的训练矩阵会把 34GB 内存打穿（119 天全票折硬化前实测 24GB+/折）。
+        #
+        # 策略 = **蓄水式保留"最早装入的共享基段"**（不是 LRU）：所有 expanding 折都从
+        # Jun1 起、共享同一段早期日期（Jun–Jul base），这段被每折反复读；而各折只在末端
+        # 不同。故缓存装满 ``_day_cache_cap`` 天后**不再淘汰、也不再新增**——自然把最早装入
+        # 的共享基段钉住、跨 fit 命中率最高；末端差异日每折从磁盘 pickle 重读（~0.3s/天，
+        # 便宜）。默认 32 天 ≈ 3.8GB，配合预分配流式装填，把 119 天折峰值压到 ~22GB。
+        self._day_cache: "OrderedDict[int, tuple]" = OrderedDict()
+        self._day_cache_cap = 32
+        # 逐日行数台账（极小、不设上限）：load_sequence_arrays 据此**预分配输出、逐日流式
+        # 填充**，避免 np.concatenate 把"所有日块 + 输出"两份 14GB 同时压在内存里。
+        self._day_nrows: Dict[int, int] = {}
 
     @classmethod
     def from_config(cls, adapter_config) -> "FeatureAdapter":
         return cls(groups=adapter_config.groups or None)
+
+    def bind_data_sources(self, h5dir: str, feature_dir: str) -> None:
+        """
+        由 Orchestrator 在 run 发起时补齐数据源路径。
+
+        适配器本身只知道“我要 433 哪些列”，不知道本轮实验的数据根目录在哪里；
+        路径应由顶层编排器注入，而不是在适配器里写死仓库相对路径。
+        """
+        self._h5dir = str(h5dir)
+        self._feature_dir = str(feature_dir)
+        # 路径一旦变化，旧 loader 可能指向了别处缓存，必须强制失效重建。
+        self._feature_loader = None
+        # 数据源换了，按日缓存/行数台账里的旧数据也作废，清空避免读到别处的特征。
+        self._day_cache = OrderedDict()
+        self._day_nrows = {}
+
+    def _feature_store_ready(self) -> bool:
+        """
+        判断本机的磁盘特征缓存是否具备可读条件。
+
+        这里只做**保守探测**：
+        - manifest 存在，说明 FeatureStore 至少已经初始化过；
+        - 之后真正读取某天某 stage 时若缺文件，由 ``FeatureLoader`` 再抛精确错误。
+        """
+        manifest = Path(self._feature_dir) / "manifest.json"
+        return manifest.exists()
+
+    def _get_feature_loader(self):
+        """
+        懒加载 ``FeatureLoader``。
+
+        原因：
+        - 大多数 torch-free 合成测试压根用不到它；
+        - 只有实验链真的选择“按日期读缓存”时才需要；
+        - 延迟构造也让 `bind_data_sources()` 可以先覆盖 h5/feature 根目录。
+        """
+        if self._feature_loader is None:
+            from feature_loader import FeatureLoader
+            self._feature_loader = FeatureLoader(
+                h5dir=self._h5dir,
+                feature_dir=self._feature_dir,
+            )
+        return self._feature_loader
+
+    def load_sequence_arrays(self, dates, target_col="fret12", meta_cols=("date", "symbol", "interval")):
+        """
+        按日期直接从磁盘特征缓存组装 ``SequenceArrays``。
+
+        这是 DL 训练真正想走的快路径：
+        - ``SequenceTrainer`` 传入本折需要的日期；
+        - 适配器用 ``FeatureLoader`` 一次把这些日期的 433 特征读出来；
+        - 再交给 ``build_sequence_arrays_from_frames`` 收口成脊柱统一格式。
+
+        若本机尚未准备好 ``data/features/``，这里明确抛 ``FileNotFoundError``，
+        让上层决定是回退 raw 现算、还是先构建缓存；绝不在底层静默吞掉。
+        """
+        if not self._feature_store_ready():
+            raise FileNotFoundError(
+                f"未发现可用特征缓存 manifest: {Path(self._feature_dir) / 'manifest.json'}"
+            )
+
+        from sequence_dataset import SequenceArrays
+
+        loader = self._get_feature_loader()
+        normalized_dates = loader._normalize_dates(dates)
+        resolved = loader.registry.resolve_groups(self.groups)
+        stage_order = [
+            stage_name
+            for stage_name in loader.registry.topo_order(include_archived=False)
+            if stage_name in resolved
+        ]
+
+        # —— 预分配 + 逐日流式填充：避免 np.concatenate 把"所有日块 + 输出"两份 14GB 同时
+        #    压在内存里（119 天全票折就是被这一下打穿的）。先确定每天行数（已知免读、未知
+        #    现读一遍并记账），按总行数一次性预分配输出，再逐日把单日块写进对应切片。 ——
+        C = len(self.channels)
+        nrows: List[int] = []
+        for date in normalized_dates:
+            d = int(date)
+            n = self._day_nrows.get(d)
+            if n is None:
+                day = self._load_day(loader, stage_order, resolved, d, target_col)
+                n = int(day[0].shape[0])   # _load_day 已顺带写 _day_nrows
+            nrows.append(n)
+        total = int(sum(nrows))
+
+        features = np.empty((total, C), dtype=np.float32)
+        labels = np.empty(total, dtype=np.float32)
+        dates_arr = symbols_arr = intervals_arr = None
+        off = 0
+        for date, n in zip(normalized_dates, nrows):
+            df, dl, dd, dsym, dint = self._load_day(loader, stage_order, resolved, int(date), target_col)
+            if dates_arr is None:   # 用首日块的 dtype 定 meta 列类型，预分配其余三列
+                dates_arr = np.empty(total, dtype=dd.dtype)
+                symbols_arr = np.empty(total, dtype=dsym.dtype)
+                intervals_arr = np.empty(total, dtype=dint.dtype)
+            features[off:off + n] = df
+            labels[off:off + n] = dl
+            dates_arr[off:off + n] = dd
+            symbols_arr[off:off + n] = dsym
+            intervals_arr[off:off + n] = dint
+            off += n
+
+        return SequenceArrays(
+            features=features,
+            labels=labels,
+            dates=dates_arr if dates_arr is not None else np.zeros(0, dtype=np.int64),
+            symbols=symbols_arr if symbols_arr is not None else np.zeros(0, dtype=np.int64),
+            intervals=intervals_arr if intervals_arr is not None else np.zeros(0, dtype=np.int64),
+            channels=list(self.channels),
+            has_label=True,
+        )
+
+    def _load_day(self, loader, stage_order, resolved, date, target_col):
+        """
+        读单个交易日的逐日 numpy 原料并**缓存**：返回
+        ``(day_features[n,C] f32, labels[n] f32, dates[n], symbols[n], intervals[n])``。
+
+        缓存键只取 ``date``——因为本适配器实例的列集（``self.channels`` / ``groups``）
+        在一次 run 内固定，单日特征只随日期变化。命中缓存即跳过全部 h5 读 + pandas
+        select，把「同一天被几十次 fit 反复重算」这条最大浪费一次性掐掉。
+
+        缓存**蓄水式有界**（``_day_cache_cap`` 天）：装满后不淘汰也不新增，保留最早装入
+        的共享基段（见 __init__）。返回的数组消费方均产新副本/只读切片填充，不就地改缓存
+        内容，故可安全把缓存引用直接交出去。
+        """
+        cached = self._day_cache.get(date)
+        if cached is not None:
+            return cached
+
+        meta_target_df = loader._load_meta_target_frame(date)
+        day_feature_parts = []
+        for stage_name in stage_order:
+            stage_df = loader._read_stage_frame(stage_name, date)
+            loader._assert_stage_alignment(stage_name, date, stage_df, meta_target_df)
+            selected = loader._select_stage_columns(
+                stage_name=stage_name,
+                stage_df=stage_df,
+                requested_columns=resolved[stage_name],
+            )
+            day_feature_parts.append(selected.to_numpy(dtype=np.float32, copy=False))
+
+        if day_feature_parts:
+            day_features = np.concatenate(day_feature_parts, axis=1).astype(np.float32, copy=False)
+        else:
+            day_features = np.zeros((len(meta_target_df), 0), dtype=np.float32)
+
+        result = (
+            day_features,
+            meta_target_df[target_col].to_numpy(dtype=np.float32, copy=True),
+            meta_target_df["date"].to_numpy(copy=True),
+            meta_target_df["symbol"].to_numpy(copy=True),
+            meta_target_df["interval"].to_numpy(copy=True),
+        )
+        self._day_nrows[date] = int(day_features.shape[0])   # 行数台账永久保留（极小）
+        # 蓄水式有界：未满才装；装满后保留最早的共享基段、新日不再入缓存（封死内存峰）。
+        if self._day_cache_cap is None or len(self._day_cache) < self._day_cache_cap:
+            self._day_cache[date] = result
+        return result
 
     def build(self, raw_day_df) -> np.ndarray:
         # build_feature_frames 内部按 (date,symbol,interval) 排序后逐日算，单日块行序
@@ -272,6 +468,193 @@ def _resolve_torch_device(torch, requested: str) -> str:
     if req.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("请求使用 CUDA，但当前 torch.cuda.is_available() 为 False。")
     return requested
+
+
+class _GpuWindowSource:
+    """
+    把一个 ``SequenceDataset`` 的「归一化特征矩阵 + 窗口索引」喂成 device 上的
+    ``[B, L, C]`` batch 流，核心目标：**让 GPU 不再干等 CPU 拼数据**。
+
+    本机现实（决定了下面三条路怎么选）：
+    - 内存充足（~34GB），整张 ``[N, C]`` 特征矩阵舒服待在内存，**全量不砍**；
+    - 显存小（8G 卡，可用 ~6.5G），而 433 通道 × 百万行的训练矩阵动辄 7–15GB，
+      **塞不进显存**——所以"整张驻留显存"只在小抽样 / 筛选早折偶尔成立。
+
+    三条路（按 device + 是否真装得下显存自动选）：
+    1. **resident（纯显存快路）**：仅当整张矩阵确实装得进显存预算时才走（**事前按
+       真实空闲显存判断、绝不盲分配再接 OOM**）；窗口 gather 全在显存带宽上做。
+    2. **prefetched（预取流式，正式大跑的主路）**：装不下显存时——后台线程在 GPU
+       算第 i 批时，提前把第 i+1 批的 ``[B,L,C]`` 在 CPU gather 好、落到 pinned 内存，
+       主线程再 ``non_blocking`` 异步拷上卡。CPU 备料与 GPU 计算重叠 → GPU 不再干等；
+       在途同时只有 ``_PREFETCH`` 个 batch（~百 MB 级），**内存有界、永不 OOM**。
+    3. **cpu**：device 为 cpu（单测 / Mac）时退化为纯 CPU gather，不涉及 pin/异步。
+
+    torch 仍只在本卡带层出现，脊柱保持 torch-free；CPU 单测路径完全不受影响。
+    """
+
+    # 预取队列深度：在途同时最多这么多 batch，限制 pinned 内存占用。
+    _PREFETCH = 3
+    # resident 只在「估算字节 < 此比例 × 当前空闲显存」时才走，留足碎片 / 激活余量。
+    _VRAM_FRAC = 0.6
+
+    def __init__(self, ds, torch, device: str):
+        self._torch = torch
+        self._ds = ds
+        self.device = str(device)
+        self.seq_len = int(ds.seq_len)
+        self.n_windows = int(len(ds))
+        self.mode = "cpu"            # cpu / resident / prefetched
+        # resident 用的 device 句柄
+        self.feats = self.label_rows = self.offsets = self.labels = None
+        # CPU 侧原料：from_numpy 零拷贝共享 ds 内已有的大矩阵（不再复制一份 14GB）。
+        self._feats_cpu = torch.from_numpy(np.ascontiguousarray(ds.feature_matrix()))
+        self._label_rows_cpu = torch.from_numpy(
+            np.ascontiguousarray(ds.label_rows).astype(np.int64, copy=False))
+        self._offsets_cpu = torch.from_numpy(
+            np.ascontiguousarray(ds.window_offsets()).astype(np.int64, copy=False))
+        self._labels_cpu = torch.from_numpy(
+            np.ascontiguousarray(ds.window_labels()).astype(np.float32, copy=False))
+
+        if self.n_windows == 0 or not self.device.startswith("cuda"):
+            return
+
+        # ---- 事前显存预算判断：只有确实装得下才 resident，绝不盲分配 14GB 再接 OOM ---- #
+        feat_bytes = self._feats_cpu.numel() * 4
+        idx_bytes = (self._label_rows_cpu.numel() + self._offsets_cpu.numel()) * 8 \
+            + self._labels_cpu.numel() * 4
+        need = feat_bytes + idx_bytes
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info()
+        except Exception:
+            free_bytes = 0
+        if need < self._VRAM_FRAC * free_bytes:
+            try:
+                self.feats = self._feats_cpu.to(self.device, dtype=torch.float32)
+                self.label_rows = self._label_rows_cpu.to(self.device)
+                self.offsets = self._offsets_cpu.to(self.device)
+                self.labels = self._labels_cpu.to(self.device)
+                self.mode = "resident"
+            except RuntimeError as exc:
+                # 二重保险：预算判断已放行仍 OOM（碎片等），也绝不上抛——退预取流式。
+                if "out of memory" not in str(exc).lower():
+                    raise
+                self.feats = self.label_rows = self.offsets = self.labels = None
+                torch.cuda.empty_cache()
+                self.mode = "prefetched"
+        else:
+            self.mode = "prefetched"
+
+    def __len__(self) -> int:
+        return self.n_windows
+
+    @property
+    def gpu_resident(self) -> bool:   # 兼容旧字段名
+        return self.mode == "resident"
+
+    def _make_order(self, shuffle: bool, seed: Optional[int]):
+        """生成窗口遍历顺序（CPU 张量）；shuffle 用可复现 Generator。"""
+        torch = self._torch
+        n = self.n_windows
+        if shuffle:
+            g = torch.Generator()
+            if seed is not None:
+                g.manual_seed(int(seed))
+            return torch.randperm(n, generator=g)
+        return torch.arange(n)
+
+    def iter_batches(self, batch_size: int, shuffle: bool = False, seed: Optional[int] = None):
+        if self.n_windows == 0:
+            return
+        if self.mode == "resident":
+            yield from self._iter_resident(batch_size, shuffle, seed)
+        elif self.mode == "prefetched":
+            yield from self._iter_prefetched(batch_size, shuffle, seed)
+        else:
+            yield from self._iter_cpu(batch_size, shuffle, seed)
+
+    def _iter_resident(self, batch_size: int, shuffle: bool, seed: Optional[int]):
+        """整张驻留 device 的快路径：窗口 gather 全在 device 上做。"""
+        order = self._make_order(shuffle, seed).to(self.device)
+        n = self.n_windows
+        for start in range(0, n, batch_size):
+            sel = order[start: start + batch_size]
+            rows = self.label_rows[sel][:, None] + self.offsets[None, :]   # [b, L]
+            yield self.feats[rows], self.labels[sel]                       # [b,L,C], [b]
+
+    def _gather_cpu(self, sel):
+        """在 CPU 上 gather 一个 batch 的 ``([b,L,C], [b])``（torch 索引，GIL 在大拷贝时释放）。"""
+        rows = self._label_rows_cpu[sel][:, None] + self._offsets_cpu[None, :]   # [b, L]
+        return self._feats_cpu[rows], self._labels_cpu[sel]
+
+    def _iter_cpu(self, batch_size: int, shuffle: bool, seed: Optional[int]):
+        """device 为 cpu 时的纯 CPU 路径（单测 / Mac）：直接产 CPU 张量。"""
+        order = self._make_order(shuffle, seed)
+        n = self.n_windows
+        for start in range(0, n, batch_size):
+            sel = order[start: start + batch_size]
+            yield self._gather_cpu(sel)
+
+    def _iter_prefetched(self, batch_size: int, shuffle: bool, seed: Optional[int]):
+        """
+        预取流式（正式大跑主路）：后台线程 CPU gather→pinned，主线程异步拷卡。
+
+        生命周期保证：``x_pin``/``y_pin`` 由本生成器帧在 ``yield`` 处持活——直到消费方
+        下次 ``next()`` 才释放，因此 ``non_blocking`` 拷贝期间 pinned 源不会被回收
+        （与 PyTorch DataLoader 的 pin_memory 路径同一条保证）。
+        """
+        order = self._make_order(shuffle, seed)
+        n = self.n_windows
+        q: "queue.Queue" = queue.Queue(maxsize=self._PREFETCH)
+        stop = threading.Event()
+        _STOP = object()
+
+        def producer():
+            try:
+                for start in range(0, n, batch_size):
+                    if stop.is_set():
+                        break
+                    sel = order[start: start + batch_size]
+                    x_cpu, y_cpu = self._gather_cpu(sel)
+                    item = (x_cpu.pin_memory(), y_cpu.pin_memory())
+                    # 带超时的 put：消费方提前停了也能周期性检查 stop、不会永久阻塞。
+                    while not stop.is_set():
+                        try:
+                            q.put(item, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+            except Exception as exc:   # 异常回传主线程，避免静默卡死
+                q.put(exc)
+            finally:
+                q.put(_STOP)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        try:
+            while True:
+                item = q.get()
+                if item is _STOP:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                x_pin, y_pin = item
+                x = x_pin.to(self.device, non_blocking=True)
+                y = y_pin.to(self.device, non_blocking=True)
+                yield x, y
+        finally:
+            # 消费方提前退出时：置 stop + 排空队列解阻塞 producer，再带超时 join，绝不卡死。
+            stop.set()
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+            t.join(timeout=5.0)
+
+    def free(self) -> None:
+        """显式释放 device / CPU 句柄，给下一段 dataset 腾资源。"""
+        self.feats = self.label_rows = self.offsets = self.labels = None
+        self._feats_cpu = self._label_rows_cpu = self._offsets_cpu = self._labels_cpu = None
 
 
 class _CausalConvBlock:
@@ -706,13 +1089,19 @@ class TCNCartridge(ModelCartridge):
             return np.full(len(ds), self._fallback_bias, dtype=np.float32)
 
         torch = self._torch
+        # 预测同样把窗口源驻留 device（OOM 自动降级流式）：窗口 gather 在卡上做、
+        # 零逐 batch CPU 拼接 + 零逐 batch H2D，与 fit/eval 同一条快路径。
+        src = _GpuWindowSource(ds, torch, self._device)
         preds: List[np.ndarray] = []
         self._model.eval()
-        with torch.no_grad():
-            for xb, _ in ds.iter_batches(batch_size=512, shuffle=False):
-                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
-                pred = self._model(x).detach().cpu().numpy().astype(np.float32)
-                preds.append(pred)
+        try:
+            with torch.no_grad():
+                # shuffle=False：保持窗口原序，预测结果与 ds 行严格对齐。
+                for xb, _ in src.iter_batches(batch_size=4096, shuffle=False):
+                    pred = self._model(xb).detach().cpu().numpy().astype(np.float32)
+                    preds.append(pred)
+        finally:
+            src.free()
         return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)
 
 
@@ -789,7 +1178,12 @@ class GRUCartridge(ModelCartridge):
             "dropout": 0.10,
             "lr": 1e-3,
             "weight_decay": 1e-4,
-            "batch_size": 256,
+            # batch_size 调大到 1024：窗口 gather 已移到 GPU、模型又小，大 batch 才能把
+            # GPU 算力喂饱、同时把每 epoch 的 Python 循环步数压下来（4060 8G 完全容得下
+            # [1024, L, 433] 的中间激活）。想更省显存可经 hparams 显式下调。
+            "batch_size": 1024,
+            # 评估/预测用更大 batch（无反传），减少循环步数；4096 兼顾预取 pinned 内存占用。
+            "eval_batch_size": 4096,
             "max_epochs": 20,
             "patience": 4,
             "grad_clip": 1.0,
@@ -798,21 +1192,20 @@ class GRUCartridge(ModelCartridge):
         merged.update(dict(hparams or {}))
         return merged
 
-    def _eval_loss(self, ds, loss_fn) -> float:
+    def _eval_loss(self, src, loss_fn, eval_batch_size: int) -> float:
+        """在 GPU 驻留窗口源上算平均 loss；loss 全程在 device 上累加，只在最后同步一次。"""
         torch = self._torch
-        if len(ds) == 0:
+        if len(src) == 0:
             return float("inf")
-        total = 0.0
+        running = torch.zeros((), device=self._device)
         count = 0
         self._model.eval()
         with torch.no_grad():
-            for xb, yb in ds.iter_batches(batch_size=512, shuffle=False):
-                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
-                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
-                pred = self._model(x)
-                total += float(loss_fn(pred, y).item()) * len(yb)
-                count += len(yb)
-        return total / max(count, 1)
+            for xb, yb in src.iter_batches(batch_size=eval_batch_size, shuffle=False):
+                pred = self._model(xb)
+                running = running + loss_fn(pred, yb).detach() * yb.shape[0]
+                count += int(yb.shape[0])
+        return float(running.item()) / max(count, 1)
 
     def fit(self, train_ds, earlystop_ds, hparams: Dict, seed: int) -> TrainRecord:
         torch, nn, _ = _require_torch()
@@ -851,6 +1244,7 @@ class GRUCartridge(ModelCartridge):
         )
         loss_fn = nn.MSELoss()
         batch_size = int(cfg["batch_size"])
+        eval_batch_size = int(cfg.get("eval_batch_size", 8192))
         max_epochs = int(cfg["max_epochs"])
         patience = int(cfg["patience"])
         grad_clip = float(cfg["grad_clip"])
@@ -862,45 +1256,52 @@ class GRUCartridge(ModelCartridge):
         train_curve: List[float] = []
         early_curve: List[float] = []
 
-        # 兜底偏置：只取 label 列均值，不物化整窗 X[B,L,C]。
-        train_labels = train_ds.label_frame()["fret12"].to_numpy(dtype=np.float32)
+        # 兜底偏置：只取窗口标签均值，不物化整窗 X[B,L,C]（window_labels 已是纯 numpy）。
+        train_labels = train_ds.window_labels()
         self._fallback_bias = float(np.mean(train_labels)) if len(train_labels) else 0.0
 
-        for epoch in range(1, max_epochs + 1):
-            self._model.train()
-            total = 0.0
-            count = 0
-            for xb, yb in train_ds.iter_batches(batch_size=batch_size, shuffle=True, seed=int(seed) + epoch):
-                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
-                y = torch.as_tensor(yb, device=self._device, dtype=torch.float32)
-                optimizer.zero_grad(set_to_none=True)
-                pred = self._model(x)
-                loss = loss_fn(pred, y)
-                loss.backward()
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=grad_clip)
-                optimizer.step()
-                total += float(loss.item()) * len(yb)
-                count += len(yb)
+        # 训练/早停数据一次性驻留 GPU：之后每 epoch 的窗口 gather 全在卡上，CPU 不再拼数据。
+        train_src = _GpuWindowSource(train_ds, torch, self._device)
+        es_src = _GpuWindowSource(earlystop_ds, torch, self._device)
+        try:
+            for epoch in range(1, max_epochs + 1):
+                self._model.train()
+                running = torch.zeros((), device=self._device)   # loss 在 device 上累加
+                count = 0
+                for xb, yb in train_src.iter_batches(batch_size=batch_size, shuffle=True, seed=int(seed) + epoch):
+                    optimizer.zero_grad(set_to_none=True)
+                    pred = self._model(xb)
+                    loss = loss_fn(pred, yb)
+                    loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=grad_clip)
+                    optimizer.step()
+                    running = running + loss.detach() * yb.shape[0]
+                    count += int(yb.shape[0])
 
-            train_loss = total / max(count, 1)
-            train_curve.append(train_loss)
+                # 每 epoch 只在此处同步一次（取代过去逐 batch .item() 的 GPU↔CPU 阻塞）。
+                train_loss = float(running.item()) / max(count, 1)
+                train_curve.append(train_loss)
 
-            if len(earlystop_ds) > 0:
-                metric = self._eval_loss(earlystop_ds, loss_fn)
-                early_curve.append(metric)
-            else:
-                metric = train_loss
+                if len(es_src) > 0:
+                    metric = self._eval_loss(es_src, loss_fn, eval_batch_size)
+                    early_curve.append(metric)
+                else:
+                    metric = train_loss
 
-            if metric + 1e-8 < best_metric:
-                best_metric = metric
-                best_epoch = epoch
-                best_state = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    break
+                if metric + 1e-8 < best_metric:
+                    best_metric = metric
+                    best_epoch = epoch
+                    best_state = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        break
+        finally:
+            # 训练窗口源用完即释放 device 显存；predict 时再按需重新驻留。
+            train_src.free()
+            es_src.free()
 
         if best_state is not None:
             self._model.load_state_dict(best_state)
@@ -927,11 +1328,17 @@ class GRUCartridge(ModelCartridge):
             return np.full(len(ds), self._fallback_bias, dtype=np.float32)
 
         torch = self._torch
+        # 预测同样把窗口源驻留 device（OOM 自动降级流式）：窗口 gather 在卡上做、
+        # 零逐 batch CPU 拼接 + 零逐 batch H2D，与 fit/eval 同一条快路径。
+        src = _GpuWindowSource(ds, torch, self._device)
         preds: List[np.ndarray] = []
         self._model.eval()
-        with torch.no_grad():
-            for xb, _ in ds.iter_batches(batch_size=512, shuffle=False):
-                x = torch.as_tensor(xb, device=self._device, dtype=torch.float32)
-                pred = self._model(x).detach().cpu().numpy().astype(np.float32)
-                preds.append(pred)
+        try:
+            with torch.no_grad():
+                # shuffle=False：保持窗口原序，预测结果与 ds 行严格对齐。
+                for xb, _ in src.iter_batches(batch_size=4096, shuffle=False):
+                    pred = self._model(xb).detach().cpu().numpy().astype(np.float32)
+                    preds.append(pred)
+        finally:
+            src.free()
         return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)

@@ -30,7 +30,7 @@
 > - **选型粒度**：结构族为主（一晚一族）+ 命令内小 HPO（结构子旋钮 + λ）+ seed 探针（3 个平均）+ 其余固定**重正则**默认；一命令两档预算（筛选→认证）。
 > - **DL 头号风险 = 时段过拟合**（容量大/无先验锚/优化随机，TCN 种子方差 0.068、R² 全负为证）→ 三层防御：rolling 检测 / 重正则+多种子降低 / 集成兜底。
 >
-> **⬇️ 进展（2026-06-01，本会话）**：① **协议已落代码**——`Stage.SWEEP` 一命令两档（档1 小网格×近2折×2seed 按最坏折选冠军 → 档2 冠军×5折×3seed）+ `build_dl_folds(fold_select="recent")` 自 Dec 倒贴五段不重合 + `enumerate_grid`，**34 test 全过 + 真实数据 CLI 端到端跑通**；② **截面模型方案已拍板落档**（因子化两腿：共享 GRU 时序腿 + set-attention 截面腿 + 残差、置换等变零身份、`MSE+λ·corr` 截面对齐；为什么不用时空联合/图网络见 `NOTE.md`「截面模型怎么设计」+ 规格 §8.2；**卡带待实现**，接已跑通的 SWEEP 上）；③ **GRU-on-433 基线整晚命令已备**（见下「DL 整晚实跑命令」）。**当前动作：Windows pull → 先 5 分钟 sanity 再整晚开跑 GRU 基线，出第一个可信 features-DL 读数 + 立保底。** purge 说明：`fret12` 日内不跨夜，1 日 embargo 已等价 purge，未另搭丢行逻辑。
+> **⬇️ 进展（2026-06-01，本会话）**：① **协议已落代码**——`Stage.SWEEP` 一命令两档（档1 小网格×近2折×2seed 按最坏折选冠军 → 档2 冠军×5折×3seed）+ `build_dl_folds(fold_select="recent")` 自 Dec 倒贴五段不重合 + `enumerate_grid`，**34 test 全过 + 真实数据 CLI 端到端跑通**；② **截面模型方案已拍板落档**（因子化两腿：共享 GRU 时序腿 + set-attention 截面腿 + 残差、置换等变零身份、`MSE+λ·corr` 截面对齐；为什么不用时空联合/图网络见 `NOTE.md`「截面模型怎么设计」+ 规格 §8.2；**卡带待实现**，接已跑通的 SWEEP 上）；③ **GRU-on-433 实验链已收敛为“优先走 `FeatureLoader/data/features` 磁盘缓存，提交链继续 raw 现算”**，避免 rolling 每折重复重算 433 特征。**当前动作：正式 GRU 基线 SWEEP 已启动并稳定运行中（run `20260601_sweep_gru433_v1`，13:43 起，档1筛选进行中）；旧的 5 分钟 sanity 现算口径作废。** purge 说明：`fret12` 日内不跨夜，1 日 embargo 已等价 purge，未另搭丢行逻辑。④ **瘦内存管线 + GPU 三态搬运 + 资源监控已落地并经 maxfold 演练实测**：最大折（131 训练日 / 全 309 票）单折峰值 RSS=24.1GB（本机 34GB，安全、不 OOM），冷/热两跑 `val_corr` 一致（0.0075，`max_epochs=4` sanity 探针，**不可外推正式精度**）；正式跑全程资源监控落 `resource_log.csv`（GPU 利用率 78–94% / 显存稳 ~6.4GB / 系统内存 ~30GB / 进程 RSS ~21GB），崩溃可回溯。规格落 §12。
 >
 > **传统保底已锁**：等权 raw_mean 融合 [X1 ridge + M_lgbm_d4]，expanding 均值 0.0776 / Dec sanity Pearson 0.0803 / R²=+0.00465。**DL 候选需在新协议下同时在均值 + 最坏折两镜头上超越此靶，才换代表；否则 DL 作增强叠在传统核心上、保底交付不破。**
 
@@ -56,7 +56,8 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 - **重正则**：dropout 0.2 / weight_decay 1e-3 / 早停 patience 5（§十一·11.5）；loss 暂纯 MSE（λ·corr 下一晚加）。
 - **早上看** `summary.json`：`val_corr.mean`（vs 传统 0.0776）、`val_corr.min`（**最坏折，决策主镜头**）、`val_r2_mean`（盯 R² 是否逼近 0，TCN 当时 9/9 全负）、`champion`；逐折逐 seed 明细 `fold_metrics.csv`、档1 网格 `trials.csv`。
 - **旋钮**：想更狠 `--grid-layers 1,2`（网格翻倍→47 fit）；想更快先 `--max-symbols 60` 抽样。
-- **注意**：每折 FeatureAdapter 现算 433 特征（约 100+ 天/折），全票时 CPU 内存峰可能上 ~15GB/折；若 OOM 先 `--max-symbols` 抽样或减 `max_epochs`。特征缓存是后续优化项（暂未做；与 AGENTS 提交链「禁 data/features 缓存」是两条链、不冲突）。
+- **注意（2026-06-01 更新）**：`GRU-on-433` 实验链**不再默认每折现算**，而是优先读取 `data/features/` 磁盘缓存；因此正式跑数前先确保所需交易日的特征缓存已构建完整。提交链 `meow.py` 仍坚持 raw 现算，与实验缓存层职责分离、不冲突。若缓存未就绪，代码会显式回退旧路径；正式大跑前不应依赖该慢路径。
+- **运行期资源管理（2026-06-01 实跑沉淀，权威见规格 §12）**：① GPU 喂数走三态 `_GpuWindowSource`——装得下显存才 resident（事前 `mem_get_info` 预算判断、绝不盲分配再 OOM），装不下走**预取流式**（后台线程 gather→pinned、主线程 `non_blocking` 拷卡、在途仅 3 batch，内存有界永不 OOM，实测稳态 GPU 利用率 ~79%）；② **瘦内存管线**把每折峰值从 ~24GB 压到 ~12GB（逐日缓存有界蓄水 `_day_cache_cap=32` + 预分配流式装填 + Normalizer 分块 fit + 原地白化 `own_features=True` + 三段分别现算），119 天全票折外推 ~22GB（本机 **~34GB**，安全）；③ 正式跑记 GPU 利用率/显存/RSS + 每折分阶段计时行（stderr），崩溃可回溯。纪律：**宁可慢也绝不让长跑因显存/内存溢出崩**。
 
 ### 传统侧（已收口、保底代表；全量明细见 `docs/实验记录.md`）
 
@@ -97,9 +98,9 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 | **新评测协议落 run_config** | `AGENTS.md §十一` 协议已落代码：`Stage.SWEEP` 一命令两档（档1 小网格×近2折×2seed 按最坏折选冠军 → 档2 冠军×5折×3seed）+ `build_dl_folds(fold_select="recent")`（自 Dec 倒贴五段不重合、锚定扩展、embargo 已等价 purge）+ `enumerate_grid`（确定性网格）+ 最坏折/R² 双镜头读数 + `--device/--grid-*` CLI。34 test 全过 + 真实数据 CLI 端到端跑通 | ✅ 完成 |
 | **截面模型方案（主攻）** | **方案已拍板落档**（`NOTE.md`「截面模型怎么设计」+ 规格 §8.2）：因子化两腿 = 共享 GRU 时序腿（每票日内路径编码）+ set-attention 截面腿（跨票、置换等变零身份、残差接）+ per-票头；`MSE+λ·corr` 截面对齐；张量契约 `[L,C]`→整截面 `[N,L,C]`+mask（WindowIndexer 按 (date,interval) 聚票、Normalizer 加截面 z）。业界 STGNN/关系排序同构、为什么不用时空联合/图网络已记 | ✅ 方案完成 |
 | **截面模型卡带（主攻，待实现）** | 实现 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 FEATURE_433）+ WindowIndexer/Normalizer 截面泛化，接已跑通的 SWEEP；下一程。时间盒：周中 ③ + ② 都无正信号超传统保底则回落保底 | 🔜 下一程 |
-| **GRU-on-433 基线 + 损失对齐** | **整晚命令已备**（见上「DL 整晚实跑命令」），Windows pull 即跑：走 SWEEP 新 rolling、纯 MSE（λ=0）出第一个可信 features-DL 读数 + 立保底；重点看最坏折 + 种子离散 + R² 是否逼近 0。`MSE+λ·corr`(λ∈{0,0.3}) 下一晚加 | 🔜 命令已备待跑 |
+| **GRU-on-433 基线 + 损失对齐** | **正式跑进行中**（run `20260601_sweep_gru433_v1`，2026-06-01 13:43 起）：走 SWEEP 新 rolling、纯 MSE（λ=0），档1筛选已完成 7/8 组合（`trials.csv` 约 19:10 落、`summary.json` 约 23:30+ 落）；资源全程健康（GPU 78–94% / 显存 6.4/8GB / RSS ~21GB，无 OOM）。早上看：均值 vs 0.0776、最坏折 vs 0.0491、R² 是否逼近 0、种子离散。`MSE+λ·corr`(λ∈{0,0.3}) 下一晚加 | 🔄 进行中 |
 | **正式结果同步目录（双机追踪）** | 根目录新增 `tracked_results/`，专门提交“小体量、正式、可复盘”的结果文件；首批纳入 TCN search / TCN expanding / 传统 Dec 全窗口 sanity 指标，供双机同步与后续深挖分析 | ✅ 已建立 |
-| 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待 ≥32GB 机器实测（本机 16GB 跑不了全窗口） | 🔜 待机器 |
+| 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待实测（**本机已核实 ~34GB**，非旧记 16GB；满足 ≥32GB，可本机试） | 🔜 待实测 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
 | 交付接线 — fit/predict 签名核验 | 对照 `meow/MEOW金融时序预测2.0.docx` 确认 `MeowEngine.fit/eval/predict` 能让老师替换路径跑通（predict 当前接特征帧，老师可能按路径取数）。代码侧已确认无藏划分器、全量训练。**另起会话专办** | 🔜 遗留（另会话） |

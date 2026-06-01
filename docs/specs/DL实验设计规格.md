@@ -377,3 +377,73 @@ DL 评测就两段（§5.2）：**海选（便宜搜超参）→ expanding 认�
 - **早杀实现**：`EarlyKillPolicy` 钩子在位（no-op）；GRU 卡带可逐 epoch 回调，撞 GPU 上限再接。
 - **多张量/图输入**：暂不实现，按 §8.1 留缝。
 - **传统交付 fit/predict 签名核验**：遗留另会话办（见 `CLAUDE.md` 看板），与 DL 地基不冲突。
+
+---
+
+## 12. 运行期资源管理（GPU 搬运 + 瘦内存管线 + 崩溃可排查日志）
+
+> 本节是 4060 实跑的工程沉淀，把"**GPU 怎么喂、内存怎么管、崩了怎么查**"三件事定死。
+> 核心纪律一句话：**宁可慢也绝不让长跑因显存/内存溢出崩**。所有"省时"优化的前提都是
+> 先满足这条；任何会盲分配大块显存/内存的写法一律否决。
+>
+> **本机硬件实情（决定下面所有取舍）**：
+> - 内存 ~**34GB**（充足，整张 `[N,C]` 特征矩阵舒服待在内存，**全量数据/全量窗口不砍**）；
+> - GPU **8GB**（可用 ~6.5GB），而 433 通道 × 百万行训练矩阵 ~7–15GB，**塞不进显存**——
+>   所以"整张驻留显存"只在小抽样/早折偶尔成立，正式大跑必须流式喂。
+
+### 12.1 GPU 喂数：三态 `_GpuWindowSource`（`models/dl_models.py`）
+
+把一个 `SequenceDataset` 的「归一化特征矩阵 `[N,C]` + 窗口行索引」喂成 device 上的
+`[B,L,C]` batch 流。**目标 = 让 GPU 不再干等 CPU 拼数据**。三条路按 device + 是否真装得下
+显存**自动选**：
+
+| 模式 | 触发条件 | 做法 | 内存/显存安全 |
+|---|---|---|---|
+| **resident**（纯显存快路） | `mem_get_info()` 实测 `need < 0.6 × free` 才走 | 整张矩阵驻显存，窗口 gather 全在显存带宽上做 | 事前按真实空闲显存判断，**绝不盲分配再接 OOM**；放行后仍 OOM（碎片）→ 二重保险退预取 |
+| **prefetched**（预取流式，**正式大跑主路**） | 装不下显存 | 后台线程在 GPU 算第 i 批时，提前把第 i+1 批 `[B,L,C]` 在 CPU gather→落 pinned 内存，主线程 `non_blocking` 异步拷卡；CPU 备料与 GPU 计算重叠 | 在途同时只有 `_PREFETCH=3` 个 batch（~百 MB 级），**内存有界、永不 OOM**；实测稳态 GPU 利用率 ~**79%**（够好，不再投资） |
+| **cpu** | device 为 cpu（单测 / Mac） | 纯 CPU gather，不涉及 pin/异步 | —— |
+
+关键工程细节：
+- **零拷贝共享**：CPU 侧原料用 `torch.from_numpy(ds.feature_matrix())`，直接共享 dataset
+  里已有的大矩阵，**不再复制一份 14GB**。
+- **pinned 生命周期保证**：预取生成器在 `yield` 处持活 `x_pin`/`y_pin`，消费方下次 `next()`
+  才释放——`non_blocking` 拷贝期间 pinned 源不会被回收（与 PyTorch DataLoader 同条保证）。
+- **不卡死**：producer/consumer 用 `threading.Event` stop + 带超时 `put`/排空队列 + `join(timeout=5)`，
+  消费方提前退出（早停/异常）也能干净收尾。
+- **显式释放**：`predict()` 用 `try/finally: src.free()` 释放 device/CPU 句柄，给下一段腾资源。
+- torch 仍**只在卡带层**出现，脊柱保持 torch-free；CPU 单测路径完全不受影响。
+
+### 12.2 瘦内存管线（把每折峰值从 ~24GB 压到 ~12GB）
+
+硬化前每折会同时压着 **~7 份全量副本**（无限日缓存 + concatenate 双份 + fit 的 nan_to_num
+整张临时 + subset 副本 + 三个 dataset 各一份 transform 副本），119 天全票折直接打穿。逐一干掉：
+
+1. **逐日缓存有界**（`FeatureAdapter._day_cache`）：单日全票 433 特征 ~120MB，无限缓存 144 天
+   = ~17GB。改为**蓄水式保留共享基段**（非 LRU）——所有 expanding 折都从 Jun1 起、共享早期
+   日期前缀；装满 `_day_cache_cap=32` 天（≈3.8GB）后**不淘汰也不新增**，自然钉住最高命中率
+   的共享基段，末端差异日每折从磁盘 pickle 重读（~0.3s/天，便宜）。
+2. **预分配 + 逐日流式填充**（`load_sequence_arrays`）：先据 `_day_nrows` 台账定总行数、一次性
+   `np.empty((total,C))`，再逐日把单日块写进切片——**杜绝 `np.concatenate` 把"所有日块 + 输出"
+   两份 14GB 同时压在内存**。
+3. **Normalizer 分块 fit**（`fit_chunked`）：逐 `CHUNK_ROWS=200k` 行 nan_to_num + float64 累加
+   count/sum/sumsq 合成 mean/std，**不物化整张 nan_to_num 副本**；core+es 当训练区一并统计但
+   **不真的 concatenate**，省一份全量副本，统计值与整块逐位等价。
+4. **原地白化**（`SequenceDataset(own_features=True)` + `transform(inplace=True)`）：本折独占三份
+   arrays，逐块在原缓冲上 nan_to_num + 仿射，**三个 dataset 不再各造一份 `[N,C]`**。
+5. **三段分别现算**（`run_on_dl_fold`）：直接按 core / earlystop / scoring 三段**分别** `_build_arrays`，
+   不"先建整训练帧再 subset"造 14GB+12GB 双份共存；三段日期互斥、并集 = 原训练区，统计口径
+   不变、无泄漏。
+
+**实测效果**：28 天折峰值 RSS **24GB → 12GB**，`val_corr` 完全不变（0.0113）；119 天全票折按
+此外推峰值 ~**22GB**，34GB 机器安全（数组地板本身 ~16GB）。
+
+### 12.3 崩溃可排查日志（正式跑必备）
+
+长跑一旦崩，必须能立刻定位是**显存 OOM / 内存 OOM / 还是别的**。两层日志：
+
+- **分阶段计时行**（`run_on_dl_fold` 打 stderr、`flush=True`，不被重定向缓冲）：每折一行
+  `[fold k timing] load=.. norm=.. build_ds=.. fit_GPU=.. predict=.. metrics=.. | GPU忙占比≈..%`，
+  用来区分"GPU 沉默"沉默在读盘/归一化/建集还是真在算。
+- **后台资源监控**（正式跑期间每 ~15 分钟一采，落独立日志文件）：GPU 利用率 + 显存占用
+  （`nvidia-smi`）+ 进程 RSS（`psutil`）。崩溃后回看这条曲线即可判定是否撞顶。
+- **进程管理用 task 机制（非 ps kill）**：长跑挂后台任务，停止走 task stop，避免误杀/留孤儿。
