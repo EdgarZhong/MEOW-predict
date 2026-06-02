@@ -8,6 +8,8 @@
 
 ### ⏭️ 下一会话直接从这里开始
 
+> **🚨 2026-06-02 夜 重大发现（颠覆"数据锁死"前提，优先读 `docs/原始数据盘点与盘口建模诊断.md`）**：老师说**同数据同题目有人 12%+**（pooled Pearson，同尺子，我们仅 0.0776 → 差距是方法欠债不是数据上限）。诊断证实 **raw 是富 LOB+订单流+226 步日内序列**（62 列），**"无 LOB/数据锁死/raw⊆433" 是错的**；433 严重欠用 raw（挂撤单 20 列只压成 4 个静态比率、盘口形状没建模、全序列压成统计量），**DL 一直喂 433 摘要、从没直接吃过 raw**。**冲 12% 真入口 = 直接建模 raw 盘口（DeepLOB 式，规格里规划过但因假前提没建）**，不是在 433 上抠融合那一个点。融合（Tier-1 ~0.085）降为低风险保底。**下一步待用户拍板**：是否走 raw 盘口建模主线；若走，先在 fold2（传统 0.0904）跑最小 raw 原型看能否超过，再铺三折。
+
 1. **✅ P1 已完成（2026-06-02 本会话）= 传统 ridge NaN 已修 + 合并并 push master**：根因 = X1 ridge 成员（`StandardScaler→Ridge`）输入 float32，~1e15 量级列在 StandardScaler 居中 / X^TX 累加时数值抵消 → 病态/近常数列 → ridge cholesky 失败回退 30GB svd → 内存紧则分配失败成 NaN。**修法（已落 `src/experiment_runner.py`）= 对 StandardScaler→model 的线性 Pipeline 成员(ridge/elasticnet/huber/mlp) 在 fit/predict 前转 float64**（fit 端 `_fit_model_core` line 731、predict 端 line 762；树/提升族尺度无关保持 float32）。全窗 Dec sanity（空闲 ~20GB 紧张态实跑）：**非 NaN，Pearson=0.0775 / R²=0.00585 / MSE~2.4e-5 / 峰值 23GB（cholesky，已绕开 30GB svd）**。已 cherry-pick 到 master（`962a970`）并 push origin（master/feat 均已推）。**判读**：0.0775 是 float64 干净解（旧 0.0803 是 float32 退化 SVD 解），单 20 天窗内属噪声范围持平、R² 反升、且彻底消除内存依赖型 NaN——对交付划算；不在 Dec 单窗调参，真正传统腿判据看 P2 的 3 个选型折。
 2. **⏭️ 第一刀 = P2（task #8，P1 已解锁）**：造对齐 DL 折的无泄漏传统滚动预测——对 3 个选型折 + 交付折逐折 train→predict、落 OOS 预测、按 (date,symbol,interval) 对齐 DL。这是后续集成评估 / 残差训练的地基。
 3. **再 P3**（task #6，依赖 P2）：① 三档消融 + 每档 ρ/集成读数；② **残差训练（DL 目标改 y−ŷ_trad）= 压 ρ 主手段，冲 0.10 的核心**。
