@@ -61,16 +61,18 @@ MEOW--predict/
 
 ## DL 工程地基（脊柱 + 卡带）
 
-DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**脊柱**，把**输入适配 + 模型本体**做成可换**卡带**；PyTorch 封死在卡带内，脊柱全程 torch-free。换模型（LSTM-on-features → TCN-on-原始微结构）只动两块卡带，脊柱零改。主攻 = **TCN 喂 ~59 原始微结构通道**（数据无连续 LOB，DeepLOB 退役，见规格 §8.0 / `NOTE.md`「为什么 TCN」）。
+DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**脊柱**，把**输入适配 + 模型本体**做成可换**卡带**；PyTorch 封死在卡带内。当前主攻 = **截面联合建模**（`XSECTION`：共享 GRU 时序腿 + set-attention 截面腿 + `MSE+λ·corr` + OLS rescale）；`TCN-on-raw` 已因截面盲区否决，`DeepLOB` 因数据无连续 LOB 退役，见规格 §8.0/§8.2 与 `NOTE.md`。
 
 - **脊柱**（`src/sequence_dataset.py` / `src/dl_protocol.py` / `src/dl_trainer.py`）：
   - 序列粒度 = 「同一票同一天」的日内 interval 序列（`[B, L, C]`），**绝不跨日、绝不跨票**；标签因果对齐窗末、warmup 不足窗丢弃。
+  - 截面扩展 = `CrossSectionIndexer` / `CrossSectionDataset` 按 `(date, interval)` 把合法窗口聚成 `[N,L,C]+mask+y`，供 `XSECTION` 卡带内部使用；trainer / 协议 / Orchestrator 不改。
   - 评测 = 三段切分 `[ train_core | earlystop-val | embargo | scoring-val ]`；4 指标（corr/MSE/R²/daily-IC）口径与传统侧 `experiment_runner` 逐字对齐。
   - 防泄漏三道物理保证：窗口不跨界 + 标签因果对齐 + Normalizer 只用训练统计；由 numpy 参考模型（末步线性）兜底探测。
 - **卡带**（`models/dl_models.py`）：
-  - `InputAdapter`：`FeatureAdapter`（包装 433 特征管线，零新公式，绑 LSTM）/ `RawChannelAdapter`（~59 原始微结构通道最小语义归一：价相对 mid / midpx 日内对数收益 / 量 log1p，绑 TCN）/ `IdentityAdapter`（调试 & 合成测试）。
-  - `ModelCartridge`：现仅含 torch-free numpy 参考模型——`ReferenceZero`（corr 基线）/ `ReferenceLast`（末步线性，防泄漏探测器）/ `ReferencePool`（窗口均值池化线性，声明 `STRUCTURE_SEARCH_SPACE` 当 HPO 被测对象 + TCN 模板）；`TCN` / `LSTM` 卡带等 4060 + PyTorch 就绪后再加，脊柱不动。
-- **基础设施**（`src/dl_search.py` / `experiments/run_dl.py`，torch-free）：`Searcher` 随机搜结构 3 旋钮（`seq_len` 走 trainer、`hidden_size`/`num_layers` 走卡带 hparams）+ 排名 + 早杀钩子桩；`Orchestrator` 组装+冻结 RunConfig+dump JSON，按 `stage` 派 SEARCH（海选，落 `trials.csv`/`best_config.json`）/ VALIDATION（定参认证，落 `fold_metrics.csv`/`summary.json`）。
+  - `InputAdapter`：`FeatureAdapter`（包装 433 特征管线，零新公式，供 GRU/XSECTION）/ `RawChannelAdapter`（~59 原始微结构通道最小语义归一，TCN 历史对照）/ `IdentityAdapter`（调试 & 合成测试）。
+  - `ModelCartridge`：`ReferenceZero` / `ReferenceLast` / `ReferencePool` 三个 torch-free 参考模型；`GRU`（433 工程特征时序基线）；`XSECTION`（截面主攻卡带，绑 `FEATURE_433`）；`TCN` / `LSTM` / `DEEPLOB` 保留为历史或占位词位。
+- **损失**（`src/dl_losses.py`）：可微 Pearson、masked 截面 Pearson、`MSE + λ·(1−corr)` 组合损失，以及训练段 OLS 线性 rescale。
+- **基础设施**（`src/dl_search.py` / `experiments/run_dl.py`）：`Searcher` 处理结构旋钮（`seq_len` 走 trainer、`hidden_size`/`num_layers` 走卡带 hparams）；`Orchestrator` 支持 `Stage.SWEEP` 一命令两档，并逐 trial / 逐折增量落盘 `trials.csv`、`fold_metrics.csv`、`progress.jsonl`、`summary.partial.json`，`--resume` 可跳过已完成项。
 - **配置**（`config/`）：分布式声明 + 中央组装；`RunConfig` 为 frozen dataclass（= config-lock 机械实现），`assemble_run_config` 在组装期校验 required_adapter / 阶段搭配 / 数据窗口，并算 `config_fingerprint` 防漂移。
 
 设计真相源：`docs/specs/DL实验设计规格.md`。
@@ -105,7 +107,7 @@ pip install -r requirements-dev.txt
   - **torch 单独装**（GPU wheel 不在默认 PyPI、cu 版本随机器 NVIDIA 驱动而变，故不进上面的 `-r` 列表）：本机 = `torch==2.6.0+cu124`（RTX 4060 / CUDA 12.4）；**换机的 cu 标签选择指引 + 装后自检命令见 `requirements.txt` 末尾注释**
   - 开发 / 测试再叠加：`pip install -r requirements-dev.txt`（pytest；项目用例本是 unittest，`python -m unittest` 亦可跑）
 
-**import 约定**：`src/` / `config/` / `models/` 三个目录均为**平铺**（非包），入口需把三者都加入 path —— 运行脚本用 `PYTHONPATH=src:config:models`（Orchestrator 还需 `experiments`，或直接 `python experiments/run_dl.py`，其文件头已自插 path）；`tests/test_dl_pipeline.py` 与 `tests/test_dl_infrastructure.py` 均在文件头自行插入目录，直接 `python -m unittest` 即可。
+**import 约定**：`src/` / `config/` / `models/` 三个目录均为**平铺**（非包），入口需把三者都加入 path —— 运行脚本用 `PYTHONPATH=src:config:models`（Orchestrator 还需 `experiments`，或直接 `python experiments/run_dl.py`，其文件头已自插 path）；`tests/test_dl_pipeline.py`、`tests/test_dl_infrastructure.py`、`tests/test_dl_xsection.py` 均在文件头自行插入目录，直接 `python -m unittest` 即可。
 
 ## 运行方式
 
@@ -116,6 +118,7 @@ cd MEOW--predict
 # —— DL 地基 + 基础设施验收单测（torch-free，秒级，Mac CPU 可跑）——
 python -m unittest tests.test_dl_pipeline -v          # D0 六项验收闸
 python -m unittest tests.test_dl_infrastructure -v    # RawChannelAdapter / Searcher / Orchestrator
+python -m unittest tests.test_dl_xsection -v          # 截面聚票 / Pearson loss / XSECTION 卡带
 
 # —— DL Orchestrator 海选 smoke（torch-free 参考卡带 + 真实数据抽样，验证端到端）——
 PYTHONPATH=src:config:models:experiments python experiments/run_dl.py \

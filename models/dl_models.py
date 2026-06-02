@@ -1496,6 +1496,7 @@ def _safe_n_heads(hidden_size: int, requested: int) -> int:
 def _build_xsection_module(
     input_channels: int, hidden_size: int, num_layers: int,
     dropout: float, n_heads: int, attn_dropout: float,
+    cross_z: bool = False,
 ):
     """
     截面模型：因子化两腿 + 零初门控残差（规格 §8.2）。
@@ -1516,6 +1517,12 @@ def _build_xsection_module(
     class XSectionModel(nn.Module):
         def __init__(self):
             super().__init__()
+            # 截面内输入归一（cross-z）开关：True 时 forward 第一层把每个 (date,interval)
+            # 快照内、各 (lag,channel) 沿在场票做 z-score——正是传统 0.0776 主力那一维
+            # cross-z/rank 的显式输入端供给（规格 §8.2.1 落地修订的「日后专门实验」）。
+            # rescale 永远开（§定稿 第 2 条）→ cross-z 抹绝对量纲也不威胁 R²≥0。
+            self.cross_z = bool(cross_z)
+            self._cz_eps = 1e-5
             gru_drop = float(dropout) if int(num_layers) > 1 else 0.0
             # 共享时序腿：与 GRU 卡带同构，取末步隐藏态作每票日内路径编码。
             self.gru = nn.GRU(
@@ -1540,6 +1547,16 @@ def _build_xsection_module(
         def forward(self, x, mask):
             # x: [B, N, L, C]；mask: [B, N]（True=在场票，False=pad）
             B, N, L, C = x.shape
+            # 截面内 cross-z（可选，默认关）：每个快照、每个 (lag,channel) 沿在场票 z-score。
+            # 只用 mask 内真实票算统计（pad 不污染），算完把 pad 位重新置 0。置换等变保持
+            # （统计是对称聚合、逐票同一变换），故「打乱在场票顺序输出同序置换」不变。
+            if self.cross_z:
+                m = mask[:, :, None, None].to(x.dtype)            # [B,N,1,1]
+                cnt = m.sum(dim=1, keepdim=True).clamp_min(1.0)   # [B,1,1,1] 各快照在场票数
+                mean = (x * m).sum(dim=1, keepdim=True) / cnt     # [B,1,L,C]
+                var = ((x - mean) ** 2 * m).sum(dim=1, keepdim=True) / cnt
+                x = (x - mean) / var.clamp_min(self._cz_eps).sqrt()
+                x = x * m                                          # pad 位归零，避免假值进 GRU
             # 时序腿：把 (B,N) 摊平成一批序列，逐票独立编码（不跨票）。
             out, _ = self.gru(x.reshape(B * N, L, C))
             h = out[:, -1, :].reshape(B, N, -1)              # [B, N, d]
@@ -1603,6 +1620,8 @@ class CrossSectionCartridge(ModelCartridge):
             "device": "auto",
             # 截面卡带默认带 corr 项（它才是真截面 IC）；λ=0 即纯 MSE 消融、走 --hparams 切。
             "lambda_corr": 0.3,
+            # 截面内输入 cross-z 归一（默认关=当前基线语义）；=1 打开做三档消融，走 --hparams 切。
+            "cross_z": 0,
         }
         merged.update(dict(hparams or {}))
         return merged
@@ -1657,6 +1676,7 @@ class CrossSectionCartridge(ModelCartridge):
             torch.cuda.manual_seed_all(int(seed))
 
         n_heads = _safe_n_heads(int(cfg["hidden_size"]), int(cfg["n_heads"]))
+        cross_z = bool(int(cfg.get("cross_z", 0)))
         self._model = _build_xsection_module(
             input_channels=train_xs.n_channels,
             hidden_size=int(cfg["hidden_size"]),
@@ -1664,6 +1684,7 @@ class CrossSectionCartridge(ModelCartridge):
             dropout=float(cfg["dropout"]),
             n_heads=n_heads,
             attn_dropout=float(cfg["attn_dropout"]),
+            cross_z=cross_z,
         ).to(self._device)
 
         optimizer = torch.optim.AdamW(
@@ -1749,6 +1770,7 @@ class CrossSectionCartridge(ModelCartridge):
                 "num_layers": int(cfg["num_layers"]),
                 "n_heads": int(n_heads),
                 "lambda_corr": lambda_corr,
+                "cross_z": cross_z,
                 "rescale_a": float(self._rescale_a),
                 "rescale_b": float(self._rescale_b),
             },

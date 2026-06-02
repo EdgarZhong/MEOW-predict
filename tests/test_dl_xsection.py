@@ -345,6 +345,74 @@ class TestXSectionModule(unittest.TestCase):
         self.assertEqual(_safe_n_heads(7, 4), 1)
 
 
+@_skip_no_torch
+class TestXSectionCrossZ(unittest.TestCase):
+    """截面内 cross-z 输入归一（线 B：把传统主力那维 cross-z 显式喂进模型）。"""
+
+    def _model(self, cross_z, C=2, d=8, heads=2, gamma=1.0):
+        from dl_models import _build_xsection_module
+        torch.manual_seed(0)
+        m = _build_xsection_module(input_channels=C, hidden_size=d, num_layers=1,
+                                   dropout=0.0, n_heads=heads, attn_dropout=0.0, cross_z=cross_z)
+        m.eval()
+        with torch.no_grad():
+            m.gamma.fill_(float(gamma))
+        return m
+
+    def test_cross_z_removes_cross_sectional_level(self):
+        # cross_z=on：给某 (l,c) 上所有在场票同加常数 → 截面去均值后不变 → 输出不变。
+        m = self._model(cross_z=True)
+        torch.manual_seed(3)
+        N, L, C = 6, 4, 2
+        x = torch.randn(1, N, L, C)
+        mask = torch.ones(1, N, dtype=torch.bool)
+        x_shift = x.clone()
+        x_shift[0, :, 2, 1] += 3.7                     # 同一 (l=2,c=1) 全票平移
+        with torch.no_grad():
+            o, o_shift = m(x, mask), m(x_shift, mask)
+        self.assertTrue(torch.allclose(o, o_shift, atol=1e-4))
+
+    def test_cross_z_off_is_sensitive_to_level(self):
+        # 对照：cross_z=off 时同样的平移会改变输出（证明不变性确由 cross-z 产生）。
+        m = self._model(cross_z=False)
+        torch.manual_seed(3)
+        N, L, C = 6, 4, 2
+        x = torch.randn(1, N, L, C)
+        mask = torch.ones(1, N, dtype=torch.bool)
+        x_shift = x.clone()
+        x_shift[0, :, 2, 1] += 3.7
+        with torch.no_grad():
+            o, o_shift = m(x, mask), m(x_shift, mask)
+        self.assertGreater(float((o - o_shift).abs().max()), 1e-4)
+
+    def test_cross_z_mask_ignores_pad(self):
+        # 加一只 mask=False 的 pad 票，不应改变在场票的截面统计 → 在场票输出不变。
+        m = self._model(cross_z=True)
+        torch.manual_seed(5)
+        N, L, C = 5, 3, 2
+        x = torch.randn(1, N, L, C)
+        mask = torch.ones(1, N, dtype=torch.bool)
+        x_pad = torch.cat([x, torch.randn(1, 1, L, C)], dim=1)        # 末尾加一只票
+        mask_pad = torch.cat([mask, torch.zeros(1, 1, dtype=torch.bool)], dim=1)  # 该票 mask=False
+        with torch.no_grad():
+            o = m(x, mask)[0]                            # [N]
+            o_pad = m(x_pad, mask_pad)[0, :N]            # 前 N 只在场票
+        self.assertTrue(torch.allclose(o, o_pad, atol=1e-4))
+
+    def test_cross_z_permutation_equivariant(self):
+        # cross-z 是对称聚合 + 逐票同一变换 → 置换等变保持。
+        m = self._model(cross_z=True, gamma=1.5)
+        torch.manual_seed(7)
+        N, L, C = 5, 4, 2
+        x = torch.randn(1, N, L, C)
+        mask = torch.ones(1, N, dtype=torch.bool)
+        perm = torch.tensor([2, 0, 4, 1, 3])
+        with torch.no_grad():
+            out = m(x, mask)[0]
+            out_p = m(x[:, perm], mask)[0]
+        self.assertTrue(torch.allclose(out_p, out[perm], atol=1e-5))
+
+
 # ================================================================== #
 # Phase 3 · 截面卡带端到端 smoke + registry
 # ================================================================== #

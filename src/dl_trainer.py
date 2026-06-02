@@ -25,6 +25,7 @@ torch-free 且不反向依赖卡带目录。具体卡带/适配器由 Orchestrat
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from typing import Callable, Dict, Optional, Sequence
@@ -151,9 +152,17 @@ class SequenceTrainer(BaseTrainer):
             _t["predict"] = time.time() - _m; _m = time.time()
 
             # 4) 4 指标（脊柱在 predict 之后算一次；scoring 在此前一次不碰）。
-            vm = evaluate_prediction_bundle(scoring_ds.label_frame(), pred_val)
+            val_lf = scoring_ds.label_frame()        # date/symbol/interval/label，行序与 pred_val 对齐
+            vm = evaluate_prediction_bundle(val_lf, pred_val)
             tm = evaluate_prediction_bundle(train_core_ds.label_frame(), pred_train)
             _t["metrics"] = time.time() - _m
+
+            # 4b) 逐票预测落盘（仅当 spec 带 dump_preds_dir；默认不落，零开销）。供「DL↔传统
+            #     预测相关性」等离线分析；GRU/截面卡带都把预测映射回 SequenceDataset 窗口序，
+            #     故此处对两种卡带统一：val_lf 的 (date,symbol,interval,label) 与 pred_val 行对齐。
+            dump_dir = self.spec.get("dump_preds_dir")
+            if dump_dir:
+                self._dump_fold_preds(dump_dir, fold.fold_id, profile_name, val_lf, pred_val)
             _gpu_busy = _t["fit_GPU"] + _t["predict"]
             _total = sum(_t.values()) or 1.0
             print(
@@ -216,6 +225,38 @@ class SequenceTrainer(BaseTrainer):
                 status="error", error_msg=str(e)[:500],
                 notes=self.spec.get("notes", ""),
             )
+
+    # ---- 逐票预测落盘（离线分析用，默认关） ---- #
+    def _dump_fold_preds(
+        self,
+        dump_dir: str,
+        fold_id: int,
+        profile_name: str,
+        val_lf: pd.DataFrame,
+        pred_val: np.ndarray,
+    ) -> None:
+        """
+        把某折 scoring 段的逐票预测落成 CSV：``date,symbol,interval,label,pred``。
+
+        - 键 ``(date,symbol,interval)`` 用整数编码（与提交链 ``MeowEngine`` 同源），
+          供离线 join 传统侧预测算「DL↔传统」相关性。
+        - 行序 = ``SequenceDataset`` 窗口序（GRU/截面卡带的 predict 均映射回此序），
+          故 ``pred_val`` 与 ``val_lf`` 严格行对齐。
+        - 失败不抛（落盘是旁路诊断，绝不拖垮训练）：打 stderr 警告即返回。
+        """
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            out = val_lf.copy()
+            # 标签列统一改名为 ``label``（label_frame 用 TARGET_COL=fret12），与传统侧
+            # dump_trad_preds.py 落盘列名对齐，分析脚本可直接按 (date,symbol,interval) join。
+            meta = ("date", "symbol", "interval")
+            out = out.rename(columns={c: "label" for c in out.columns if c not in meta})
+            out["pred"] = np.asarray(pred_val, dtype=np.float64).reshape(-1)
+            fname = f"preds_{profile_name}_fold{fold_id}_seed{self.seed}.csv"
+            out.to_csv(os.path.join(dump_dir, fname), index=False)
+        except Exception as e:  # 旁路诊断失败不影响主流程
+            print(f"[dump-preds] 警告: 落盘失败 fold{fold_id} seed{self.seed}: {e}",
+                  file=sys.stderr, flush=True)
 
     # ---- BaseTrainer 兼容入口 ---- #
     def run_fold(self, fold_data: FoldData) -> FoldResult:

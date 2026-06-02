@@ -76,6 +76,7 @@ class Orchestrator:
         adapter=None,
         cartridge_factory: Optional[Callable[[], object]] = None,
         resume: bool = False,
+        dump_preds: bool = False,
     ):
         self.cfg = run_config
         self.h5dir = h5dir
@@ -83,6 +84,9 @@ class Orchestrator:
         # 续跑开关：True 时启动会读回已落盘的 trial / (seed,fold)，跳过已完成的不重算
         # （仅 SWEEP 支持，见 _run_sweep）。默认关 → 与改造前一致：每次 run 从头重写。
         self.resume = bool(resume)
+        # 逐票预测落盘开关：True 时各折把 scoring 段逐票预测落 <out_dir>/<run_id>/preds/，
+        # 供「DL↔传统预测相关性」离线分析；默认关、零开销（见 _spec 注入 dump_preds_dir）。
+        self.dump_preds = bool(dump_preds)
         # 依赖注入：默认从 registry + MeowDataLoader 构建；测试可注入合成 loader / 参考卡带。
         self.adapter = adapter if adapter is not None else build_adapter(run_config.adapter)
         if hasattr(self.adapter, "bind_data_sources"):
@@ -113,7 +117,7 @@ class Orchestrator:
     # ---- 给 SequenceTrainer / FoldResult 的元信息 ---- #
     def _spec(self) -> Dict:
         c = self.cfg
-        return {
+        spec = {
             "experiment_id": c.run_id,
             "model_type": c.model.kind.value,
             "feature_set": c.adapter.kind.value,
@@ -121,6 +125,10 @@ class Orchestrator:
             "postprocess_type": "none",
             "notes": f"fp={c.config_fingerprint}",
         }
+        if self.dump_preds:
+            # 逐票预测落 <out_dir>/<run_id>/preds/（run() 里 out_dir 同构）。
+            spec["dump_preds_dir"] = os.path.join(c.exec_.out_dir, c.run_id, "preds")
+        return spec
 
     # ---- 顶层入口 ---- #
     def run(self) -> dict:
@@ -827,6 +835,9 @@ def main(argv=None):
                     help="抽前 N 个 symbol 控内存（参考卡带 gather_all 用）；<=0 = 不抽样")
     ap.add_argument("--resume", action="store_true",
                     help="续跑：复用同 run-id 目录下已落盘的 trial/(seed,fold)，跳过已完成的不重算（SWEEP）")
+    ap.add_argument("--dump-preds", action="store_true",
+                    help="把每折 scoring 段逐票预测落 <out_dir>/<run_id>/preds/（date,symbol,interval,label,pred），"
+                         "供「DL↔传统预测相关性」等离线分析；默认关、零开销")
     args = ap.parse_args(argv)
 
     rc = _build_run_config(args)
@@ -839,6 +850,7 @@ def main(argv=None):
         h5dir=args.h5dir,
         feature_dir=args.feature_dir,
         resume=args.resume,
+        dump_preds=args.dump_preds,
     )
     summary = orch.run()
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
