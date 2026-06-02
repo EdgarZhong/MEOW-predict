@@ -149,6 +149,59 @@ def _recent_anchored_splits(
     return list(reversed(out))
 
 
+def build_delivery_fold(
+    rolling_start: int,
+    train_end: int,
+    eval_end: int,
+    *,
+    embargo: int = 1,
+    earlystop_frac: float = 0.15,
+    min_earlystop_days: int = 1,
+    min_core_days: int = 10,
+    fold_id: int = 0,
+    calendar: Optional[Calendar] = None,
+) -> DLFold:
+    """
+    构造 DL 交付对齐折（AGENTS §十一·11.2/11.6）。
+
+    语义固定为：
+    - 训练区：``rolling_start`` 到 ``train_end``（含），例如 Jun–Nov 全量；
+    - embargo：训练截止后的若干交易日，默认 1 日，用来保持与主裁判折一致的防泄漏间隔；
+    - 打分区：embargo 之后到 ``eval_end``（含），例如 Dec 剩余交易日。
+
+    这个折只用于冠军定死后的只读交付读数，不参与 SWEEP 档1/档2 的排名。
+    """
+    cal = calendar or Calendar()
+    train_dates = cal.range(rolling_start, train_end)
+    all_dates = cal.range(rolling_start, eval_end)
+    if not train_dates:
+        raise ValueError("delivery 折训练区为空，请检查 rolling_start/train_end")
+    if not all_dates:
+        raise ValueError("delivery 折日期区间为空，请检查 rolling_start/eval_end")
+    train_dates = list(train_dates)
+    all_dates = list(all_dates)
+    if train_dates[-1] not in all_dates:
+        raise ValueError("delivery 折 train_end 不在 eval_end 覆盖的交易日区间内")
+
+    train_end_idx = all_dates.index(train_dates[-1])
+    embargo = max(0, embargo)
+    embargo_dates = tuple(all_dates[train_end_idx + 1: train_end_idx + 1 + embargo])
+    scoring_dates = tuple(all_dates[train_end_idx + 1 + embargo:])
+    if not scoring_dates:
+        raise ValueError("delivery 折打分区为空，请增大 delivery_eval_end 或减小 embargo")
+
+    core, es = split_train_earlystop(train_dates, earlystop_frac, min_earlystop_days, min_core_days)
+    fold = DLFold(
+        fold_id=fold_id,
+        train_core_dates=core,
+        earlystop_dates=es,
+        embargo_dates=embargo_dates,
+        scoring_dates=scoring_dates,
+    )
+    assert_folds_causal([fold])
+    return fold
+
+
 def build_dl_folds(
     rolling_start: int,
     rolling_end: int,

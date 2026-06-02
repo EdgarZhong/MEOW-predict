@@ -1,7 +1,7 @@
 # DL 实验设计规格
 
 创建日期：2026-05-31
-状态：设计定稿（D0 地基待实现）
+状态：设计定稿（D0 地基与截面卡带已落地；正式长跑前仍需 maxfold 内存演练）
 适用范围：MEOW 金融时序预测 —— 深度学习（DL）主线（Windows 4060 / PyTorch）
 
 > 本文是 DL 主线的**设计真相源**。规则正文（红线纪律、两速评测、宽进严出等通用口径）仍以 `AGENTS.md` 为准；本文只补 DL 特有的架构、协议、配置与地基约定。动态进度看 `CLAUDE.md`。
@@ -139,7 +139,7 @@ class ModelCartridge:
 
 ## 5. 评测协议
 
-> ⚠️ **2026-06-01 作废通告**：本节 §5.2 的"海选(单切分+早杀) + expanding 两阶段"口径**已废**，由 `AGENTS.md §十一 DL 评测协议`取代（锚定扩展 walk-forward + purge/embargo + 最坏折/bootstrap + 一命令两档预算）。原因见 `NOTE.md`「交付=方法非权重 → 评测协议为什么这么重设计」。下方 §5.3 三段折+embargo、§5.4 四指标双镜头、§5.5 numpy 参考模型**仍有效**，沿用。
+> ⚠️ **2026-06-01 作废通告 / 2026-06-02 修订**：本节 §5.2 的"海选(单切分+早杀) + expanding 两阶段"口径**已废**，由 `AGENTS.md §十一 DL 评测协议`取代（锚定扩展 walk-forward + purge/embargo + 最坏折/bootstrap + 一命令两档预算）。**2026-06-02 §十一 又修订为：选型折 3 段×~20 交易日（月度 Sep–Nov）+ Dec 抽出做"交付对齐折"（方案 A：`train(Jun–Nov)/embargo(Dec1)/eval(Dec4–Dec29)`，1 seed、只报不选、验交付链）**——一切折口径以 `AGENTS.md §十一` 为准。原因见 `NOTE.md`「交付=方法非权重 → 评测协议为什么这么重设计」。下方 §5.3 三段折+embargo、§5.4 四指标双镜头、§5.5 numpy 参考模型**仍有效**，沿用。
 
 ### 5.1 walk-forward 复用，不另起炉灶
 
@@ -315,17 +315,17 @@ config/
 
 **目标**：每个 `(date, interval)` 把当时在场的 ~N 票横喂一个模型，让网络看见"这只票此刻在全市场排第几"——cross-z / cross-rank 那一维 alpha（传统 0.0776 主力、TCN-on-raw 整整瞎掉的维度）。
 
-**结构 = 因子化两腿 + 残差**（业界 STGNN / 关系排序同构；为什么不用时空联合大注意力、不用 GAT/GCN 图网络见 `NOTE.md`）：
+**结构 = 因子化两腿 + 零初门控残差**（业界 STGNN / 关系排序同构；为什么不用时空联合大注意力、不用 GAT/GCN 图网络见 `NOTE.md`）：
 
 ```
 每票日内窗 [L, C] ──共享时序腿(GRU，所有票/所有 interval 同一套权重)──▶ h_i ∈ R^d
 {h_1..h_N}(同一 (date,interval) 在场票) ──截面腿(set-attention，无位置/无 ID，带 padding mask)──▶ Δ_i
-z_i = h_i + Δ_i (残差) ──per-票头(Linear)──▶ ŷ_i  (该票该 interval 的 fret12)
+z_i = h_i + γ·Δ_i (γ 初始化 0) ──per-票头(Linear)──▶ ŷ_i  (该票该 interval 的 fret12)
 ```
 
 - 时序腿权重**跨票 + 跨 interval 共享**（样本效率拉满）；截面腿只在某 `(date,interval)` 的票集合内自注意力。
 - set-attention **无位置编码、无股票 ID** → 置换等变 + 零身份（换池子免费保险，§十一·11.5）。
-- **残差**：截面腿学不到 → Δ≈0 → 退化回纯时序 GRU 基线（= GRU-on-433 那条 ③）→ ③ 天然是 ② 的消融下界。
+- **零初门控残差**：`γ` 标量初始化 **0** → 训练起点截面腿零贡献、逐位等价纯时序 GRU 基线（= GRU-on-433 那条 ③，③ 天然是 ② 的消融下界）；学得到截面增益再放大 `γ`。
 
 **张量契约泛化（§8.1 扩展缝兑现，唯一动脊柱处）**：
 
@@ -333,14 +333,28 @@ z_i = h_i + Δ_i (残差) ──per-票头(Linear)──▶ ŷ_i  (该票该 int
 |---|---|---|
 | 样本单元 | 某 (票,日,interval) 一个窗 `[L,C]` | 某 (date,interval) 的票集合 `[N,L,C]` + `mask[N]` + `y[N]` |
 | Window Indexer | 按 (票,日) 逐窗 gather | 按 (date,interval) 聚票，各票取前 L 窗 stack；变长 N → pad + mask（不跨日、因果对齐不变） |
-| Normalizer | 通道 train-stat 白化 | 同上 **+ 加一档截面内归一（每 (date,interval) cross-z）** ← 正补 TCN 瞎掉的那维 |
-| 协议 / 指标 / HPO / Orchestrator / SWEEP | — | **全不动**（脊柱+卡带架构的价值兑现） |
+| Normalizer | 通道 train-stat 白化 | **v1 沿用逐通道 train-stat 白化、不加 cross-z**（见下「落地修订」） |
+| 协议 / 指标 / HPO / Orchestrator / SWEEP / trainer | — | **全不动**（脊柱+卡带架构的价值兑现；卡带内部把 `SequenceDataset` 重组成截面，trainer 零改） |
 
-**卡带**：新 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 `FEATURE_433`）；torch（共享 GRU + `nn.MultiheadAttention` 1 块 + 残差 + Linear 头）；loss = `MSE + λ·(1 − 截面内 Pearson)`，λ∈{0,0.3} 走 SWEEP 小网格。
+**卡带**：新 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 `FEATURE_433`）；torch（共享 GRU + `nn.MultiheadAttention` 1 块 + 零初门控残差 + Linear 头）；loss = `MSE + λ·(1 − 截面内 Pearson)`，λ∈{0,0.3} 走 SWEEP（λ 经 `--hparams lambda_corr`）。
 
 **与评分联姻**：一次预测整截面 ~N 个 fret12 → corr 项就是**截面内 Pearson** = 老师 pooled corr / daily-IC 那一维，预测一个截面、直接优化它的截面排名。
 
 **风险盒**：截面腿是冲 0.10 主攻一摆；周中若 ③ 基线 + ② 截面都无正信号超传统保底（最坏折 + 均值双镜头），回落保底交付（DL 作增强叠传统核心，§十一·11.8）。
+
+#### 8.2.1 落地修订（2026-06-02，WT-B 合并后；凡与上表冲突以本节为准）
+
+实现已落 `src/sequence_dataset.py`（`CrossSectionIndexer` / `CrossSectionDataset`）、`models/dl_models.py`（`_build_xsection_module` / `_GpuCrossSectionSource` / `CrossSectionCartridge`）、`src/dl_losses.py`、`tests/test_dl_xsection.py`。三处口径较上文收敛：
+
+1. **截面内 cross-z 归一化：v1 不做、且不做开关**（覆盖上表「加一档 cross-z」）。理由：① 截面那维由**学出来的 set-attention 截面腿**承重，不再靠输入端 cross-z；② 433 已含 cross-z/cross-rank，再叠冗余；③ 输入端跨票 z-score 会抹掉绝对量级，威胁「R²≥0」硬底。v1 用 Normalizer 现有逐通道 train-stat 白化（按 `[N,L,C]`）。日后若验证截面腿需显式 cross-norm，再当专门实验加回。
+
+2. **损失固定 `MSE + λ·(1−截面内 Pearson)`，不做 MSE/Huber 开关**；corr 项 = masked 逐快照 Pearson（`src/dl_losses.py`，数值稳定可微、向量化、≥2 票才计入、对各快照等权平均）；λ 经 `--hparams lambda_corr`，不进 search_space。
+
+3. **预测永远套全局线性 rescale `a·ŷ+b`**（OLS **fit-on-train / apply-on-val**，零泄漏，GRU + XSECTION 两卡带都套）。机理：OLS 重标定后**训练段** `R²=corr²` 精确成立，故 corr>0 即保 R²≥0；val 上套用 train 系数，受 train→val 尺度漂移影响可微负，这是零泄漏口径下可接受的真实读数。选 λ 仍只按 max val_corr，三指标逐折照报供核对。
+
+**卡带数据缝（关键）**：`CrossSectionCartridge` 吃 trainer 现成的 `SequenceDataset`，内部用 `CrossSectionDataset.from_whitened(ds.feature_matrix(), ds.arrays, ds.seq_len)` **零再白化、零复制**地按 `(date,interval)` 重组成快照；predict 逐快照前向后，用 `argsort(flat_label_rows)` 把逐票预测映射回 `ds.label_rows` 升序（两者末行集合相同，映射无损）→ 指标对齐仍走 `SequenceDataset.label_frame()`。**故 `src/dl_trainer.py`、协议、Orchestrator、SWEEP 全部零改**。
+
+**内存纪律**：`_GpuCrossSectionSource` 复用 `_GpuWindowSource` 同款「事前显存预算判断 → resident / 否则 CPU-gather→整批搬卡」两态（截面 `[B,maxN,L,C]` 瞬时更吃显存，`_VRAM_FRAC` 收紧到 0.45，`snap_batch` 默认 4 控瞬时）；每批瞬时有界、避免整期截面物化。
 
 ## 9. D0 地基交付物（torch-free，Mac CPU 即可跑通）
 
@@ -371,9 +385,9 @@ DL 评测就两段（§5.2）：**海选（便宜搜超参）→ expanding 认�
 
 - **D0 地基 + 接卡前基础设施**：✅ 已落地（§9 六件 + Searcher / Orchestrator / RawChannelAdapter，torch-free / Mac CPU 跑通）。`ModelKind` 含 `TCN`(否决) / `GRU`(已实现) / `DEEPLOB`(退役)；`AdapterKind` 含 `FEATURE_433` / `RAW_CHANNELS` / `IDENTITY`。
 - **TCN-on-raw**：❌ **否决**（卡带本体 + 海选 + expanding 均已跑完）。真因 = 截面盲区，非 max_epochs；详见 `NOTE.md`「路线再收敛」、`CLAUDE.md` 看板。
-- **新评测协议落代码**：✅ 已落地——`Stage.SWEEP`「一命令两档」（档1 小网格 × 近 2 折 × 2 seed → 按**最坏折**选冠军；档2 冠军 × 5 折 × 3 seed）+ `build_dl_folds(fold_select="recent")`（Oct–Dec 五段不重合、自 `rolling_end` 倒贴）+ `enumerate_grid`（确定性网格）。口径权威见 `AGENTS.md §十一`。
-- **GRU-on-433 基线（当前主跑）**：✅ 卡带已实现（绑 `FEATURE_433`、MSE + AdamW + 早停）；走 `SWEEP` 新 rolling 出第一个可信 features-DL 读数 + 立保底。实跑命令见 `CLAUDE.md`。`MSE+λ·corr` 损失对齐为下一增量（改卡带 loss，下一晚）。
-- **截面模型卡带（主攻，待实现）**：见 §8.2 设计——共享时序腿（GRU 编码每票日内路径）+ 截面腿（set-attention 跨票、置换等变零身份）+ per-票头、残差融合；需把张量契约从单张 `[L,C]` 泛化成「整截面快照 `[N,L,C]` + mask」（§8.1 扩展缝、Window Indexer 重写为按 `(date,interval)` 聚票）。
+- **新评测协议落代码**：✅ 两档骨架已落地——`Stage.SWEEP`「一命令两档」（档1 小网格 × 近 2 折 × 2 seed → 按**最坏折**选冠军；档2 冠军 × N 折 × 3 seed）+ `build_dl_folds(fold_select="recent")` + `enumerate_grid`（确定性网格）。✅ **2026-06-02 协议修订已落代码**：① 选型折改 **3 段×~20 交易日（月度 Sep–Nov，rolling 截到 Nov 末）**；② 新增显式 `--delivery-eval-end` **交付对齐折**——冠军定死后跑 `train(Jun–Nov)/embargo(Dec1)/eval(Dec4–Dec29)` × 1 seed，写 `summary.json` 的 `delivery` 块、不参与排名。口径权威见 `AGENTS.md §十一`（11.2/11.6/11.8/11.9，2026-06-02 修订段）。
+- **GRU-on-433 基线**：✅ 卡带已实现（绑 `FEATURE_433`、MSE + AdamW + 早停）。**`MSE+λ·corr` 损失对齐 + OLS rescale 后处理已落（2026-06-02）**：λ 经 `--hparams lambda_corr`、预测永远套训练段 OLS rescale（§8.2.1）。
+- **截面模型卡带（主攻）**：✅ **已落地（2026-06-02，§8.2.1）**——`XSECTION` 卡带（共享 GRU 时序腿 + set-attention 截面腿 + 零初门控残差 + per-票头 + masked 截面 Pearson 损失 + rescale），张量契约经 `CrossSectionIndexer`/`CrossSectionDataset` 按 `(date,interval)` 聚票泛化；测试入口见 `tests/test_dl_xsection.py`。maxfold 内存演练见 `CLAUDE.md`。
 - **早杀实现**：`EarlyKillPolicy` 钩子在位（no-op）；GRU 卡带可逐 epoch 回调，撞 GPU 上限再接。
 - **多张量/图输入**：暂不实现，按 §8.1 留缝。
 - **传统交付 fit/predict 签名核验**：遗留另会话办（见 `CLAUDE.md` 看板），与 DL 地基不冲突。

@@ -31,7 +31,7 @@ from sequence_dataset import (  # noqa: E402
     build_sequence_arrays_from_frames, subset_by_dates,
 )
 from dl_protocol import (  # noqa: E402
-    assert_folds_causal, build_dl_folds, evaluate_prediction_bundle, summarize_folds,
+    assert_folds_causal, build_delivery_fold, build_dl_folds, evaluate_prediction_bundle, summarize_folds,
 )
 from dl_trainer import SequenceTrainer  # noqa: E402
 from dl_models import IdentityAdapter, ReferenceLastCartridge, ReferenceZeroCartridge  # noqa: E402
@@ -225,6 +225,17 @@ class TestProtocolAndE2E(unittest.TestCase):
                                step=10, min_train_days=20, earlystop_frac=0.2, max_folds=3)
         self.assertGreater(len(folds), 0)
         assert_folds_causal(folds)   # 四段时间严格递增、embargo 隔开训练/打分
+
+    def test_delivery_fold_causal_and_excludes_embargo(self):
+        # 交付折：训练截止后的 embargo 日只隔离，不进入 Dec 只读打分区。
+        fold = build_delivery_fold(
+            1, 10, 15, embargo=2, earlystop_frac=0.2, min_core_days=3,
+            calendar=_IntCalendar(range(1, 16)),
+        )
+        self.assertEqual(fold.train_dates, tuple(range(1, 11)))
+        self.assertEqual(fold.embargo_dates, (11, 12))
+        self.assertEqual(fold.scoring_dates, (13, 14, 15))
+        assert_folds_causal([fold])
 
     def test_metrics_perfect_prediction(self):
         lf = pd.DataFrame({"date": [1, 1, 2, 2, 2], "fret12": [0.1, -0.2, 0.3, 0.0, -0.1]})

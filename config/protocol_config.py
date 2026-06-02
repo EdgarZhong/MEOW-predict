@@ -54,6 +54,7 @@ class ProtocolConfig:
     earlystop_frac: float = 0.15
     max_folds: Optional[int] = None
     fold_select: str = "first"      # "first"=最早若干折（默认/调试）；"recent"=最近若干折倒贴 rolling_end（§十一·11.2 新协议）
+    delivery_eval_end: Optional[int] = None   # SWEEP 交付对齐折 eval 末日；None=不跑交付折（调试/旧路径）
 
     def fold_mode(self) -> str:
         """派生 build_dl_folds 的 mode：两种 profile 都走 expanding 切法（单切分=取 1 折）。"""
@@ -79,4 +80,5 @@ class ProtocolConfig:
             "earlystop_frac": self.earlystop_frac,
             "max_folds": self.max_folds,
             "fold_select": self.fold_select,
+            "delivery_eval_end": self.delivery_eval_end,
         }

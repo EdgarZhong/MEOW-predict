@@ -32,7 +32,7 @@ from dl_models import (  # noqa: E402
     _PRICE_REL_COLS, _LOG_VOLUME_COLS, _RATIO_COLS,
 )
 from dl_search import EarlyKillPolicy, Searcher, sample_hparams, enumerate_grid  # noqa: E402
-from dl_protocol import build_dl_folds, assert_folds_causal  # noqa: E402
+from dl_protocol import build_dl_folds, assert_folds_causal, summarize_folds  # noqa: E402
 from sequence_dataset import SequenceDataset, Normalizer, build_sequence_arrays  # noqa: E402
 from tradingcalendar import Calendar  # noqa: E402
 
@@ -629,6 +629,53 @@ class TestSweepOrchestrator(unittest.TestCase):
             run_dir = os.path.join(td, rc.run_id)
             for fn in ("config.json", "trials.csv", "fold_metrics.csv", "summary.json"):
                 self.assertTrue(os.path.exists(os.path.join(run_dir, fn)), fn)
+
+    def test_sweep_delivery_is_reported_but_not_ranked(self):
+        from model_config import ModelKind, ModelConfig
+        from adapter_config import AdapterKind, AdapterConfig
+        from protocol_config import Stage, ProfileKind, ProtocolConfig
+        from search_config import SearchConfig
+        from exec_config import ExecConfig
+        from run_config import assemble_run_config
+        from run_dl import Orchestrator
+
+        dates = Calendar().range(20230601, 20230731)
+        train_end = 20230710
+        df = make_synth_seq(dates, n_symbols=6, n_interval=15, label="current", seed=18)
+        with tempfile.TemporaryDirectory() as td:
+            rc = assemble_run_config(
+                "20260602_sweep_delivery_test_v1",
+                ModelConfig(ModelKind.REFERENCE_POOL, hparams={}),
+                AdapterConfig(AdapterKind.IDENTITY, columns=("c0", "c1")),
+                ProtocolConfig(Stage.SWEEP, ProfileKind.EXPANDING, dates[0], train_end,
+                               val_window=2, step=2, min_train_days=6, max_folds=4,
+                               fold_select="recent", delivery_eval_end=dates[-1]),
+                SearchConfig(n_trials=1, search_overrides={
+                    "seq_len": {"type": "choice", "values": [3, 4]},
+                    "hidden_size": {"type": "choice", "values": [8]},
+                    "num_layers": {"type": "choice", "values": [1]}}),
+                ExecConfig(seeds=(42, 7, 11), out_dir=td),
+            )
+            summary = Orchestrator(
+                rc, raw_loader=make_loader(df), adapter=IdentityAdapter(["c0", "c1"]),
+                cartridge_factory=ReferencePoolCartridge,
+            ).run()
+            self.assertEqual(summary["status"], "ok")
+            self.assertIn("delivery", summary)
+            self.assertEqual(summary["delivery"]["seed"], 42)       # 交付折只跑首个 seed
+            self.assertGreater(summary["delivery"]["val_start"], train_end)
+
+            run_dir = os.path.join(td, rc.run_id)
+            rows = TestSweepIncrementalDump._read_rows(os.path.join(run_dir, "fold_metrics.csv"))
+            cert_rows = [r for r in rows if r["profile_name"] == "sweep_cert"]
+            delivery_rows = [r for r in rows if r["profile_name"] == "sweep_delivery"]
+            self.assertEqual(len(delivery_rows), 1)
+            self.assertEqual(len(cert_rows), summary["n_folds"] * len(summary["cert_seeds"]))
+
+            # summary.val_corr 只来自档2 认证行；delivery 是只读报告，不进排名/汇总。
+            cert_summary = summarize_folds([{"corr": float(r["val_corr"])} for r in cert_rows])
+            self.assertAlmostEqual(summary["val_corr"]["mean"], cert_summary["mean"], places=12)
+            self.assertAlmostEqual(summary["val_corr"]["min"], cert_summary["min"], places=12)
 
 
 # ------------------------------------------------------------------ #

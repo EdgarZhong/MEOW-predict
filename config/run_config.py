@@ -104,6 +104,11 @@ def assemble_run_config(
         raise ValueError(
             f"protocol 数据窗口非法：rolling_start={protocol.rolling_start} > rolling_end={protocol.rolling_end}"
         )
+    if protocol.delivery_eval_end is not None and protocol.delivery_eval_end <= protocol.rolling_end:
+        raise ValueError(
+            "delivery_eval_end 必须晚于 rolling_end："
+            f"delivery_eval_end={protocol.delivery_eval_end}, rolling_end={protocol.rolling_end}"
+        )
 
     # (3) stage / profile 搭配：认证 / 一命令两档都要多折判官（EXPANDING）
     if protocol.stage in (Stage.VALIDATION, Stage.SWEEP) and protocol.profile != ProfileKind.EXPANDING:

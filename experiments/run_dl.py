@@ -44,7 +44,9 @@ for _sub in ("src", "config", "models"):
 
 import numpy as np  # noqa: E402
 
-from dl_protocol import DLFold, assert_folds_causal, build_dl_folds, summarize_folds  # noqa: E402
+from dl_protocol import (  # noqa: E402
+    DLFold, assert_folds_causal, build_delivery_fold, build_dl_folds, summarize_folds,
+)
 from dl_search import EarlyKillPolicy, Searcher, enumerate_grid  # noqa: E402
 from dl_trainer import SequenceTrainer  # noqa: E402
 from feature_store import DEFAULT_FEATURE_DIR  # noqa: E402
@@ -411,6 +413,44 @@ class Orchestrator:
         finally:
             fold_writer.close()
 
+        # —— 交付对齐折：冠军定死后只跑 1 seed，只报不选（AGENTS §十一·11.2/11.6） —— #
+        delivery = None
+        p = self.cfg.protocol
+        if p.delivery_eval_end is not None:
+            delivery_seed = int(cert_seeds[0]) if cert_seeds else 42
+            delivery_fold_id = max(f.fold_id for f in folds) + 1
+            delivery_fold = build_delivery_fold(
+                p.rolling_start, p.rolling_end, p.delivery_eval_end,
+                embargo=p.embargo, earlystop_frac=p.earlystop_frac,
+                fold_id=delivery_fold_id,
+            )
+            delivery = {"status": "pending", "seed": delivery_seed, "fold_id": delivery_fold.fold_id}
+            prior_delivery = done_folds.get((delivery_seed, delivery_fold.fold_id)) if self.resume else None
+            if prior_delivery is not None:
+                # 续跑时若交付折已落盘，直接从 CSV 回灌 summary，不重训、不影响认证排名。
+                delivery = _delivery_summary_from_row(prior_delivery, delivery_seed)
+                prog.event("delivery_skipped", seed=delivery_seed, fold_id=delivery_fold.fold_id,
+                           val_corr=_num(delivery.get("val_corr")))
+            else:
+                t0 = time.time()
+                trainer = SequenceTrainer(
+                    self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
+                    seq_len=champ_seq_len, normalizer_mode=self._normalizer_mode(),
+                    hparams=dict(champ_hp), seed=delivery_seed,
+                )
+                r = trainer.run_on_dl_fold(delivery_fold, profile_name="sweep_delivery")
+                d = r.to_dict()
+                d["random_seed"] = delivery_seed
+                delivery_writer = _IncrementalCsvWriter(fm_path, append=True)
+                try:
+                    delivery_writer.write_row(d)
+                finally:
+                    delivery_writer.close()
+                delivery = _delivery_summary_from_result(r, delivery_seed)
+                prog.event("delivery_done", seed=delivery_seed, fold_id=delivery_fold.fold_id,
+                           val_corr=_num(r.val_corr), val_r2=_num(r.val_r2), status=r.status,
+                           elapsed_sec=round(time.time() - t0, 1))
+
         summ_cert = summarize_folds([{"corr": c} for c in corrs])
         summary = {
             "run_id": self.cfg.run_id, "stage": "sweep", "status": "ok",
@@ -423,10 +463,13 @@ class Orchestrator:
             "val_r2_mean": float(np.mean(r2s)) if r2s else 0.0,
             "val_r2_min": float(np.min(r2s)) if r2s else 0.0,
         }
+        if delivery is not None:
+            summary["delivery"] = delivery
         _dump_json(os.path.join(out_dir, "summary.json"), summary)
         prog.event("sweep_done", status="ok",
                    val_corr_mean=_num(summ_cert["mean"]), val_corr_min=_num(summ_cert["min"]),
-                   val_r2_mean=_num(float(np.mean(r2s)) if r2s else 0.0))
+                   val_r2_mean=_num(float(np.mean(r2s)) if r2s else 0.0),
+                   delivery_val_corr=_num(delivery.get("val_corr")) if delivery else None)
         return summary
 
     def _normalizer_mode(self) -> str:
@@ -622,6 +665,52 @@ def _read_done_folds(path: str) -> Dict[tuple, dict]:
     return out
 
 
+def _delivery_summary_from_result(r, seed: int) -> dict:
+    """把交付折 FoldResult 压成 summary.delivery；只读报告，不参与 SWEEP 排名。"""
+    return {
+        "status": r.status,
+        "seed": int(seed),
+        "fold_id": int(r.fold_id),
+        "train_start": int(r.train_start),
+        "train_end": int(r.train_end),
+        "val_start": int(r.val_start),
+        "val_end": int(r.val_end),
+        "n_train_days": int(r.n_train_days),
+        "n_val_days": int(r.n_val_days),
+        "val_corr": float(r.val_corr),
+        "val_mse": float(r.val_mse),
+        "val_r2": float(r.val_r2),
+        "daily_corr_mean": float(r.daily_corr_mean),
+        "daily_corr_std": float(r.daily_corr_std),
+        "best_epoch": int(r.best_epoch),
+        "runtime_sec": float(r.runtime_sec),
+        "error_msg": r.error_msg,
+    }
+
+
+def _delivery_summary_from_row(row: dict, seed: int) -> dict:
+    """从已落盘的 delivery 行回灌 summary.delivery，供 --resume 跳过重训。"""
+    return {
+        "status": row.get("status", ""),
+        "seed": int(seed),
+        "fold_id": _coerce_int(row.get("fold_id")),
+        "train_start": _coerce_int(row.get("train_start")),
+        "train_end": _coerce_int(row.get("train_end")),
+        "val_start": _coerce_int(row.get("val_start")),
+        "val_end": _coerce_int(row.get("val_end")),
+        "n_train_days": _coerce_int(row.get("n_train_days")),
+        "n_val_days": _coerce_int(row.get("n_val_days")),
+        "val_corr": _coerce_float(row.get("val_corr")),
+        "val_mse": _coerce_float(row.get("val_mse")),
+        "val_r2": _coerce_float(row.get("val_r2")),
+        "daily_corr_mean": _coerce_float(row.get("daily_corr_mean")),
+        "daily_corr_std": _coerce_float(row.get("daily_corr_std")),
+        "best_epoch": _coerce_int(row.get("best_epoch")),
+        "runtime_sec": _coerce_float(row.get("runtime_sec")),
+        "error_msg": row.get("error_msg", ""),
+    }
+
+
 # ================================================================== #
 # CLI —— 组装一份 RunConfig 并 run（torch-free smoke：参考卡带 + 真实/抽样数据）
 # ================================================================== #
@@ -648,6 +737,7 @@ def _build_run_config(args):
         val_window=args.val_window, step=args.step, embargo=args.embargo,
         min_train_days=args.min_train_days,
         max_folds=max_folds, fold_select=args.fold_select,
+        delivery_eval_end=args.delivery_eval_end,
     )
     search = SearchConfig(n_trials=args.trials, search_overrides=_parse_grid_overrides(args))
     exec_ = ExecConfig(
@@ -711,6 +801,8 @@ def main(argv=None):
     ap.add_argument("--columns", default="", help="identity adapter 的列（逗号分隔）")
     ap.add_argument("--start", type=int, default=20230601)
     ap.add_argument("--end", type=int, default=20230731)
+    ap.add_argument("--delivery-eval-end", type=int, default=None,
+                    help="SWEEP 交付对齐折 eval 末日；例如 --end 20231130 --delivery-eval-end 20231229")
     ap.add_argument("--val-window", type=int, default=5)
     ap.add_argument("--step", type=int, default=5)
     ap.add_argument("--min-train-days", type=int, default=20)
@@ -720,7 +812,7 @@ def main(argv=None):
                     help="recent=最近若干折倒贴 rolling_end（新协议主路径）；first=最早若干折（调试）")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="PyTorch 卡带训练设备；整晚 GPU 跑传 cuda")
-    ap.add_argument("--max-folds", type=int, default=3, help="validation / sweep 折数（新协议 5）")
+    ap.add_argument("--max-folds", type=int, default=3, help="validation / sweep 选型折数（新协议主路径为 3）")
     ap.add_argument("--trials", type=int, default=4, help="仅 search 用")
     ap.add_argument("--seeds", default="42")
     ap.add_argument("--hparams", default="", help="k=v,k2=v2（如 dropout=0.2,weight_decay=0.001,max_epochs=30）")
