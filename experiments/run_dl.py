@@ -11,6 +11,13 @@ Orchestrator —— DL run 的发起 + 组装冻结 RunConfig + 两阶段交接 
 3. 按 ``stage`` 分派：
    - ``SEARCH``  → 交 ``Searcher`` 海选（落 ``trials.csv`` + ``best_config.json``）。
    - ``VALIDATION`` → 定参跑 expanding 少折 × 多种子认证（落 ``fold_metrics.csv`` + ``summary.json``）。
+   - ``SWEEP`` → 一命令两档（主路径，§十一·11.6）：档1 网格筛选 + 档2 冠军认证。
+
+**增量落盘（防长跑中断打水漂）**：SWEEP / VALIDATION 是数小时级长跑，``trials.csv`` /
+``fold_metrics.csv`` 不再"全算完一次性写"，而是**每个 trial / 每折一完成就 append + flush + fsync**
+（``_IncrementalCsvWriter``），并同步逐事件写 ``progress.jsonl`` 时间线 + 每折刷新
+``summary.partial.json`` 实时快照。中途崩溃也留下全部已完成步骤的价值；``--resume`` 可复用这些
+落盘跳过已完成的不重算。``summary.json`` 仅在成功收官时落 → 它"在 ⇔ 跑完"，是完成标记。
 
 **内存约定**：numpy 参考卡带走 ``gather_all``（一次性物化全部窗口），全量真实数据会爆内存；
 故 CLI smoke 默认用 ``--max-symbols`` 抽样降规模。真正的 TCN 卡带按 ``iter_batches`` 流式喂，
@@ -24,6 +31,8 @@ import csv
 import json
 import os
 import sys
+import time
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Sequence
 
 # —— import 约定：src / config / models 三目录平铺（README / CLAUDE 已记） —— #
@@ -64,10 +73,14 @@ class Orchestrator:
         feature_dir: str = DEFAULT_FEATURE_DIR,
         adapter=None,
         cartridge_factory: Optional[Callable[[], object]] = None,
+        resume: bool = False,
     ):
         self.cfg = run_config
         self.h5dir = h5dir
         self.feature_dir = feature_dir
+        # 续跑开关：True 时启动会读回已落盘的 trial / (seed,fold)，跳过已完成的不重算
+        # （仅 SWEEP 支持，见 _run_sweep）。默认关 → 与改造前一致：每次 run 从头重写。
+        self.resume = bool(resume)
         # 依赖注入：默认从 registry + MeowDataLoader 构建；测试可注入合成 loader / 参考卡带。
         self.adapter = adapter if adapter is not None else build_adapter(run_config.adapter)
         if hasattr(self.adapter, "bind_data_sources"):
@@ -166,23 +179,37 @@ class Orchestrator:
         seq_len = int(defaults.pop("seq_len", 32))
         cart_hparams = defaults
 
-        fold_rows: List[dict] = []
+        # —— 逐折增量落盘：每个 (seed, fold) 一完成立即 append + flush，不再攒到最后一次性写 —— #
+        seeds = self.cfg.exec_.seeds
+        total = len(seeds) * len(folds)
+        prog = _ProgressLog(os.path.join(out_dir, "progress.jsonl"))
+        prog.event("validation_start", n_folds=len(folds), n_seeds=len(seeds),
+                   seeds=[int(s) for s in seeds], seq_len=seq_len)
+        writer = _IncrementalCsvWriter(os.path.join(out_dir, "fold_metrics.csv"))
         corrs: List[float] = []
-        for seed in self.cfg.exec_.seeds:
-            trainer = SequenceTrainer(
-                self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
-                seq_len=seq_len, normalizer_mode=self._normalizer_mode(),
-                hparams=cart_hparams, seed=int(seed),
-            )
-            for fold in folds:
-                r = trainer.run_on_dl_fold(fold, profile_name="validation")
-                d = r.to_dict()
-                d["random_seed"] = int(seed)
-                fold_rows.append(d)
-                if r.status == "ok" and np.isfinite(r.val_corr):
-                    corrs.append(float(r.val_corr))
+        done = 0
+        try:
+            for seed in seeds:
+                trainer = SequenceTrainer(
+                    self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
+                    seq_len=seq_len, normalizer_mode=self._normalizer_mode(),
+                    hparams=cart_hparams, seed=int(seed),
+                )
+                for fold in folds:
+                    t0 = time.time()
+                    r = trainer.run_on_dl_fold(fold, profile_name="validation")
+                    d = r.to_dict()
+                    d["random_seed"] = int(seed)
+                    writer.write_row(d)           # ← 落盘 + flush 在此，崩溃也留下已完成折
+                    done += 1
+                    if r.status == "ok" and np.isfinite(r.val_corr):
+                        corrs.append(float(r.val_corr))
+                    prog.event("fold_done", seed=int(seed), fold_id=fold.fold_id,
+                               val_corr=_num(r.val_corr), status=r.status,
+                               elapsed_sec=round(time.time() - t0, 1), done=done, total=total)
+        finally:
+            writer.close()
 
-        _dump_csv(os.path.join(out_dir, "fold_metrics.csv"), fold_rows)
         summ = summarize_folds([{"corr": c} for c in corrs])
         summary = {
             "run_id": self.cfg.run_id, "stage": "validation", "status": "ok",
@@ -191,6 +218,9 @@ class Orchestrator:
             "val_corr": summ,   # mean / std / min(最坏折) / max / positive_rate
         }
         _dump_json(os.path.join(out_dir, "summary.json"), summary)
+        prog.event("validation_done", status="ok",
+                   val_corr_mean=_num(summ["mean"]), val_corr_min=_num(summ["min"]))
+        prog.close()
         return summary
 
     # ---- 一命令两档（SWEEP，§十一·11.6） ---- #
@@ -214,6 +244,15 @@ class Orchestrator:
         return {"corrs": corrs, "best_epoch_mean": float(np.mean(best_epochs)) if best_epochs else 0.0}
 
     def _run_sweep(self, folds: Sequence[DLFold], out_dir: str) -> dict:
+        # prog（进度日志）在外层创建 + try/finally 关闭，保证中断/异常时它的文件句柄也干净落盘
+        # （CSV 写器各自在内层 try/finally 关闭；这里专管贯穿两档的 prog）。
+        prog = _ProgressLog(os.path.join(out_dir, "progress.jsonl"))
+        try:
+            return self._run_sweep_impl(folds, out_dir, prog)
+        finally:
+            prog.close()
+
+    def _run_sweep_impl(self, folds: Sequence[DLFold], out_dir: str, prog: "_ProgressLog") -> dict:
         """
         一命令两档（§十一·11.6），全程同一套 §十一·11.2 忠实协议（锚定扩展 + 倒贴 + embargo）：
 
@@ -225,6 +264,7 @@ class Orchestrator:
         ec = self.cfg.exec_
         sc = self.cfg.search
         # 网格 = 卡带 search_space 叠加 overrides 收窄后**确定性**展开（忠实「网格预先声明跑一次」）。
+        # 关键：网格确定 → trial_id == 网格下标，续跑时可由网格重建任一 trial 的超参，无需解析 CSV。
         search_space = dict(getattr(self.cartridge_factory(), "search_space", {}) or {})
         grid = enumerate_grid(search_space, dict(sc.search_overrides))
         defaults = dict(self.cfg.model.hparams)
@@ -233,64 +273,145 @@ class Orchestrator:
         n_screen = min(_SWEEP_SCREEN_FOLDS, len(folds))
         screen_folds = list(folds[-n_screen:])     # 最近 N 折（fold_select=recent 下 = 最贴 rolling_end）
         screen_seeds = ec.seeds[:_SWEEP_SCREEN_SEEDS] if len(ec.seeds) >= _SWEEP_SCREEN_SEEDS else ec.seeds
+        cert_seeds = ec.seeds
 
-        # —— 档1：网格逐点跑最近折，按最坏折排名 —— #
-        trial_rows: List[dict] = []
+        prog.event("sweep_start", grid_size=len(grid), n_screen_folds=n_screen,
+                   screen_seeds=[int(s) for s in screen_seeds],
+                   cert_seeds=[int(s) for s in cert_seeds], resume=self.resume)
+
+        # —— 档1：网格逐点跑最近折，**逐 trial 增量落盘**，按最坏折排名 —— #
+        trials_path = os.path.join(out_dir, "trials.csv")
+        done_trials = _read_done_trials(trials_path) if self.resume else {}
+        trials_writer = _IncrementalCsvWriter(trials_path, append=self.resume)
         ranked: List[tuple] = []     # (min, mean, tid, seq_len, hparams)
-        for tid, combo in enumerate(grid):
-            eff = {**defaults, **combo}
-            seq_len = int(eff.pop("seq_len", _DEFAULT_SEQ_LEN))
-            cart_hp = eff
-            status, err, res = "ok", "", {"corrs": [], "best_epoch_mean": 0.0}
-            try:
-                res = self._eval_config(seq_len, cart_hp, screen_folds, screen_seeds)
-            except Exception as e:                       # noqa: BLE001
-                status, err = "error", str(e)[:300]
-            summ = summarize_folds([{"corr": c} for c in res["corrs"]])
-            row = {"trial_id": tid, "seq_len": seq_len,
-                   "screen_corr_mean": summ["mean"], "screen_corr_min": summ["min"],
-                   "screen_corr_std": summ["std"], "n_evals": len(res["corrs"]),
-                   "best_epoch_mean": res["best_epoch_mean"], "status": status, "error_msg": err}
-            for k, v in cart_hp.items():
-                if k != "device":
-                    row[f"hp_{k}"] = v
-            trial_rows.append(row)
-            if status == "ok" and len(res["corrs"]) > 0:
-                ranked.append((summ["min"], summ["mean"], tid, seq_len, dict(cart_hp)))
-        _dump_csv(os.path.join(out_dir, "trials.csv"), trial_rows)
+        try:
+            for tid, combo in enumerate(grid):
+                eff = {**defaults, **combo}
+                seq_len = int(eff.pop("seq_len", _DEFAULT_SEQ_LEN))
+                cart_hp = eff
+                # 续跑：该 trial 已成功落盘 → 由网格重建 cart_hp、从 CSV 读回排名指标，跳过重算。
+                prior = done_trials.get(tid)
+                if prior is not None and prior.get("status") == "ok" and _coerce_int(prior.get("n_evals")) > 0:
+                    smin = _coerce_float(prior.get("screen_corr_min"))
+                    smean = _coerce_float(prior.get("screen_corr_mean"))
+                    if np.isfinite(smin):
+                        ranked.append((smin, smean, tid, seq_len, dict(cart_hp)))
+                    prog.event("trial_skipped", trial_id=tid, seq_len=seq_len)
+                    continue
+
+                t0 = time.time()
+                status, err, res = "ok", "", {"corrs": [], "best_epoch_mean": 0.0}
+                try:
+                    res = self._eval_config(seq_len, cart_hp, screen_folds, screen_seeds)
+                except Exception as e:                   # noqa: BLE001
+                    status, err = "error", str(e)[:300]
+                summ = summarize_folds([{"corr": c} for c in res["corrs"]])
+                row = {"trial_id": tid, "seq_len": seq_len,
+                       "screen_corr_mean": summ["mean"], "screen_corr_min": summ["min"],
+                       "screen_corr_std": summ["std"], "n_evals": len(res["corrs"]),
+                       "best_epoch_mean": res["best_epoch_mean"], "status": status, "error_msg": err}
+                for k, v in cart_hp.items():
+                    if k != "device":
+                        row[f"hp_{k}"] = v
+                trials_writer.write_row(row)          # ← 落盘 + flush 在此（逐 trial）
+                if status == "ok" and len(res["corrs"]) > 0:
+                    ranked.append((summ["min"], summ["mean"], tid, seq_len, dict(cart_hp)))
+                prog.event("trial_done", trial_id=tid, seq_len=seq_len,
+                           screen_corr_mean=_num(summ["mean"]), screen_corr_min=_num(summ["min"]),
+                           n_evals=len(res["corrs"]), status=status,
+                           elapsed_sec=round(time.time() - t0, 1))
+        finally:
+            trials_writer.close()
 
         if not ranked:
             summary = {"run_id": self.cfg.run_id, "stage": "sweep", "status": "no_champion",
                        "grid_size": len(grid), "note": "档1 全部 trial 无有效评估"}
             _dump_json(os.path.join(out_dir, "summary.json"), summary)
+            prog.event("sweep_done", status="no_champion")
             return summary
 
         # 按最坏折 min 排名（§十一·11.7 规则 3），mean 兜底 tiebreak。
         ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
         champ_min, champ_mean, champ_tid, champ_seq_len, champ_hp = ranked[0]
+        prog.event("champion", trial_id=champ_tid, seq_len=champ_seq_len,
+                   screen_corr_min=_num(champ_min), screen_corr_mean=_num(champ_mean))
 
-        # —— 档2：冠军 × 全折 × 全 seed，落逐折逐 seed 明细 —— #
-        cert_seeds = ec.seeds
-        fold_rows: List[dict] = []
+        # 档1 收官即落一份 partial summary（冠军已知、cert 未开），崩在档2 也能知道选了谁。
+        champion_block = {"trial_id": champ_tid, "seq_len": champ_seq_len, "hparams": champ_hp,
+                          "screen_corr_min": champ_min, "screen_corr_mean": champ_mean}
+        total_cert = len(folds) * len(cert_seeds)
+        _dump_json(os.path.join(out_dir, "summary.partial.json"), {
+            "run_id": self.cfg.run_id, "stage": "sweep", "status": "screening_done",
+            "grid_size": len(grid), "n_screen_folds": n_screen,
+            "screen_seeds": [int(s) for s in screen_seeds],
+            "champion": champion_block,
+            "n_folds": len(folds), "cert_seeds": [int(s) for s in cert_seeds],
+            "cert_progress": {"done": 0, "total": total_cert},
+        })
+
+        # —— 档2：冠军 × 全折 × 全 seed，**逐折增量落盘** + 每折刷新 partial summary —— #
+        fm_path = os.path.join(out_dir, "fold_metrics.csv")
+        done_folds = _read_done_folds(fm_path) if self.resume else {}
+        fold_writer = _IncrementalCsvWriter(fm_path, append=self.resume)
+        prog.event("cert_start", n_folds=len(folds), cert_seeds=[int(s) for s in cert_seeds],
+                   total=total_cert, resume=self.resume, n_resumed_folds=len(done_folds))
         corrs: List[float] = []
-        for seed in cert_seeds:
-            trainer = SequenceTrainer(
-                self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
-                seq_len=champ_seq_len, normalizer_mode=self._normalizer_mode(),
-                hparams=dict(champ_hp), seed=int(seed),
-            )
-            for fold in folds:
-                r = trainer.run_on_dl_fold(fold, profile_name="sweep_cert")
-                d = r.to_dict()
-                d["random_seed"] = int(seed)
-                fold_rows.append(d)
-                if r.status == "ok" and np.isfinite(r.val_corr):
-                    corrs.append(float(r.val_corr))
-        _dump_csv(os.path.join(out_dir, "fold_metrics.csv"), fold_rows)
+        r2s: List[float] = []
+        done = 0
+        try:
+            for seed in cert_seeds:
+                trainer = None      # 懒构造：整组折都已续跑跳过的 seed 不必建 trainer
+                for fold in folds:
+                    prior = done_folds.get((int(seed), fold.fold_id))
+                    if prior is not None:
+                        # 续跑：该 (seed, fold) 已落盘 → 从 CSV 回灌 summary 累加量，跳过重算。
+                        if prior.get("status") == "ok":
+                            vc = _coerce_float(prior.get("val_corr"))
+                            vr = _coerce_float(prior.get("val_r2"))
+                            if np.isfinite(vc):
+                                corrs.append(vc)
+                            if np.isfinite(vr):
+                                r2s.append(vr)
+                        done += 1
+                        prog.event("fold_skipped", seed=int(seed), fold_id=fold.fold_id,
+                                   done=done, total=total_cert)
+                        continue
+                    if trainer is None:
+                        trainer = SequenceTrainer(
+                            self._spec(), self.adapter, self.cartridge_factory, self.raw_loader,
+                            seq_len=champ_seq_len, normalizer_mode=self._normalizer_mode(),
+                            hparams=dict(champ_hp), seed=int(seed),
+                        )
+                    t0 = time.time()
+                    r = trainer.run_on_dl_fold(fold, profile_name="sweep_cert")
+                    d = r.to_dict()
+                    d["random_seed"] = int(seed)
+                    fold_writer.write_row(d)          # ← 落盘 + flush 在此（逐折）
+                    done += 1
+                    if r.status == "ok" and np.isfinite(r.val_corr):
+                        corrs.append(float(r.val_corr))
+                    if r.status == "ok" and np.isfinite(r.val_r2):
+                        r2s.append(float(r.val_r2))
+                    prog.event("fold_done", seed=int(seed), fold_id=fold.fold_id,
+                               val_corr=_num(r.val_corr), val_r2=_num(r.val_r2), status=r.status,
+                               elapsed_sec=round(time.time() - t0, 1), done=done, total=total_cert)
+                    # 每折刷新 live snapshot：当前已完成折的 pooled / 最坏折 / R² 读数。
+                    summ_run = summarize_folds([{"corr": c} for c in corrs])
+                    _dump_json(os.path.join(out_dir, "summary.partial.json"), {
+                        "run_id": self.cfg.run_id, "stage": "sweep", "status": "certifying",
+                        "grid_size": len(grid), "n_screen_folds": n_screen,
+                        "screen_seeds": [int(s) for s in screen_seeds],
+                        "champion": champion_block,
+                        "n_folds": len(folds), "cert_seeds": [int(s) for s in cert_seeds],
+                        "cert_progress": {"done": done, "total": total_cert},
+                        "val_corr": summ_run,
+                        "val_r2_mean": float(np.mean(r2s)) if r2s else 0.0,
+                        "val_r2_min": float(np.min(r2s)) if r2s else 0.0,
+                    })
+        finally:
+            fold_writer.close()
 
         summ_cert = summarize_folds([{"corr": c} for c in corrs])
-        r2s = [d["val_r2"] for d in fold_rows
-               if d.get("status") == "ok" and np.isfinite(d.get("val_r2", float("nan")))]
         summary = {
             "run_id": self.cfg.run_id, "stage": "sweep", "status": "ok",
             "grid_size": len(grid), "n_screen_folds": n_screen,
@@ -303,6 +424,9 @@ class Orchestrator:
             "val_r2_min": float(np.min(r2s)) if r2s else 0.0,
         }
         _dump_json(os.path.join(out_dir, "summary.json"), summary)
+        prog.event("sweep_done", status="ok",
+                   val_corr_mean=_num(summ_cert["mean"]), val_corr_min=_num(summ_cert["min"]),
+                   val_r2_mean=_num(float(np.mean(r2s)) if r2s else 0.0))
         return summary
 
     def _normalizer_mode(self) -> str:
@@ -321,6 +445,7 @@ def _dump_json(path: str, obj: dict) -> None:
 
 
 def _dump_csv(path: str, rows: List[dict]) -> None:
+    """一次性把若干行写成 CSV（保留给非长跑路径；长跑路径改用 _IncrementalCsvWriter 逐行落）。"""
     if not rows:
         # 仍写一个空文件占位，便于 resume/审计看到 run 跑过。
         open(path, "w", encoding="utf-8").close()
@@ -335,6 +460,166 @@ def _dump_csv(path: str, rows: List[dict]) -> None:
         w.writeheader()
         for r in rows:
             w.writerow(r)
+
+
+# ------------------------------------------------------------------ #
+# 增量落盘基础设施（防长跑中断打水漂）
+# ------------------------------------------------------------------ #
+
+def _now_iso() -> str:
+    """秒级本地时间戳（progress.jsonl 用，便于人读"跑到哪一步、花了多久"）。"""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _num(x):
+    """把一个数清洗成"可写进合法 JSON"的值：有限数 → float，nan/inf/非数 → None。
+
+    仅用于 progress.jsonl 这种希望严格合法 JSONL 的日志；summary*.json 沿用旧 _dump_json
+    的行为（允许 NaN，与改造前逐字段一致）。
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _coerce_int(x) -> int:
+    """CSV 读回的字符串 → int（失败给 0，仅用于续跑判定"是否已完成"）。"""
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_float(x) -> float:
+    """CSV 读回的字符串 → float（失败给 nan，配合 np.isfinite 过滤）。"""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+class _IncrementalCsvWriter:
+    """
+    逐行增量落盘的 CSV writer：每写一行立即 flush（+ fsync），崩溃时已写行不留在缓冲区里丢。
+
+    与一次性 ``_dump_csv`` 的产物**逐字段一致**（前提：所有行同一组 key——本项目 trials.csv /
+    fold_metrics.csv 均满足，列由确定性网格 / 固定 FoldResult schema 决定），区别只在落盘时机：
+    一行一落，而非攒到最后一次性写。
+
+    - **表头**：全新文件时由**首行的 key 顺序**确定（等价于旧 ``_dump_csv`` 在"所有行同 schema"
+      下的并集列序），写一次；``append`` 续写时从已有表头读列序、不再重写表头。
+    - **续写**（``append=True`` 且文件已存在且非空）：以 ``a`` 模式打开，沿用已有表头列序，
+      新行追加在后面——配合 Orchestrator 的 resume 跳过逻辑实现"崩溃续跑不重复"。
+    - **零行兜底**：全程没写任何行时，``close()`` 留一个空文件占位（对齐旧 ``_dump_csv([])``）。
+    """
+
+    def __init__(self, path: str, *, append: bool = False, fsync: bool = True):
+        self.path = path
+        self.fsync = fsync
+        self.fieldnames: Optional[List[str]] = None
+        self._fh = None
+        self._writer = None
+        self._wrote_any = False
+        # 续写：已有非空文件 → 读回表头列序，open 'a' 接着追加。
+        if append and os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                header = next(csv.reader(f), [])
+            if header:
+                self.fieldnames = header
+                self._fh = open(path, "a", encoding="utf-8", newline="")
+                self._writer = csv.DictWriter(self._fh, fieldnames=self.fieldnames)
+
+    def write_row(self, row: dict) -> None:
+        if self._writer is None:
+            # 全新文件：用首行的 key 顺序定表头，立即写表头。
+            self.fieldnames = list(row.keys())
+            self._fh = open(self.path, "w", encoding="utf-8", newline="")
+            self._writer = csv.DictWriter(self._fh, fieldnames=self.fieldnames)
+            self._writer.writeheader()
+        else:
+            # 防御：万一某行冒出表头未涵盖的新字段（schema 理论上固定，不该发生），
+            # 记一条 stderr 警告但不抛——优先保证"已写不丢、长跑不崩"。
+            extra = [k for k in row.keys() if k not in self.fieldnames]
+            if extra:
+                print(f"[incr-dump] 警告: {os.path.basename(self.path)} 出现表头外字段 {extra}，已忽略",
+                      file=sys.stderr)
+        self._writer.writerow({k: row.get(k) for k in self.fieldnames})
+        self._wrote_any = True
+        self._fh.flush()
+        if self.fsync:
+            os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.flush()
+            if self.fsync:
+                os.fsync(self._fh.fileno())
+            self._fh.close()
+            self._fh = None
+        elif not self._wrote_any:
+            # 从未打开过文件（全新且零行）→ 留空文件占位，与旧 _dump_csv([]) 行为一致。
+            open(self.path, "w", encoding="utf-8").close()
+
+
+class _ProgressLog:
+    """
+    逐事件 append 的 JSONL 进度日志：每行一个事件、落盘即 flush，可 ``tail -f`` 实时盯进度。
+
+    定位：在 trials.csv / fold_metrics.csv 之外，提供一条**人读友好的时间线**——每个 trial /
+    每折何时完成、耗时多久、当前读数多少、跑到第几 / 共几步。崩溃后它是"卡在哪一步"的权威记录。
+    以 ``a`` 模式打开（续跑时接着记，不覆盖历史 session）。
+    """
+
+    def __init__(self, path: str, *, fsync: bool = True):
+        self.path = path
+        self.fsync = fsync
+        self._fh = open(path, "a", encoding="utf-8")
+
+    def event(self, name: str, **fields) -> None:
+        rec = {"ts": _now_iso(), "event": name, **fields}
+        # allow_nan=False + 上游已用 _num 清洗 → 保证每行都是合法 JSON。
+        self._fh.write(json.dumps(rec, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+        self._fh.flush()
+        if self.fsync:
+            os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.flush()
+            if self.fsync:
+                os.fsync(self._fh.fileno())
+            self._fh.close()
+            self._fh = None
+
+
+def _read_done_trials(path: str) -> Dict[int, dict]:
+    """读已存在的 trials.csv → ``{trial_id: row_dict}``（续跑跳过判定用）。文件缺失/空 → {}。"""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    out: Dict[int, dict] = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                out[int(row["trial_id"])] = row
+            except (KeyError, ValueError, TypeError):
+                continue
+    return out
+
+
+def _read_done_folds(path: str) -> Dict[tuple, dict]:
+    """读已存在的 fold_metrics.csv → ``{(seed, fold_id): row_dict}``（续跑跳过判定用）。"""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    out: Dict[tuple, dict] = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                out[(int(row["random_seed"]), int(row["fold_id"]))] = row
+            except (KeyError, ValueError, TypeError):
+                continue
+    return out
 
 
 # ================================================================== #
@@ -448,6 +733,8 @@ def main(argv=None):
                     help="实验链特征缓存根目录（feature_433 优先从这里读取）")
     ap.add_argument("--max-symbols", type=int, default=20,
                     help="抽前 N 个 symbol 控内存（参考卡带 gather_all 用）；<=0 = 不抽样")
+    ap.add_argument("--resume", action="store_true",
+                    help="续跑：复用同 run-id 目录下已落盘的 trial/(seed,fold)，跳过已完成的不重算（SWEEP）")
     args = ap.parse_args(argv)
 
     rc = _build_run_config(args)
@@ -459,6 +746,7 @@ def main(argv=None):
         raw_loader=raw_loader,
         h5dir=args.h5dir,
         feature_dir=args.feature_dir,
+        resume=args.resume,
     )
     summary = orch.run()
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
