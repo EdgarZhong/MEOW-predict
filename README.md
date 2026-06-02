@@ -75,6 +75,28 @@ DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**�
 
 设计真相源：`docs/specs/DL实验设计规格.md`。
 
+## Quick Start（环境安装 / 换机迁移）
+
+换一台机器跑（尤其新 PC 跑 DL），按此四步从零装好环境（Python 3.11）：
+
+```bash
+# 1. 纯 PyPI 运行依赖一键装（numpy/pandas/tables/scikit-learn/lightgbm/psutil，已锁版本）
+pip install -r requirements.txt
+
+# 2. 单独装 torch（GPU wheel 因机器 CUDA 而异，不在上面的 -r 列表）：
+#    先 nvidia-smi 看右上角 "CUDA Version"，选不超过它的最高标签——
+#    ≥12.6 → cu126 / ≥12.4 → cu124（本机即此档）/ ≥11.8 → cu118
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# 3. 自检（应打印  2.6.0+cuXXX  True  显卡名）
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+# 4. 要跑测试再叠加 dev 依赖（pytest）
+pip install -r requirements-dev.txt
+```
+
+> 换机选 cu 标签的完整对应、装后自检、以及无 NVIDIA 卡时的 CPU 兜底，都写在 `requirements.txt` 末尾注释里，新机可直接对着抄。
+
 ## 运行环境
 
 - **Python 3.11**（本机 3.11.9 / Windows；锁定的依赖版本按 3.11 验证）
