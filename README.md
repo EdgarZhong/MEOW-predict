@@ -77,10 +77,11 @@ DL 主线把**协议 / 窗口 / 归一化 / 指标 / 配置**做成不可变**�
 
 ## 运行环境
 
-- Python 3.13（mise 全局环境）
-- 基础依赖（含 DL D0 地基，全程 torch-free）：`pip install --system numpy pandas scikit-learn tables`
-- 可选：`psutil`（交付链内存采样演练 `run_submission_full_window.py` 必需）
-- DL 卡带（D1/D2，待 4060）：将额外需要 `torch`（GPU / PyTorch）；D0 地基不需要
+- **Python 3.11**（本机 3.11.9 / Windows；锁定的依赖版本按 3.11 验证）
+- **依赖真相源 = `requirements.txt`**（运行依赖，已锁版本，从实跑环境捕获）：
+  - 一键装纯 PyPI 依赖：`pip install -r requirements.txt` —— numpy / pandas / tables(PyTables，读 h5) / scikit-learn / lightgbm / psutil
+  - **torch 单独装**（GPU wheel 不在默认 PyPI、cu 版本随机器 NVIDIA 驱动而变，故不进上面的 `-r` 列表）：本机 = `torch==2.6.0+cu124`（RTX 4060 / CUDA 12.4）；**换机的 cu 标签选择指引 + 装后自检命令见 `requirements.txt` 末尾注释**
+  - 开发 / 测试再叠加：`pip install -r requirements-dev.txt`（pytest；项目用例本是 unittest，`python -m unittest` 亦可跑）
 
 **import 约定**：`src/` / `config/` / `models/` 三个目录均为**平铺**（非包），入口需把三者都加入 path —— 运行脚本用 `PYTHONPATH=src:config:models`（Orchestrator 还需 `experiments`，或直接 `python experiments/run_dl.py`，其文件头已自插 path）；`tests/test_dl_pipeline.py` 与 `tests/test_dl_infrastructure.py` 均在文件头自行插入目录，直接 `python -m unittest` 即可。
 
