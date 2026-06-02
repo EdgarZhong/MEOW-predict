@@ -631,5 +631,153 @@ class TestSweepOrchestrator(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(run_dir, fn)), fn)
 
 
+# ------------------------------------------------------------------ #
+# 9) SWEEP 增量落盘（防中断打水漂）
+# ------------------------------------------------------------------ #
+
+class TestSweepIncrementalDump(unittest.TestCase):
+    """
+    验收三件事（对应 AGENT_TASK「增量落盘」）：
+    1. 完整跑：``trials.csv`` / ``fold_metrics.csv`` 与"一次性写"**逐字节等价**（只是落盘时机变早），
+       且多出 ``progress.jsonl``（时间线）+ ``summary.partial.json``（实时快照）。
+    2. 人为中断：档2 第 3 折注入 ``KeyboardInterrupt``，已完成的前 2 折仍在 ``fold_metrics.csv`` 里、
+       可读、列正确；``summary.json`` 不存在（=没跑完）。
+    3. ``--resume`` 续跑：复用已落盘的 (seed,fold)，跳过已完成的、补齐剩余，无重复、无遗漏。
+    """
+
+    def _assemble(self, out_dir, seeds=(42, 7, 11)):
+        from model_config import ModelKind, ModelConfig
+        from adapter_config import AdapterKind, AdapterConfig
+        from protocol_config import Stage, ProfileKind, ProtocolConfig
+        from search_config import SearchConfig
+        from exec_config import ExecConfig
+        from run_config import assemble_run_config
+
+        dates = Calendar().range(20230601, 20230710)
+        df = make_synth_seq(dates, n_symbols=6, n_interval=15, label="current", seed=8)
+        rc = assemble_run_config(
+            "20260602_sweep_incr_test_v1",
+            ModelConfig(ModelKind.REFERENCE_POOL, hparams={}),
+            AdapterConfig(AdapterKind.IDENTITY, columns=("c0", "c1")),
+            ProtocolConfig(Stage.SWEEP, ProfileKind.EXPANDING, dates[0], dates[-1],
+                           val_window=2, step=2, min_train_days=6, max_folds=4,
+                           fold_select="recent"),
+            SearchConfig(n_trials=1, search_overrides={
+                "seq_len": {"type": "choice", "values": [3, 4]},
+                "hidden_size": {"type": "choice", "values": [8]},
+                "num_layers": {"type": "choice", "values": [1]}}),
+            ExecConfig(seeds=seeds, out_dir=out_dir),
+        )
+        return rc, df
+
+    def _orch(self, rc, df, **kw):
+        from run_dl import Orchestrator
+        return Orchestrator(rc, raw_loader=make_loader(df),
+                            adapter=IdentityAdapter(["c0", "c1"]),
+                            cartridge_factory=ReferencePoolCartridge, **kw)
+
+    @staticmethod
+    def _read_rows(path):
+        import csv
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_full_run_is_byteequivalent_and_emits_progress(self):
+        import run_dl
+        with tempfile.TemporaryDirectory() as td:
+            rc, df = self._assemble(td)
+            summary = self._orch(rc, df).run()
+            self.assertEqual(summary["status"], "ok")
+            run_dir = os.path.join(td, rc.run_id)
+
+            # 增量产物存在 + 新增两件监控文件。
+            for fn in ("config.json", "trials.csv", "fold_metrics.csv", "summary.json",
+                       "progress.jsonl", "summary.partial.json"):
+                self.assertTrue(os.path.exists(os.path.join(run_dir, fn)), fn)
+
+            # 行数对：trials = grid_size；fold_metrics = n_folds × n_seeds。
+            trials_path = os.path.join(run_dir, "trials.csv")
+            fm_path = os.path.join(run_dir, "fold_metrics.csv")
+            self.assertEqual(len(self._read_rows(trials_path)), summary["grid_size"])
+            self.assertEqual(len(self._read_rows(fm_path)),
+                             summary["n_folds"] * len(summary["cert_seeds"]))
+
+            # 逐字节等价：把增量写的文件读回，再用旧一次性 _dump_csv 重写，内容应完全一致
+            # （证明"只改落盘时机、不改产物布局"）。
+            for path in (trials_path, fm_path):
+                rows = self._read_rows(path)
+                ref = path + ".ref"
+                run_dl._dump_csv(ref, rows)
+                with open(path, encoding="utf-8") as a, open(ref, encoding="utf-8") as b:
+                    self.assertEqual(a.read(), b.read(), f"{os.path.basename(path)} 增量≠一次性")
+
+            # progress.jsonl：每行合法 JSON，且含 champion + sweep_done 事件。
+            events = []
+            with open(os.path.join(run_dir, "progress.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        events.append(json.loads(line))   # 解析失败即非法 JSONL → 抛错
+            names = [e["event"] for e in events]
+            self.assertIn("champion", names)
+            self.assertIn("sweep_done", names)
+            self.assertEqual(names[-1], "sweep_done")
+
+    def test_interrupt_keeps_completed_then_resume_completes(self):
+        import run_dl
+        with tempfile.TemporaryDirectory() as td:
+            rc, df = self._assemble(td)
+            run_dir = os.path.join(td, rc.run_id)
+            fm_path = os.path.join(run_dir, "fold_metrics.csv")
+
+            # —— ① 在档2 第 3 次 sweep_cert 调用注入 KeyboardInterrupt —— #
+            base_trainer = run_dl.SequenceTrainer
+
+            class _InterruptingTrainer(base_trainer):
+                cert_calls = 0     # 类级计数：跨 seed 的 trainer 实例共享
+
+                def run_on_dl_fold(self, fold, profile_name="dl"):
+                    if profile_name == "sweep_cert":
+                        _InterruptingTrainer.cert_calls += 1
+                        if _InterruptingTrainer.cert_calls == 3:
+                            raise KeyboardInterrupt("注入中断（模拟长跑崩溃）")
+                    return super().run_on_dl_fold(fold, profile_name=profile_name)
+
+            run_dl.SequenceTrainer = _InterruptingTrainer
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    self._orch(rc, df).run()
+            finally:
+                run_dl.SequenceTrainer = base_trainer
+
+            # 崩溃后：summary.json 不存在（没跑完）；但前 2 折已落盘、可读、列正确。
+            self.assertFalse(os.path.exists(os.path.join(run_dir, "summary.json")))
+            self.assertTrue(os.path.exists(os.path.join(run_dir, "trials.csv")))
+            self.assertTrue(os.path.exists(os.path.join(run_dir, "summary.partial.json")))
+            partial_rows = self._read_rows(fm_path)
+            self.assertEqual(len(partial_rows), 2, "中断前完成的 2 折应已在盘上")
+            for r in partial_rows:
+                self.assertEqual(r["status"], "ok")
+                self.assertIn("val_corr", r)
+                self.assertEqual(int(r["random_seed"]), 42)   # 首个 seed 的前两折
+
+            # partial summary 记得冠军 + 进度。
+            with open(os.path.join(run_dir, "summary.partial.json"), encoding="utf-8") as f:
+                partial = json.load(f)
+            self.assertIn("champion", partial)
+
+            # —— ② resume 续跑：跳过已完成 2 折，补齐剩余，无重复无遗漏 —— #
+            rc2, _ = self._assemble(td)        # 同 run_id / 同 out_dir
+            summary = self._orch(rc2, df, resume=True).run()
+            self.assertEqual(summary["status"], "ok")
+            self.assertTrue(os.path.exists(os.path.join(run_dir, "summary.json")))
+
+            full_rows = self._read_rows(fm_path)
+            expected = summary["n_folds"] * len(summary["cert_seeds"])
+            self.assertEqual(len(full_rows), expected, "续跑后应补齐到完整折数")
+            keys = [(int(r["random_seed"]), int(r["fold_id"])) for r in full_rows]
+            self.assertEqual(len(keys), len(set(keys)), "续跑不得重复已完成的 (seed,fold)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
