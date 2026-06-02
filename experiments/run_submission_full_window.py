@@ -82,7 +82,9 @@ class PeakSampler(threading.Thread):
         self._poll = poll_sec
         self._heartbeat = heartbeat_sec
         self._proc = psutil.Process(os.getpid())
-        self._stop = threading.Event()
+        # 注意：属性名不能叫 `_stop`——会覆盖 threading.Thread 内部的 `_stop()` 方法，
+        # 导致 join() 收尾时把 Event 当方法调用 → TypeError: 'Event' object is not callable。
+        self._stop_event = threading.Event()
         self.peak_gb = 0.0
 
     def _rss_gb(self):
@@ -96,7 +98,7 @@ class PeakSampler(threading.Thread):
 
     def run(self):
         last_hb = 0.0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             cur = self._rss_gb()
             if cur > self.peak_gb:
                 self.peak_gb = cur
@@ -104,10 +106,10 @@ class PeakSampler(threading.Thread):
             if now - last_hb >= self._heartbeat:
                 _log("[mem] current={:.2f} GB  peak={:.2f} GB".format(cur, self.peak_gb))
                 last_hb = now
-            self._stop.wait(self._poll)
+            self._stop_event.wait(self._poll)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 def _log(msg):
