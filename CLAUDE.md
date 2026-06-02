@@ -2,9 +2,17 @@
 
 更新日期：2026-06-02
 
-## 当前阶段：XSECTION 首轮判决（~0.06 < 传统 0.0776）→ 双 Pivot：① 量 DL↔传统去相关（定集成路线）② cross-z 喂回截面输入
+## 当前阶段：路线锁定 = 传统保底 + 去相关 DL 集成（相关性已验 ρ=0.45 中等相关，集成已抬升）→ 按「冲 0.10 路线图」P1→P6 执行
 
-> **最新复盘（2026-06-02，本会话）。下方"战略 / TCN 史 / 押截面"等块为历史脉络，保留备查；当前推进口径以本块为准。**
+> **最新复盘（2026-06-02，本会话）。下方"双 Pivot / 战略 / TCN 史 / 押截面"等块为历史脉络，保留备查；当前推进口径 = 本块 +「相关性判读结果」+「冲 0.10 路线图」+「🚩 交付隐患」。**
+
+### ⏭️ 下一会话直接从这里开始
+
+1. **第一刀 = P1 修传统 ridge NaN**（task #7）：真因已查清 = X1 ridge 成员（`src/experiment_runner.py:614–618` 的 `StandardScaler→Ridge`）输入 float32，1e15 量级列居中时灾难性抵消 → 缩放后垃圾 → cholesky 失败回退 30GB svd → 内存紧则 NaN。**修法 = 线性成员输入转 float64**（细则见下「🚩 交付隐患 · P1 修法」）。改完重验 Dec ≥0.0803 + 内存紧/idle 两态非 NaN + 合并 master。
+2. **再 P2**（task #8，依赖 P1）：造对齐 DL 折的无泄漏传统滚动预测。
+3. **再 P3①**（task #6，依赖 P2）：三档消融 + 每档 ρ/集成读数。
+4. 全景 + 依赖 + 判决点 = 见本文件「### 冲 0.10 路线图」。分工：本路线（集成）本侧做；用户另开更强 DL-only。
+5. **本会话产物（gitignored，本机可见）**：DL Dec 预测 `results/dl/20260602_corr_probe_dl_v1/preds/preds_validation_fold0_seed42.csv`（0.0588）；传统 lgbm Dec 预测 `results/dl/_corr_probe/trad_preds_20231201_20231229.csv`（健康 0.0803）；ridge Dec 预测 `…/trad_preds_ridge_20231201_20231229.csv`（NaN，实证用）；相关性报告 `results/dl/_corr_probe/corr_report.json`。新脚本：`experiments/dump_trad_preds_members.py`（逐成员落盘）、`experiments/analyze_dl_trad_corr.py`、`experiments/dump_trad_preds.py`、`experiments/_probe_trad_features.py`（特征量级探针，一次性）。
 
 ### 一句话现状
 
@@ -36,9 +44,47 @@
 
 最可能现实结果 = **集成 → ~0.085–0.09**；真正 0.10 是 stretch（需 DL 够正交 **且** cross-z 有实质起量）。两 Pivot 的数出来，再定 0.10 够不够得着，还是转"承认传统天花板 ~0.085–0.09、把交付做扎实"。
 
-### 进行中
+### 相关性判读结果（probe 已出，2026-06-02）
 
-- 探针 `20260602_corr_probe_dl_v1`（单折 validation / 冠军 hparams / `cross_z` 关 = 当前 0.0624 模型 / `--dump-preds`）后台跑；出 Dec 逐票预测后 → 传统 dump → 分析脚本 → 拿 DL↔传统相关性判读。
+DL Dec 预测（`20260602_corr_probe_dl_v1`，cross_z 关）× 传统 Dec 预测（lgbm 成员，自检 pooled 0.0803）join 20 天 120 万行，`analyze_dl_trad_corr.py` 出（落 `results/dl/_corr_probe/corr_report.json`）：
+
+| | DL（单） | 传统-lgbm（单） | 等权集成 |
+|---|---|---|---|
+| daily-IC 均值 | 0.0702 | 0.0542（最坏日 −0.0724） | **0.0727** |
+| pooled corr | 0.0588 | 0.0781 | **0.0805** |
+
+- **DL↔传统去相关：pooled 0.4453 / daily-IC 0.4756 = 中等相关，不是冗余**（之前"高度相关→大概率杀死"的先验被推翻）。两指标上 DL/传统换位（DL 赢 daily-IC、传统赢 pooled）= 互补形状。
+- **集成数学（两去相关信号可达相关性 `R²=(IC₁²+IC₂²−2ρ·IC₁·IC₂)/(1−ρ²)`）**：代当前 pooled 数 → 最优合并 ≈ **0.083**（实测等权 0.0805 吻合）= **当前牌的集成天花板，非 0.10**。
+- **关键结论——卡 10% 的是 ρ，不是 DL 强度**：扫 ρ，若 ρ→0（完全去相关）则当前强度合并 = √(0.0781²+0.0588²) ≈ **0.098**；ρ=0.45 不变要顶到 0.10 则需 DL-alone ~0.091（比传统还高，不现实）。**→ 真正杠杆 = 把 DL 做正交（压 ρ、同时 IC 不塌），不是单纯把 DL 练猛。**
+- **caveat（务必打折）**：仅 Dec 单 20 天窗；"传统"这里是 lgbm-alone（非锁定等权集成 0.0776）；"最优静态权 0.0738"是同窗挑权的过拟合上界、忽略。GO/NO-GO 必须看 3 个选型折。
+
+### 冲 0.10 路线图（2026-06-02 锁定：传统保底 + 去相关 DL 集成）
+
+> **路线定调**：DL-alone 到不了 0.10；现实路线 = 传统保底 + DL 去相关一臂、做集成。**两层目标**：Tier-1 = 传统+DL 等权集成稳到 **~0.083–0.085**（基本到手，只差跨折验证）；Tier-2 = 压 ρ 把集成推向 **0.09–0.10**（stretch，~20–30%）。
+>
+> **分工**：**本路线（集成）= 本侧负责**，稳扎稳打、工程化；**用户另开"更强 DL-only"**，不依赖本路线，若产出更强 DL 可直接当本路线 Tier-2 更强的一臂喂进 Phase 4。
+>
+> **GPU 是单卡串行资源** → 无 GPU 的 CPU 活（Phase 1/2/6）可与 GPU 活（Phase 3）并行排在不同会话。
+
+| Phase | 任务 | 依赖 | 资源 | 产出 / GO-NO-GO |
+|---|---|---|---|---|
+| **P1 修传统腿** | ① ridge NaN 修复（特征标准化，改共用 `src/` 交付代码）② 重验 Dec sanity ≥0.0803 + 内存紧/idle 两态非 NaN ③ 合并 master | — | CPU/内存 | 可靠传统预测（两态不 NaN）。**阻塞 P2 及所有用传统预测的下游** |
+| **P2 传统滚动预测** | harness：对 3 个选型折 + 交付折，逐折 traditional train→predict、落逐票预测、按 (date,symbol,interval) 对齐 DL | P1 | CPU | 无泄漏传统 OOS 预测，供残差训练 / 去相关惩罚 / 折级集成评估 |
+| **P3 DL 去正交（核心，最不确定）** | ① 三档消融（纯GRU/截面off/截面cross-z）：测每档 DL IC，join P2 出每档 ρ 与集成增益 ② **残差训练**：DL 目标改 y−ŷ_trad（用 P2 无泄漏传统预测）= 压 ρ 主手段 ③（可选）loss 加去相关项 | P2（②③）；①可先跑 DL 侧 | GPU 串行 | 候选 DL 配置（各带 IC + 对传统 ρ）。**冲 0.10 成败在这** |
+| **P4 集成 + 验收** | ① 定融合器（等权零自由参数首选 + 量纲处理保 MSE/R²）② 3 个选型折评估集成 vs 传统单独（看最坏折）= **主裁** ③ 交付折 Dec 读数 | P2+P3 | CPU 分析 | **GO-NO-GO**：等权集成跨 3 折是否稳赢传统（最坏折正）。赢→进 P5；平→守 ~0.085 |
+| **P5 交付集成** | ① DL 腿接进提交链（fit() 里连 DL 一起重训，符合"交付=方法非权重"）② 交付内存/时间预算（含 torch）③ fit/predict 签名仍对 docx | P4 赢 | CPU+GPU | 含 DL 的可交付提交链 |
+| **P6 既有交付尾巴（独立并行）** | 全量内存峰实测 / 提交版减注释 / fit-predict 签名核验 | — | CPU | 与主线无依赖，任何空档插做 |
+
+**会话分配建议**：
+- **CPU 会话组**：P1 → P2，然后 P4 分析、P6 尾巴。GPU 忙时照样推进。
+- **GPU 会话组**：P3 实验，一晚一族（先三档消融，再残差训练）。
+- **依赖红线**：P1 不修完，P2/P3②③/P4 的传统预测都是 NaN，全堵；**所以 P1 是第一刀**。
+
+**两个判决点**：
+1. P4② Tier-1：等权（传统+DL-on-y）跨 3 折是否稳赢传统最坏折 → 否则回落传统单独交付。
+2. P3② 残差后：ρ 是否真降、集成是否向 0.09 爬 → 卡在 ~0.085 就承认天花板、停止冲 0.10、把交付做扎实。
+
+**诚实分界**：P1/P2/P4/P5/P6 是扎实工程，稳交 ~0.083–0.085；**10% 全押在 P3 能否压 ρ 又不塌 IC**——这一环不确定，别拿它当承诺。
 
 ---
 
@@ -113,6 +159,23 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 - 特征从 raw 现算、禁用 `data/features` 缓存。
 
 剩余尾巴（见待办队列）：① 全量内存峰上 ≥32GB 机器实测；② 提交版减注释；③ `fit/predict` 签名对照 docx 核验（另会话）。
+
+### 🚩 交付隐患（2026-06-02 发现，下一步必修）：X1 ridge 成员**仅因当时空闲内存差异**就会 NaN
+
+**现象**：本会话在本机（34GB Win）跑传统 Dec dump，融合预测**整列 1462884 行全 NaN**；而用户此前在 **master、同一台机器**上交付演练 `fit(Jun–Nov)+eval(Dec)` 跑通、得 Pearson 0.0803 / R²=0.00465。
+
+**根因链（已实证）**：
+1. 433 提交特征里有 **~1e14–1.7e15 量级的未归一化列**（特征探针：`nonfinite=0` 但 `maxabs≈1.7e15`）；`meow.py` 窗口矩阵**硬编码 float32**（`meow/meow.py:65/84`）。
+2. **标准化早就有、不是缺标准化**：X1 ridge 成员 fit 走 `_fit_model_core`（`src/experiment_runner.py:614–618`）= `StandardScaler → Ridge`，但输入 `x` 是 **float32**（line 599 注释明写"x 已是 float32 特征矩阵"）。1e15 量级列在 float32 下做 StandardScaler 居中（`x−mean`，两者都 ~1e15）= **灾难性抵消**：float32 仅 ~7 位有效数字、1e15 绝对精度才到 ~1e8，比这更小的特征信号全部丢失 → 缩放后是数值垃圾 / 近常数列。
+3. 垃圾/近常数列 → X^TX 近奇异 → **ridge cholesky 失败 → sklearn 回退 svd**（栈：`sklearn/_ridge.py:309 _solve_svd`）；全窗 875万×K 经济 svd 需 **~28–30GB**（U 矩阵），只在机器近 idle（≥~30GB 空闲）装得下：master 演练 idle 时 fit 峰值 ~28GB 跑通；本会话 dump 空闲仅 ~23GB → `init_gesdd failed init`（分配失败）→ ridge 系数 NaN → 等权融合 `(NaN + lgbm)/2 = 全 NaN`。
+4. **同机、同码（git diff master...HEAD 传统链零差异）、同数据 → NaN 与否仅由当时空闲内存决定**；lgbm 树模型尺度无关、整窗 fit 正常，只有 ridge 这半坏。**注意**：实验选型链的 X1（Nov 0.0737）走 FeatureLoader（可能 float64），与提交链 float32 现算的 X1 **数值口径本就不同** → 提交侧 X1 ridge 一直在 float32 垃圾缩放上解，修复后预测会变（应改善或持平，须验）。
+
+**交付风险**：老师机器内存紧 / 有其他负载，或换更小内存机时，`python meow.py` 全窗 fit 的提交输出可能**静默变 NaN**；且 ridge 每次都在跑这个 30GB svd（本该几毫秒 cholesky），又慢又脆。
+
+**P1 修法（改共用 `src/` 代码，顺带覆盖 master；别在跑 run 时动）**：
+- **(a) 推荐——根因解 = 线性成员走 float64**：在 `_fit_model_core`（`experiment_runner.py:596`）的线性分支（ridge/elasticnet/huber，均 `StandardScaler→model`）把 `x` 转 **float64** 再进 Pipeline，`_predict_with_baseline`（`experiment_runner.py:754`）对应转 float64。居中不丢精度 → 缩放后正常 → cholesky 毫秒级成功、内存小、**彻底绕开 30GB svd**。X1 成员子集 float64 ~10–14GB，本机够。**不要**只改 `solver='cholesky'`（根因是缩放精度，不是 solver 选择）。
+- 验收：改完重跑 Dec sanity（`experiments/run_submission_full_window.py` 或 `experiments/dump_trad_preds_members.py`）确认传统 ≥0.0803；**内存紧（人为占住部分 RAM）+ idle 两态各跑一次**全窗 fit，确认都非 NaN、Pearson 稳定 ~0.08。
+- 合并 master 覆盖交付。
 
 ## DL 主线：地基设计要点（详见 `docs/specs/DL实验设计规格.md`）
 
@@ -252,6 +315,7 @@ python experiments/run_dl.py --stage sweep --model xsection --adapter feature_43
 | **Pivot 2 · cross-z 喂回截面输入 + 三档消融** | 代码已落：`_build_xsection_module(cross_z=)` forward 第一层 masked 截面 z + `cross_z` hparam（默认关）+ 4 新单测（全 DL 套件 85 passed）。规格 §8.2.1 已更新。**消融 `纯GRU/截面off/截面+cross-z` 待跑**（Pivot 1 出数后定是否优先）。 | 🔜 代码就绪待跑 |
 | **DL infra 吞吐画像与折间 barrier 拆解** | 来自正式 run `20260602_sweep_xsection_v1` 的现象：GPU 已上卡但常态 util 偏低（常见 `25%~40%`），fold 间仍有 `load / norm / build_ds` 空窗。**当前只记现象与方向，不预设结论**：后续在 GPU 空闲时做单折 profiling（batch / `snap_batch` / AMP / `torch.compile` / predict 批大小）+ 函数级计时，判断瓶颈落在 kernel 粒度、host 同步、读盘、normalizer 还是截面重组。 | 🔬 观察中（下个 infra 小回合） |
 | **正式结果同步目录（双机追踪）** | 根目录新增 `tracked_results/`，专门提交“小体量、正式、可复盘”的结果文件；首批纳入 TCN search / TCN expanding / 传统 Dec 全窗口 sanity 指标，供双机同步与后续深挖分析 | ✅ 已建立 |
+| 🚩 **交付接线 — X1 ridge 仅因空闲内存就 NaN（必修）** | 本会话实证：同机同码同数据，传统 Dec 融合预测**全 NaN**（vs master idle 时跑通 0.0803）。根因=433 特征含 ~1e15 未归一化列 + `meow.py` float32 窗口 → ridge cholesky 必失败 → 回退 svd 需 ~30GB → 内存紧（本会话空闲仅 ~23GB）则分配失败成 NaN，idle（~30GB 空闲）才装得下。**行为差异仅由当时空闲内存决定**，交付脆弱（老师机器内存紧→提交可能静默 NaN）。详见上「🚩 交付隐患」。修向：(a) 推荐 ridge 输入标准化/转 float64→cholesky 毫秒级、绕开 30GB svd；(b) 显式 cholesky solver；(c) 缩窗。修后内存紧/idle 两态各验一次非 NaN。 | 🔜 **下一步必修** |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待实测（**本机已核实 ~34GB**，非旧记 16GB；满足 ≥32GB，可本机试） | 🔜 待实测 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
