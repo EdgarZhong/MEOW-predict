@@ -104,13 +104,13 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 
 | WT | 目录（外侧） | 分支 | 任务 | 文件归属（互不相交，可干净 merge） |
 |---|---|---|---|---|
-| **WT-A** | `../MEOW-wt-incrdump` | `feat/dl-incr-dump` | **增量落盘** | `experiments/run_dl.py`、`src/dl_search.py` |
-| **WT-B** | `../MEOW-wt-xsection` | `feat/dl-xsection` | **截面数据改造 + `MSE+λ·corr` loss + 可微 Pearson/截面 IC 指标 + 测试脚手架** | `src/sequence_dataset.py`、`models/dl_models.py`、`models/registry.py`、`config/*`、新增 `src/dl_losses.py` |
+| **WT-A** ✅ 已合并 | `../MEOW-wt-incrdump` | `feat/dl-incr-dump` | **增量落盘**（实际只动 `run_dl.py` + 测试，未碰 `dl_search.py`） | `experiments/run_dl.py`、`tests/test_dl_infrastructure.py` |
+| **WT-B** 🔧 进行中 | `../MEOW-wt-xsection` | `feat/dl-xsection` | **截面数据改造 + `MSE+λ·corr` loss + 可微 Pearson/截面 IC 指标 + 测试脚手架** | `src/sequence_dataset.py`、`models/dl_models.py`、`models/registry.py`、`config/*`、新增 `src/dl_losses.py` |
 
-### WT-A — 增量落盘（防中断打水漂）
+### WT-A — 增量落盘（防中断打水漂）✅ 已合并 `feat/dl-foundation`（2026-06-02）
 
-- 现状：档1 全跑完才写 `trials.csv`、档2 全跑完才写 `fold_metrics.csv`/`summary.json`（`run_dl.py` ~260/289/305 行）。今晚档2 黑盒 5h、若中途崩 15 fit 全丢——必要性已坐实。
-- 改：**每 trial 完成即 append `trials.csv`+flush；每折完成即 append `fold_metrics.csv`+flush**；带表头幂等、可安全续跑不重复。`summary.json` 仍最后总写（有逐行 csv 兜底）。
+- 现状（已解决）：档1 全跑完才写 `trials.csv`、档2 全跑完才写 `fold_metrics.csv`/`summary.json`；今晚档2 黑盒 5h、若中途崩 15 fit 全丢——必要性已坐实。
+- 已落地：**每 trial 完成即 append `trials.csv`+flush+fsync；每折完成即 append `fold_metrics.csv`+flush+fsync**（`_IncrementalCsvWriter` 表头幂等、零行兜底、与旧 `_dump_csv` 逐字节等价）+ `progress.jsonl` 逐事件时间线 + `summary.partial.json` 每折刷新快照。`summary.json` 仅成功收官落（=「在 ⇔ 跑完」完成标记）。`--resume` 复用已落盘 trial/(seed,fold) 跳过不重算（网格确定 → trial_id 即下标重建超参；折 key=`(random_seed,fold_id)`）。infra 测试 36 通过。
 
 ### WT-B — 截面改造 + loss（主攻地基）
 
@@ -130,7 +130,7 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 > 背景：今晚截面改造做不完，**本会话不跑**；两 agent 已获授权（无资源限制）把测试做完备。**方案不变**——尽快跑下一正式长跑。**Merge 在新会话做**（WT-A + WT-B → `feat/dl-foundation`），随后即启动长跑，利用夜里时间。
 
 **新会话启动顺序**：
-1. **Merge** WT-A(`feat/dl-incr-dump` 增量落盘) + WT-B(`feat/dl-xsection` 截面+loss+rescale) → `feat/dl-foundation`（文件集不相交，应无冲突）。
+1. **Merge** ~~WT-A(`feat/dl-incr-dump` 增量落盘，✅ 已于 2026-06-02 合并)~~ + **WT-B**(`feat/dl-xsection` 截面+loss+rescale，🔧 进行中，待其收尾后合并) → `feat/dl-foundation`（文件集不相交，应无冲突）。
 2. **跑全测试套件**确认绿（GPU 空）：`python -m pytest tests/test_dl_pipeline.py`（截面新用例 + 既有不变量）。
 3. **maxfold 内存演练**（截面 indexer 最大折 131d/全票不撞 34GB、冷热两跑一致）——**长跑前硬闸，过不了不跑**。
 4. 启动正式长跑（见下），后台 + `resource_monitor.py` + 守护。
@@ -171,7 +171,7 @@ python experiments/run_dl.py --stage sweep --model xsection --adapter feature_43
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
 | 交付接线 — fit/predict 签名核验 | 对照 `meow/MEOW金融时序预测2.0.docx` 确认 `MeowEngine.fit/eval/predict` 能让老师替换路径跑通（predict 当前接特征帧，老师可能按路径取数）。代码侧已确认无藏划分器、全量训练。**另起会话专办** | 🔜 遗留（另会话） |
-| **run_dl 增量落盘（防中断打水漂）** | 当前 SWEEP 是"全算完才落盘"（档1全跑完才写 `trials.csv`、档2全跑完才写 `summary.json` `run_dl.py:260/289/305`），中途崩则已完成的 fit **全丢**。改为**每 trial / 每折完成即增量追加落盘 + flush**（`trials.csv` 逐 trial、`fold_metrics.csv` 逐折），崩溃也留下已跑部分的价值。**编码于 WT-A（见上「并行编码分工」）；测试待主跑 ~00:45 收官后跑** | 🔧 WT-A 编码中 |
+| **run_dl 增量落盘（防中断打水漂）** | **已实现 + 已合并 `feat/dl-foundation`（merge `feat/dl-incr-dump`，2026-06-02）**：`trials.csv`/`fold_metrics.csv` 逐 trial/逐折 `append+flush+fsync`（`_IncrementalCsvWriter` 表头幂等、零行兜底、与旧 `_dump_csv` 产物逐字节等价）+ `progress.jsonl` 时间线 + `summary.partial.json` 每折快照；`summary.json` 仅成功收官落（=完成标记）；`--resume` 复用已落盘 trial/(seed,fold) 跳过不重算。infra 测试 **36 通过**（新增 `TestSweepIncrementalDump`：逐字节等价 / 人为中断保留前序 / resume 续跑无重复无遗漏） | ✅ 完成（已合并） |
 | 传统后续优化（推迟，保留方向） | lgbm HPO / 小波→GBDT / MLP——上限有限，战略转型后推迟，有空才碰 | 🅿️ 推迟 |
 | 🚩红线（口径更新） | 传统 Final（12 月）三层口径未碰；**DL 新协议（§十一）改用锚定扩展 walk-forward，Dec 进 rolling 当最近折用满**（交付=方法非权重，无权重 lockbox） | 口径已改 |
 
