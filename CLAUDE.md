@@ -85,6 +85,73 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 - **超参只搜结构 3 旋钮**（序列长/hidden/层数）+ 随机搜索 + 早杀。
 - **冲 0.12，不验"序列是否有料"**（已是先验）。
 
+## 🚧 并行编码分工（worktree，2026-06-02 凌晨开）
+
+> **本会话主线 = 守护正在收官的 `20260601_sweep_gru433_v1`（14/15 fit，~00:45 出 summary）。** 趁机在仓库外侧 2 个 worktree 并行铺地基；**Agent 由用户在各 worktree 内启动**（本会话不 spawn）。
+
+### 🚨 资源横幅（所有 worktree 编码 Agent 必读）
+
+**✅【00:31 更新：主训练已于 00:30 自然收官（summary 已落），GPU 全空、内存释放 → 本横幅的高负载/GPU 约束即刻解除，可放开跑测试与 maxfold 演练。】**
+
+（以下为收官前原始横幅，留档）**主训练进程 PID 19560 仍在跑（占 GPU ~6.2/8GB + 系统内存 ~29–32/34GB），预计 ~00:45 收官。在它跑完前——**
+
+- ❌ **严禁任何高负载 / 上 GPU 的操作**：`pytest tests/test_dl_pipeline.py`（含真实 h5 + torch/CUDA 用例）、`--device cuda` 任何脚本、maxfold 内存演练、训练 / SWEEP，**一律不许跑**（抢显存/内存可能把主跑挤崩）。
+- ✅ **可做**：写 / 改代码、读文件、设计、torch-free 的轻量 `python -c` import 自检（不加载数据、不碰 CUDA）。
+- ⏳ **测试统一推迟**：所有单测 / 集成测试**等主跑 ~00:45 收官、GPU 空闲后再统一跑**。
+- 注：worktree 不含 `data/*.h5`（gitignore，未复制）→ 天然跑不了依赖数据的测试，正好契合本横幅。
+
+### worktree 映射（均从 `feat/dl-foundation` 切出；各根目录已留自包含 `AGENT_TASK.md`）
+
+| WT | 目录（外侧） | 分支 | 任务 | 文件归属（互不相交，可干净 merge） |
+|---|---|---|---|---|
+| **WT-A** | `../MEOW-wt-incrdump` | `feat/dl-incr-dump` | **增量落盘** | `experiments/run_dl.py`、`src/dl_search.py` |
+| **WT-B** | `../MEOW-wt-xsection` | `feat/dl-xsection` | **截面数据改造 + `MSE+λ·corr` loss + 可微 Pearson/截面 IC 指标 + 测试脚手架** | `src/sequence_dataset.py`、`models/dl_models.py`、`models/registry.py`、`config/*`、新增 `src/dl_losses.py` |
+
+### WT-A — 增量落盘（防中断打水漂）
+
+- 现状：档1 全跑完才写 `trials.csv`、档2 全跑完才写 `fold_metrics.csv`/`summary.json`（`run_dl.py` ~260/289/305 行）。今晚档2 黑盒 5h、若中途崩 15 fit 全丢——必要性已坐实。
+- 改：**每 trial 完成即 append `trials.csv`+flush；每折完成即 append `fold_metrics.csv`+flush**；带表头幂等、可安全续跑不重复。`summary.json` 仍最后总写（有逐行 csv 兜底）。
+
+### WT-B — 截面改造 + loss（主攻地基）
+
+设计权威：`NOTE.md`「截面模型怎么设计」+ 规格 §8.2 + `AGENTS.md §十一·11.5`。**本会话又焊死了 loss 口径（见 🔑）。**
+
+- **张量契约泛化**：样本单元 `[L,C]`(单票) → `[N,L,C]+mask[N]+y[N]`(整截面)；WindowIndexer 按 `(date,interval)` 聚票、各取前 L 窗 stack、变长 N→pad+mask(不跨日 / 因果对齐不变)；Normalizer 加一档**截面内 cross-z**。**务必把"瘦内存"纪律搬进新 indexer**（有界 day-cache + 按需 gather + 用完即释放），否则整截面物化会爆内存——上整晚跑前先做 maxfold 演练。
+- **`CrossSectionCartridge`**：`ModelKind` 加 `XSECTION`、绑 `FEATURE_433`；torch = 共享 GRU 时序腿 + `nn.MultiheadAttention` 1 块(无位置 / 无 ID，带 padding mask) + 残差 + Linear 头。残差 → 截面腿学不到则退化回纯时序 GRU(③ 是 ② 的消融下界)；无位置无 ID = 置换等变 + 零身份(换池子免费保险)。
+- **🔑 loss 口径（本会话焊死，务必照做）**：
+  1. `loss = 量纲项 + λ·(1 − 截面内 Pearson)`，λ∈{0,0.3} 走 SWEEP 小网格。
+  2. **corr 项 = 截面内 Pearson**(同一 `(date,interval)` 跨票) = 老师 pooled corr / daily-IC 那个被打分的量。**逐票 GRU 上的批内 corr 只是粗代理 → 截面模型才让"直接优化 corr"对齐到被打分的 corr。**
+  3. **【定稿覆盖，2026-06-02】目标层级 = corr 力争最大化 / R²≥0 硬底**。R²≥0 不靠调 λ，靠**永远开启的训练段全局 OLS 线性 rescale `a·ŷ+b`**(fit-on-train / apply-on-val，零泄漏，不设开关)——重标定后 **R²=corr²**，corr>0 即自动 R²≥0、且 corr 不掉。**于是 corr 与 R² 不再冲突，选 λ 只按"最大化 val corr"**，三指标照报仅供核对(不必为护栏牺牲 corr、不必 Pareto 纠结)。
+  4. **不要任何开关**：损失项固定 MSE（不做 MSE/Huber 切换）；rescale 始终开。corr 项 = **数值稳定可微 截面内 Pearson**，独立成 `src/dl_losses.py` + 单测。
+  5. λ·corr **先在 GRU 卡带验**(便宜、确认杠杆)，再带进截面卡带。
+
+## 🚀 下一长跑启动方案（新会话执行；本会话只拟定 + 提交，不启动）
+
+> 背景：今晚截面改造做不完，**本会话不跑**；两 agent 已获授权（无资源限制）把测试做完备。**方案不变**——尽快跑下一正式长跑。**Merge 在新会话做**（WT-A + WT-B → `feat/dl-foundation`），随后即启动长跑，利用夜里时间。
+
+**新会话启动顺序**：
+1. **Merge** WT-A(`feat/dl-incr-dump` 增量落盘) + WT-B(`feat/dl-xsection` 截面+loss+rescale) → `feat/dl-foundation`（文件集不相交，应无冲突）。
+2. **跑全测试套件**确认绿（GPU 空）：`python -m pytest tests/test_dl_pipeline.py`（截面新用例 + 既有不变量）。
+3. **maxfold 内存演练**（截面 indexer 最大折 131d/全票不撞 34GB、冷热两跑一致）——**长跑前硬闸，过不了不跑**。
+4. 启动正式长跑（见下），后台 + `resource_monitor.py` + 守护。
+
+**长跑命令（主攻 = 截面模型 SWEEP；以合并后实际 ModelKind/CLI 为准，新会话先 `run_dl.py --help` 核对）**：
+
+```
+python experiments/run_dl.py --stage sweep --model xsection --adapter feature_433 --device cuda \
+  --start 20230601 --end 20231229 --val-window 12 --step 12 --min-train-days 40 --max-folds 5 \
+  --fold-select recent --grid-seq-len 32 --grid-hidden 32 --grid-layers 1 \
+  --hparams dropout=0.2,weight_decay=0.001,max_epochs=15,patience=5,lambda_corr=0.3 \
+  --seeds 42,43,44 --max-symbols 0 --run-id 20260602_sweep_xsection_v1 --out-dir results/dl
+```
+
+- λ 走 `--hparams`（决策 Q1）；**rescale 永远开、cross-z 不做**（决策 Q2）；结构固定昨晚冠军 seq32/h32/L1；max_epochs 30→15（best_epoch 实测 4–7，省时不损精度）。
+- **Tier-1 fallback**（若截面卡带未全就绪 / 演练没过）：先跑 **GRU-on-433 + λ·corr + rescale**（`--model gru` + `lambda_corr=0.3`，proven 管线、低风险），验杠杆 + 把 R² 翻正，不浪费今晚。
+
+**早上看**：三镜头——val_corr.mean / 最坏折 val_corr.min（决策主镜头）/ val_r2（**应被 rescale 兜在 ≥0**）；目标 corr 力争 >0.10、R² 不为负。§11.9 传统 0.0776/0.0803 仅大致参考。
+
+**loss / rescale / cross-z 定稿**：见上「并行编码分工 §WT-B 🔑」+ 各 worktree `AGENT_TASK.md`（已与两 agent 同步）。
+
 ## 待办队列
 
 | # | 任务 | 状态 |
@@ -97,14 +164,14 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 | **TCN-on-raw（已否决）** | 实现完成 + smoke 通过。海选 `20260531_search_tcn_raw_v1` best 0.01653；expanding `20260531_valid_tcn_raw_v1`：mean=0.00912 / val_R² 9/9 全负（-0.224~-0.005）/ fold1 种子方差 0.068。**真因=截面盲区**（`[B,L,C]` 一次一票、无截面归一，看不见 cross-z/rank 那维 alpha；非 max_epochs）。**结论：否决**——raw 与 433 同源无更富数据、raw-LOB 终局不存在，路线转向**截面建模** | ❌ 否决 |
 | **新评测协议落 run_config** | `AGENTS.md §十一` 协议已落代码：`Stage.SWEEP` 一命令两档（档1 小网格×近2折×2seed 按最坏折选冠军 → 档2 冠军×5折×3seed）+ `build_dl_folds(fold_select="recent")`（自 Dec 倒贴五段不重合、锚定扩展、embargo 已等价 purge）+ `enumerate_grid`（确定性网格）+ 最坏折/R² 双镜头读数 + `--device/--grid-*` CLI。34 test 全过 + 真实数据 CLI 端到端跑通 | ✅ 完成 |
 | **截面模型方案（主攻）** | **方案已拍板落档**（`NOTE.md`「截面模型怎么设计」+ 规格 §8.2）：因子化两腿 = 共享 GRU 时序腿（每票日内路径编码）+ set-attention 截面腿（跨票、置换等变零身份、残差接）+ per-票头；`MSE+λ·corr` 截面对齐；张量契约 `[L,C]`→整截面 `[N,L,C]`+mask（WindowIndexer 按 (date,interval) 聚票、Normalizer 加截面 z）。业界 STGNN/关系排序同构、为什么不用时空联合/图网络已记 | ✅ 方案完成 |
-| **截面模型卡带（主攻，待实现）** | 实现 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 FEATURE_433）+ WindowIndexer/Normalizer 截面泛化，接已跑通的 SWEEP；下一程。时间盒：周中 ③ + ② 都无正信号超传统保底则回落保底 | 🔜 下一程 |
-| **GRU-on-433 基线 + 损失对齐** | **正式跑进行中**（run `20260601_sweep_gru433_v1`，2026-06-01 13:43 起）：走 SWEEP 新 rolling、纯 MSE（λ=0），档1筛选已完成 7/8 组合（`trials.csv` 约 19:10 落、`summary.json` 约 23:30+ 落）；资源全程健康（GPU 78–94% / 显存 6.4/8GB / RSS ~21GB，无 OOM）。早上看（**先单独看 DL 自身深度、不与传统正式取舍**——折口径不对齐，见 `AGENTS.md §11.9`）：绝对水平、最坏折、R² 是否逼近 0、种子离散；传统 0.0776 / 0.0803 **仅作大致参考判推进方向**。要正式对决须先统一折（传统重评 recent 5 折 或 DL 补 Dec 整月对齐折）。`MSE+λ·corr`(λ∈{0,0.3}) 下一晚加 | 🔄 进行中 |
+| **截面模型卡带（主攻，待实现）** | 实现 `CrossSectionCartridge`（`ModelKind` 加 `XSECTION`，绑 FEATURE_433）+ WindowIndexer/Normalizer 截面泛化，接已跑通的 SWEEP。时间盒：周中 ③ + ② 都无正信号超传统保底则回落保底。**编码于 WT-B（见上「并行编码分工」）** | 🔧 WT-B 编码中 |
+| **GRU-on-433 基线 + 损失对齐** | **基线认证收官**（run `20260601_sweep_gru433_v1`，纯 MSE/λ=0，13:43→00:30，详见 `docs/实验记录.md` 2026-06-02）。冠军 seq32/h32/L1。**三镜头**：val_corr.mean **0.0585**（positive **15/15**、std 0.013）/ 最坏折 **0.0391** / **R² −0.0071（14/15 微负）**。结论：**结构成立**（处处为正、种子离散小、远胜 TCN → 看见截面 alpha，=③消融下界）；**R² 微负 = MSE/corr 矛盾实锤**。§11.9 传统 0.0776/0.0803 仅大致参考、不正式取舍。**下一步：λ·corr + R²≥0 护栏 + 近免费 rescale 修 R²（→ WT-B）；λ·corr 先 GRU 验再上截面** | ✅ 基线收官 |
 | **正式结果同步目录（双机追踪）** | 根目录新增 `tracked_results/`，专门提交“小体量、正式、可复盘”的结果文件；首批纳入 TCN search / TCN expanding / 传统 Dec 全窗口 sanity 指标，供双机同步与后续深挖分析 | ✅ 已建立 |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待实测（**本机已核实 ~34GB**，非旧记 16GB；满足 ≥32GB，可本机试） | 🔜 待实测 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
 | 交付接线 — fit/predict 签名核验 | 对照 `meow/MEOW金融时序预测2.0.docx` 确认 `MeowEngine.fit/eval/predict` 能让老师替换路径跑通（predict 当前接特征帧，老师可能按路径取数）。代码侧已确认无藏划分器、全量训练。**另起会话专办** | 🔜 遗留（另会话） |
-| **run_dl 增量落盘（防中断打水漂）** | 当前 SWEEP 是"全算完才落盘"（档1全跑完才写 `trials.csv`、档2全跑完才写 `summary.json` `run_dl.py:260/289/305`），中途崩则已完成的 fit **全丢**。改为**每 trial / 每折完成即增量追加落盘 + flush**（`trials.csv` 逐 trial、`fold_metrics.csv` 逐折），崩溃也留下已跑部分的价值。**现在不动代码，等 `20260601_sweep_gru433_v1` 跑完再实施** | 🔜 待实现（跑完再做） |
+| **run_dl 增量落盘（防中断打水漂）** | 当前 SWEEP 是"全算完才落盘"（档1全跑完才写 `trials.csv`、档2全跑完才写 `summary.json` `run_dl.py:260/289/305`），中途崩则已完成的 fit **全丢**。改为**每 trial / 每折完成即增量追加落盘 + flush**（`trials.csv` 逐 trial、`fold_metrics.csv` 逐折），崩溃也留下已跑部分的价值。**编码于 WT-A（见上「并行编码分工」）；测试待主跑 ~00:45 收官后跑** | 🔧 WT-A 编码中 |
 | 传统后续优化（推迟，保留方向） | lgbm HPO / 小波→GBDT / MLP——上限有限，战略转型后推迟，有空才碰 | 🅿️ 推迟 |
 | 🚩红线（口径更新） | 传统 Final（12 月）三层口径未碰；**DL 新协议（§十一）改用锚定扩展 walk-forward，Dec 进 rolling 当最近折用满**（交付=方法非权重，无权重 lockbox） | 口径已改 |
 
