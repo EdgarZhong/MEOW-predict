@@ -577,3 +577,191 @@ class SequenceDataset:
             "interval": self.arrays.intervals[lr],
             TARGET_COL: self.arrays.labels[lr],
         })
+
+
+# ================================================================== #
+# 截面索引器 + 截面数据集（按 (date,interval) 聚票，规格 §8.2）
+# ================================================================== #
+
+class CrossSectionIndexer:
+    """
+    把扁平行的**合法窗口末行**按 ``(date, interval)`` 聚成"截面快照"。
+
+    一个快照 = 同一 ``(date, interval)`` 时刻、所有"凑得齐一整窗"的在场票，每票带它
+    自己 ``[t-L+1, t]`` 那段日内窗（窗口口径完全复用 ``WindowIndexer``，因此**不跨日、
+    不跨票、因果对齐、warmup 丢弃**等物理保证一字不改，只是把窗口换一种分组方式聚起来）。
+
+    返回 ``snapshots``：一个列表，每个元素是某 ``(date, interval)`` 快照里各在场票的
+    **窗口末行全局行号**数组（按 ``symbol`` 升序），快照之间按 ``(date, interval)`` 升序。
+    变长 N（每个截面在场票数不同）由下游 ``CrossSectionDataset`` 在成批时 pad + mask。
+
+    与逐票 ``WindowIndexer`` 的关系：两者末行集合**完全相同**（都来自
+    ``WindowIndexer.build_index``），只是 CrossSection 把它们按截面重新分组。因此截面
+    卡带产出的逐票预测，可无损映射回逐票 ``label_rows`` 顺序（升序）做指标对齐。
+    """
+
+    def __init__(self, seq_len: int):
+        self.seq_len = int(seq_len)
+        self._win = WindowIndexer(seq_len)
+
+    def build_index(self, arrays: SequenceArrays) -> List[np.ndarray]:
+        label_rows = self._win.build_index(arrays)      # 合法窗口末行（按 (date,sym,itv) 升序）
+        if label_rows.size == 0:
+            return []
+        d = arrays.dates[label_rows]
+        itv = arrays.intervals[label_rows]
+        sym = arrays.symbols[label_rows]
+        # label_rows 原序是 (date, symbol, interval)：同一 (date,interval) 的不同票**不连续**
+        # （symbol 夹在中间），必须按 (date, interval, symbol) 重排把同截面的票聚拢。
+        order = np.lexsort((sym, itv, d))               # 主键 date，其次 interval，再 symbol
+        lr = label_rows[order]
+        dd = d[order]
+        ii = itv[order]
+        # (date,interval) 变化处即新快照起点。
+        change = np.empty(lr.shape[0], dtype=bool)
+        change[0] = True
+        change[1:] = (dd[1:] != dd[:-1]) | (ii[1:] != ii[:-1])
+        starts = np.flatnonzero(change)
+        # 按起点切片成各快照（np.split 用内部边界 starts[1:]）。
+        return np.split(lr, starts[1:])
+
+
+class CrossSectionDataset:
+    """
+    截面快照数据集：把 ``SequenceArrays`` 按 ``(date, interval)`` 聚成快照流。
+
+    与 ``SequenceDataset`` 共享同一套"白化特征矩阵 + 窗口偏移"的惰性 gather 机制，
+    只是**样本单元从"一个窗 [L,C]"换成"一个截面 [N,L,C] + mask[N] + y[N]"**（规格
+    §8.2 张量契约泛化）。瘦内存纪律保持：特征矩阵只白化一次（可原地）、快照按需
+    gather、不一次性物化整期所有快照。
+
+    两种构造入口：
+    - ``__init__(arrays, seq_len, normalizer, own_features)``：标准入口（与
+      ``SequenceDataset`` 同签名），自带白化，单测/独立使用走它。
+    - ``from_whitened(feats, arrays, seq_len)``：复用**已白化**的特征矩阵（如 trainer
+      已为 ``SequenceDataset`` 原地白化过的那张），**不再重算白化、不再复制 [N,C]**——
+      截面卡带内部包装 trainer 传来的 ``SequenceDataset`` 时走它，避免双份内存。
+    """
+
+    def __init__(
+        self,
+        arrays: SequenceArrays,
+        seq_len: int,
+        normalizer: Optional[Normalizer] = None,
+        own_features: bool = False,
+    ):
+        self.arrays = arrays
+        self.seq_len = int(seq_len)
+        self.normalizer = normalizer if normalizer is not None else Normalizer(mode="identity")
+        self._feats = self.normalizer.transform(arrays.features, inplace=own_features)  # [N,C] 已白化
+        self._offsets = np.arange(-(self.seq_len - 1), 1, dtype=np.int64)
+        self.snapshots: List[np.ndarray] = CrossSectionIndexer(seq_len).build_index(arrays)
+
+    @classmethod
+    def from_whitened(cls, feats: np.ndarray, arrays: SequenceArrays, seq_len: int) -> "CrossSectionDataset":
+        """用已白化矩阵 ``feats`` + 原始 ``arrays``（取 meta/labels）直接组装，零再白化、零复制。"""
+        obj = cls.__new__(cls)
+        obj.arrays = arrays
+        obj.seq_len = int(seq_len)
+        obj.normalizer = Normalizer(mode="identity")
+        obj._feats = feats
+        obj._offsets = np.arange(-(int(seq_len) - 1), 1, dtype=np.int64)
+        obj.snapshots = CrossSectionIndexer(seq_len).build_index(arrays)
+        return obj
+
+    def __len__(self) -> int:
+        """快照数（= 有多少个 (date,interval) 截面）。"""
+        return len(self.snapshots)
+
+    @property
+    def n_channels(self) -> int:
+        return self.arrays.n_channels
+
+    @property
+    def channels(self) -> List[str]:
+        return list(self.arrays.channels)
+
+    def n_tickers_total(self) -> int:
+        """所有快照在场票总数（= 逐票预测/label_frame 行数）。"""
+        return int(sum(len(s) for s in self.snapshots))
+
+    def snapshot_sizes(self) -> np.ndarray:
+        """各快照在场票数 ``[num_snapshots]``。"""
+        return np.array([len(s) for s in self.snapshots], dtype=np.int64)
+
+    def feature_matrix(self) -> np.ndarray:
+        """已白化的整张特征矩阵 ``[N, C]`` float32（与窗口 gather 同源）。"""
+        return self._feats
+
+    def window_offsets(self) -> np.ndarray:
+        return self._offsets
+
+    def flat_label_rows(self) -> np.ndarray:
+        """按快照顺序拼接的全部窗口末行号（snapshot-flatten 序）；空则返回空数组。"""
+        if not self.snapshots:
+            return np.array([], dtype=np.int64)
+        return np.concatenate(self.snapshots).astype(np.int64, copy=False)
+
+    def gather_snapshot(self, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """取第 k 个快照：``(X[N, L, C] float32, y[N] float32)``，票按 symbol 升序。"""
+        lr = self.snapshots[k]
+        gr = lr[:, None] + self._offsets[None, :]        # [N, L]
+        X = self._feats[gr].astype(np.float32)           # [N, L, C]
+        y = self.arrays.labels[lr].astype(np.float32)    # [N]
+        return X, y
+
+    def iter_batches(
+        self,
+        batch_size: int,
+        shuffle: bool = False,
+        seed: Optional[int] = None,
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        按"快照数"成批（``batch_size`` = 一批多少个截面，**不是多少票**），pad 到批内
+        最大在场票数 ``maxN``，惰性产 ``(X[B,maxN,L,C], y[B,maxN], mask[B,maxN])``（纯 numpy）。
+
+        - pad 位特征/标签置 0，``mask=False``；下游损失/注意力只在 mask 有效位上算。
+        - ``shuffle=True`` 按种子打乱**快照顺序**（训练）；``shuffle=False`` 保持
+          ``(date,interval)`` 升序（评测，便于把逐票预测拼回 ``flat_label_rows`` 序）。
+        """
+        n = len(self)
+        if n == 0:
+            return
+        order = np.arange(n)
+        if shuffle:
+            rng = np.random.default_rng(seed)
+            rng.shuffle(order)
+        L, C = self.seq_len, self.n_channels
+        for start in range(0, n, batch_size):
+            sel = order[start: start + batch_size]
+            snaps = [self.snapshots[i] for i in sel]
+            sizes = [len(s) for s in snaps]
+            maxN = max(sizes) if sizes else 0
+            B = len(snaps)
+            X = np.zeros((B, maxN, L, C), dtype=np.float32)
+            y = np.zeros((B, maxN), dtype=np.float32)
+            mask = np.zeros((B, maxN), dtype=bool)
+            for bi, lr in enumerate(snaps):
+                nk = len(lr)
+                gr = lr[:, None] + self._offsets[None, :]    # [nk, L]
+                X[bi, :nk] = self._feats[gr]
+                y[bi, :nk] = self.arrays.labels[lr]
+                mask[bi, :nk] = True
+            yield X, y, mask
+
+    def label_frame(self) -> pd.DataFrame:
+        """
+        按快照顺序（``(date,interval)`` 升序、票内 symbol 升序）展平的逐票 meta + 标签。
+
+        注意：行序是 **snapshot-flatten 序**，与 ``SequenceDataset.label_frame()`` 的
+        ``(date,symbol,interval)`` 窗口序**不同**。截面卡带对外 predict 时会把预测按
+        ``flat_label_rows`` 升序映射回逐票窗口序，故指标对齐仍用 SequenceDataset 那份。
+        本方法主要供独立使用 / 单测核对聚票正确性。
+        """
+        lr = self.flat_label_rows()
+        return pd.DataFrame({
+            "date": self.arrays.dates[lr],
+            "symbol": self.arrays.symbols[lr],
+            "interval": self.arrays.intervals[lr],
+            TARGET_COL: self.arrays.labels[lr],
+        })

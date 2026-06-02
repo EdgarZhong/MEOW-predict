@@ -37,6 +37,8 @@ import numpy as np
 from adapter_config import AdapterKind
 from model_config import ModelKind
 from registry import register_adapter, register_model
+# 损失/重标定来自脊柱侧 src/dl_losses.py（torch-free import；torch 仅在被调用时惰性导）。
+from dl_losses import fit_linear_rescale_numpy, make_loss
 
 
 # ================================================================== #
@@ -432,6 +434,14 @@ GRU_SEARCH_SPACE: Dict = {
     "num_layers":  {"type": "int", "low": 1, "high": 2},
 }
 
+# ---- 截面模型搜索空间（结构旋钮；λ 走 --hparams 不进此空间，见 §Q1） ----
+# 时序腿沿用 GRU 浅层；截面腿 set-attention 少头低维，重正则换跨时间稳（§11.5）。
+XSECTION_SEARCH_SPACE: Dict = {
+    "seq_len":     {"type": "choice", "values": [16, 32, 48]},
+    "hidden_size": {"type": "choice", "values": [32, 64]},
+    "num_layers":  {"type": "int", "low": 1, "high": 2},
+}
+
 
 def _require_torch():
     """
@@ -655,6 +665,109 @@ class _GpuWindowSource:
         """显式释放 device / CPU 句柄，给下一段 dataset 腾资源。"""
         self.feats = self.label_rows = self.offsets = self.labels = None
         self._feats_cpu = self._label_rows_cpu = self._offsets_cpu = self._labels_cpu = None
+
+
+class _GpuCrossSectionSource:
+    """
+    把一个 ``CrossSectionDataset`` 的「白化特征矩阵 + 各快照窗口索引」喂成 device 上的
+    ``(X[B,maxN,L,C], y[B,maxN], mask[B,maxN])`` batch 流（``B`` = 一批多少个 (date,interval)
+    快照）。与 ``_GpuWindowSource`` 同款瘦内存纪律，只是 gather 形状从逐窗 ``[b,L,C]`` 升到
+    逐截面 ``[B,maxN,L,C]``，故显存预算更保守。
+
+    两态（按 device + 显存预算自动选；省去后台预取线程，每批瞬时有界、内存安全）：
+    1. **resident**：整张白化矩阵装得进显存预算时驻留 device，按快照 gather 全在卡上做；
+    2. **cpu**：device=cpu（单测）或显存装不下时——每批在 CPU gather 好 ``[B,maxN,L,C]``
+       再整批 ``.to(device)``，在途只有当前一批，**内存有界、永不 OOM**。
+
+    pad 位（``mask=False``）的窗口末行号填 0（合法行、gather 不越界），其特征/标签经
+    时序腿后由 mask 在损失/收集处屏蔽，不污染结果。
+    """
+
+    # 截面 batch 的 [B,maxN,L,C] 瞬时也吃显存，故 resident 阈值比逐窗源更保守。
+    _VRAM_FRAC = 0.45
+
+    def __init__(self, xs_ds, torch, device: str):
+        self._torch = torch
+        self._xs = xs_ds
+        self.device = str(device)
+        self.seq_len = int(xs_ds.seq_len)
+        self.snapshots = xs_ds.snapshots
+        self.n_snaps = len(self.snapshots)
+        self._offsets_cpu = torch.from_numpy(
+            np.ascontiguousarray(xs_ds.window_offsets()).astype(np.int64, copy=False))
+        self._feats_cpu = torch.from_numpy(np.ascontiguousarray(xs_ds.feature_matrix()))
+        self._labels_cpu = torch.from_numpy(
+            np.ascontiguousarray(xs_ds.arrays.labels).astype(np.float32, copy=False))
+        self.mode = "cpu"
+        self.feats_gpu = self.offsets_gpu = self.labels_gpu = None
+
+        if self.n_snaps == 0 or not self.device.startswith("cuda"):
+            return
+        # 事前显存预算：只有整张特征矩阵确实装得下才 resident，绝不盲分配再接 OOM。
+        feat_bytes = self._feats_cpu.numel() * 4
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info()
+        except Exception:
+            free_bytes = 0
+        if feat_bytes < self._VRAM_FRAC * free_bytes:
+            try:
+                self.feats_gpu = self._feats_cpu.to(self.device, dtype=torch.float32)
+                self.offsets_gpu = self._offsets_cpu.to(self.device)
+                self.labels_gpu = self._labels_cpu.to(self.device)
+                self.mode = "resident"
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                self.feats_gpu = self.offsets_gpu = self.labels_gpu = None
+                torch.cuda.empty_cache()
+                self.mode = "cpu"
+
+    def __len__(self) -> int:
+        return self.n_snaps
+
+    @staticmethod
+    def _pack(snaps):
+        """把一批变长快照打成 ``(lr_pad[B,maxN] int64, mask[B,maxN] bool)``（pad 行号填 0）。"""
+        sizes = [len(s) for s in snaps]
+        maxN = max(sizes) if sizes else 0
+        B = len(snaps)
+        lr_pad = np.zeros((B, maxN), dtype=np.int64)
+        mask = np.zeros((B, maxN), dtype=bool)
+        for bi, s in enumerate(snaps):
+            nk = len(s)
+            lr_pad[bi, :nk] = s
+            mask[bi, :nk] = True
+        return lr_pad, mask
+
+    def iter_batches(self, snap_batch: int, shuffle: bool = False, seed: Optional[int] = None):
+        if self.n_snaps == 0:
+            return
+        torch = self._torch
+        order = np.arange(self.n_snaps)
+        if shuffle:
+            rng = np.random.default_rng(seed)
+            rng.shuffle(order)
+        for start in range(0, self.n_snaps, snap_batch):
+            sel = order[start: start + snap_batch]
+            snaps = [self.snapshots[i] for i in sel]
+            lr_pad_np, mask_np = self._pack(snaps)
+            if self.mode == "resident":
+                lr_pad = torch.from_numpy(lr_pad_np).to(self.device)
+                rows = lr_pad[:, :, None] + self.offsets_gpu[None, None, :]   # [B,maxN,L]
+                X = self.feats_gpu[rows]                                       # [B,maxN,L,C]
+                y = self.labels_gpu[lr_pad]                                    # [B,maxN]
+                mask = torch.from_numpy(mask_np).to(self.device)
+            else:
+                lr_pad = torch.from_numpy(lr_pad_np)
+                rows = lr_pad[:, :, None] + self._offsets_cpu[None, None, :]   # [B,maxN,L]（CPU）
+                X = self._feats_cpu[rows].to(self.device)                      # 整批一次搬卡
+                y = self._labels_cpu[lr_pad].to(self.device)
+                mask = torch.from_numpy(mask_np).to(self.device)
+            yield X, y, mask
+
+    def free(self) -> None:
+        self.feats_gpu = self.offsets_gpu = self.labels_gpu = None
+        self._feats_cpu = self._labels_cpu = self._offsets_cpu = None
 
 
 class _CausalConvBlock:
@@ -1165,6 +1278,10 @@ class GRUCartridge(ModelCartridge):
         self._device = "cpu"
         self._fallback_bias = 0.0
         self._fitted = False
+        # 全局线性 rescale a·ŷ+b（§定稿 第 2 条，预测阶段永远套）：默认恒等，fit 后被
+        # 训练段 OLS 标定覆盖。a=1/b=0 时 predict 等价不 rescale（空训练兜底安全）。
+        self._rescale_a = 1.0
+        self._rescale_b = 0.0
 
     @classmethod
     def from_config(cls, model_config) -> "GRUCartridge":
@@ -1178,6 +1295,9 @@ class GRUCartridge(ModelCartridge):
             "dropout": 0.10,
             "lr": 1e-3,
             "weight_decay": 1e-4,
+            # 损失对齐杠杆（§定稿/§Q1）：loss = MSE + λ·(1−批内 Pearson)，λ 经 --hparams 切
+            # 0.0 / 0.3，不进 search_space。λ=0 即纯 MSE（消融下界、保护原基线口径）。
+            "lambda_corr": 0.0,
             # batch_size 调大到 1024：窗口 gather 已移到 GPU、模型又小，大 batch 才能把
             # GPU 算力喂饱、同时把每 epoch 的 Python 循环步数压下来（4060 8G 完全容得下
             # [1024, L, 433] 的中间激活）。想更省显存可经 hparams 显式下调。
@@ -1242,7 +1362,11 @@ class GRUCartridge(ModelCartridge):
             lr=float(cfg["lr"]),
             weight_decay=float(cfg["weight_decay"]),
         )
-        loss_fn = nn.MSELoss()
+        # 组合损失 = MSE + λ·(1−批内 Pearson)。GRU 逐票批：整批当一个截面算 1D Pearson
+        # （§3 粗代理）；λ=0 时工厂内部短路 corr、等价纯 MSE。loss_fn(pred, yb) 接口
+        # 与原 nn.MSELoss 调用点一致（mask 默认 None），_eval_loss 同样复用。
+        lambda_corr = float(cfg.get("lambda_corr", 0.0))
+        loss_fn = make_loss(lambda_corr=lambda_corr)
         batch_size = int(cfg["batch_size"])
         eval_batch_size = int(cfg.get("eval_batch_size", 8192))
         max_epochs = int(cfg["max_epochs"])
@@ -1307,6 +1431,12 @@ class GRUCartridge(ModelCartridge):
             self._model.load_state_dict(best_state)
 
         self._fitted = True
+        # 用 best 权重在**训练区**现算原始预测，OLS 标定全局 rescale a·ŷ+b（§定稿 第 2 条）。
+        # fit-on-train / apply-on-val：a,b 只用训练段拟合，predict 时套到 val/test，零泄漏。
+        raw_train = self._predict_raw(train_ds)
+        y_train = train_ds.window_labels()
+        self._rescale_a, self._rescale_b = fit_linear_rescale_numpy(raw_train, y_train)
+
         return TrainRecord(
             train_curve=train_curve,
             earlystop_curve=early_curve,
@@ -1318,10 +1448,14 @@ class GRUCartridge(ModelCartridge):
                 "device": self._device,
                 "hidden_size": int(cfg["hidden_size"]),
                 "num_layers": int(cfg["num_layers"]),
+                "lambda_corr": lambda_corr,
+                "rescale_a": float(self._rescale_a),
+                "rescale_b": float(self._rescale_b),
             },
         )
 
-    def predict(self, ds) -> np.ndarray:
+    def _predict_raw(self, ds) -> np.ndarray:
+        """模型原始输出（**未套 rescale**），与 ds 窗口顺序严格对齐。fit 内标定 OLS 用它。"""
         if len(ds) == 0:
             return np.zeros(0, dtype=np.float32)
         if not self._fitted or self._model is None:
@@ -1342,3 +1476,323 @@ class GRUCartridge(ModelCartridge):
         finally:
             src.free()
         return np.concatenate(preds, axis=0) if preds else np.zeros(0, dtype=np.float32)
+
+    def predict(self, ds) -> np.ndarray:
+        """对外预测：原始输出套全局线性 rescale（§定稿 第 2 条，永远开启）→ R²=corr²≥0。"""
+        raw = self._predict_raw(ds)
+        if raw.size == 0:
+            return raw
+        return (self._rescale_a * raw + self._rescale_b).astype(np.float32)
+
+
+def _safe_n_heads(hidden_size: int, requested: int) -> int:
+    """注意力头数必须整除 embed_dim：取 ≤requested 且整除 hidden_size 的最大头数（兜底 1）。"""
+    h = max(1, int(requested))
+    while h > 1 and (int(hidden_size) % h != 0):
+        h -= 1
+    return h
+
+
+def _build_xsection_module(
+    input_channels: int, hidden_size: int, num_layers: int,
+    dropout: float, n_heads: int, attn_dropout: float,
+):
+    """
+    截面模型：因子化两腿 + 零初门控残差（规格 §8.2）。
+
+        每票日内窗 [L,C] ──共享时序腿(GRU，所有票/interval 同一套权重)──▶ h_i ∈ R^d
+        {h_i}(同一 (date,interval) 在场票) ──截面腿(MultiheadAttention 1 块，无位置/无 ID，
+                                              带 padding mask)──▶ Δ_i
+        z_i = h_i + γ·Δ_i  (γ 初始化 0：截面腿一开始零贡献 → 退化回纯时序 GRU 基线)
+        ŷ_i = Linear(z_i)  (per-票头，所有票共享)
+
+    - **置换等变 + 零身份**：时序腿逐票独立、截面腿无位置编码无股票 ID、头逐票共享 →
+      打乱在场票顺序，输出随之同序置换、值不变（换池子免费保险，§11.5）。
+    - **零初残差**：γ 初值 0，学不到截面增益时 Δ 贡献被门到 0、等价 GRU-on-433 那条 ③，
+      天然是截面模型的消融下界。
+    """
+    torch, nn, F = _require_torch()
+
+    class XSectionModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            gru_drop = float(dropout) if int(num_layers) > 1 else 0.0
+            # 共享时序腿：与 GRU 卡带同构，取末步隐藏态作每票日内路径编码。
+            self.gru = nn.GRU(
+                input_size=int(input_channels),
+                hidden_size=int(hidden_size),
+                num_layers=int(num_layers),
+                batch_first=True,
+                dropout=gru_drop,
+            )
+            # 截面腿：单块自注意力（query=key=value=h），无位置编码、无股票嵌入 → 置换等变。
+            self.attn = nn.MultiheadAttention(
+                embed_dim=int(hidden_size),
+                num_heads=int(n_heads),
+                dropout=float(attn_dropout),
+                batch_first=True,
+            )
+            self.attn_drop = nn.Dropout(float(dropout))
+            # 零初始化门控标量：init 0 → 初始 z=h（纯时序腿）；可学着放大截面贡献。
+            self.gamma = nn.Parameter(torch.zeros(1))
+            self.head = nn.Linear(int(hidden_size), 1)
+
+        def forward(self, x, mask):
+            # x: [B, N, L, C]；mask: [B, N]（True=在场票，False=pad）
+            B, N, L, C = x.shape
+            # 时序腿：把 (B,N) 摊平成一批序列，逐票独立编码（不跨票）。
+            out, _ = self.gru(x.reshape(B * N, L, C))
+            h = out[:, -1, :].reshape(B, N, -1)              # [B, N, d]
+            # 截面腿：key_padding_mask 屏蔽 pad 票（True 处被忽略）；每个 batch 元素=一个
+            # 截面，注意力只在该截面在场票内做（每元素恒 ≥1 真实票，softmax 不会全 -inf）。
+            key_padding = ~mask                              # [B, N]
+            delta, _ = self.attn(h, h, h, key_padding_mask=key_padding, need_weights=False)
+            z = h + self.gamma * self.attn_drop(delta)       # 零初残差：γ=0 时 z=h 逐位精确
+            return self.head(z).squeeze(-1)                  # [B, N]
+
+    return XSectionModel()
+
+
+@register_model(ModelKind.XSECTION)
+class CrossSectionCartridge(ModelCartridge):
+    """
+    截面模型卡带（主攻，规格 §8.2）。吃 trainer 现成的 ``SequenceDataset``，内部按
+    ``(date,interval)`` 重组成截面快照（``CrossSectionDataset.from_whitened`` 零再白化、
+    零复制），故**脊柱/trainer 零改动**。
+
+    与评分天然联姻（§3）：一次预测整快照 → 损失里的 corr 项 = 真·截面内 Pearson =
+    老师 pooled corr / 每日截面 IC 那一维被打分的量（逐票 GRU 只能拿批内粗代理）。
+
+    口径：``loss = MSE + λ·(1−截面内 Pearson)``（masked 逐快照），λ 经 hparams（§Q1）；
+    预测永远套训练段 OLS rescale（§定稿 第 2 条）保 R²=corr²≥0；重正则（小 GRU、少头、
+    dropout/weight_decay/早停，§11.5）。required_adapter 固定 FEATURE_433。
+    """
+
+    search_space: ClassVar[Dict] = XSECTION_SEARCH_SPACE
+    required_adapter = AdapterKind.FEATURE_433
+
+    def __init__(self):
+        self._torch = None
+        self._model = None
+        self._device = "cpu"
+        self._fallback_bias = 0.0
+        self._fitted = False
+        self._rescale_a = 1.0
+        self._rescale_b = 0.0
+        self._snap_batch = 4
+
+    @classmethod
+    def from_config(cls, model_config) -> "CrossSectionCartridge":
+        return cls()
+
+    @staticmethod
+    def _default_hparams(hparams: Dict) -> Dict:
+        merged = {
+            "hidden_size": 32,
+            "num_layers": 1,
+            "dropout": 0.20,            # 重正则（§11.5）
+            "attn_dropout": 0.10,
+            "n_heads": 4,
+            "lr": 1e-3,
+            "weight_decay": 1e-3,       # 比 GRU 更狠：截面腿容量更大、宁可欠拟合换稳
+            "snap_batch": 4,            # 一批多少个截面快照（控制 [B,maxN,L,C] 瞬时显存）
+            "eval_snap_batch": 8,
+            "max_epochs": 30,
+            "patience": 5,
+            "grad_clip": 1.0,
+            "device": "auto",
+            # 截面卡带默认带 corr 项（它才是真截面 IC）；λ=0 即纯 MSE 消融、走 --hparams 切。
+            "lambda_corr": 0.3,
+        }
+        merged.update(dict(hparams or {}))
+        return merged
+
+    def _wrap(self, ds):
+        """把 trainer 传来的 SequenceDataset（已白化）零复制包成截面快照集。"""
+        from sequence_dataset import CrossSectionDataset
+        return CrossSectionDataset.from_whitened(ds.feature_matrix(), ds.arrays, ds.seq_len)
+
+    def _eval_loss(self, src, loss_fn, snap_batch: int) -> float:
+        """在截面源上算平均组合损失（device 上累加，按有效票数加权），早停用。"""
+        torch = self._torch
+        if len(src) == 0:
+            return float("inf")
+        running = torch.zeros((), device=self._device)
+        count = 0
+        self._model.eval()
+        with torch.no_grad():
+            for xb, yb, mb in src.iter_batches(snap_batch, shuffle=False):
+                pred = self._model(xb, mb)
+                nvalid = int(mb.sum().item())
+                running = running + loss_fn(pred, yb, mask=mb).detach() * nvalid
+                count += nvalid
+        return float(running.item()) / max(count, 1)
+
+    def fit(self, train_ds, earlystop_ds, hparams: Dict, seed: int) -> TrainRecord:
+        torch, nn, _ = _require_torch()
+        cfg = self._default_hparams(hparams)
+        self._torch = torch
+        self._device = _resolve_torch_device(torch, cfg.get("device", "auto"))
+        self._snap_batch = int(cfg["snap_batch"])
+        t0 = time.time()
+
+        train_xs = self._wrap(train_ds)
+        es_xs = self._wrap(earlystop_ds)
+        # 兜底偏置：全训练窗标签均值（与逐票口径一致，不物化整窗）。
+        train_labels = train_ds.window_labels()
+        self._fallback_bias = float(np.mean(train_labels)) if len(train_labels) else 0.0
+
+        if len(train_xs) == 0:
+            self._model = None
+            self._fitted = True
+            return TrainRecord(
+                train_curve=[0.0],
+                earlystop_curve=[0.0] if len(es_xs) else [],
+                best_epoch=0, n_epochs=1, fit_seconds=time.time() - t0,
+                extra={"kind": "xsection", "empty": True, "device": self._device},
+            )
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+        n_heads = _safe_n_heads(int(cfg["hidden_size"]), int(cfg["n_heads"]))
+        self._model = _build_xsection_module(
+            input_channels=train_xs.n_channels,
+            hidden_size=int(cfg["hidden_size"]),
+            num_layers=int(cfg["num_layers"]),
+            dropout=float(cfg["dropout"]),
+            n_heads=n_heads,
+            attn_dropout=float(cfg["attn_dropout"]),
+        ).to(self._device)
+
+        optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=float(cfg["lr"]),
+            weight_decay=float(cfg["weight_decay"]),
+        )
+        lambda_corr = float(cfg.get("lambda_corr", 0.3))
+        loss_fn = make_loss(lambda_corr=lambda_corr)   # masked 截面口径：传 mask 即走真截面 Pearson
+        snap_batch = int(cfg["snap_batch"])
+        eval_snap_batch = int(cfg.get("eval_snap_batch", snap_batch))
+        max_epochs = int(cfg["max_epochs"])
+        patience = int(cfg["patience"])
+        grad_clip = float(cfg["grad_clip"])
+
+        best_metric = float("inf")
+        best_epoch = 0
+        best_state = None
+        no_improve = 0
+        train_curve: List[float] = []
+        early_curve: List[float] = []
+
+        train_src = _GpuCrossSectionSource(train_xs, torch, self._device)
+        es_src = _GpuCrossSectionSource(es_xs, torch, self._device)
+        try:
+            for epoch in range(1, max_epochs + 1):
+                self._model.train()
+                running = torch.zeros((), device=self._device)
+                count = 0
+                for xb, yb, mb in train_src.iter_batches(snap_batch, shuffle=True, seed=int(seed) + epoch):
+                    optimizer.zero_grad(set_to_none=True)
+                    pred = self._model(xb, mb)
+                    loss = loss_fn(pred, yb, mask=mb)
+                    loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=grad_clip)
+                    optimizer.step()
+                    nvalid = int(mb.sum().item())
+                    running = running + loss.detach() * nvalid
+                    count += nvalid
+
+                train_loss = float(running.item()) / max(count, 1)
+                train_curve.append(train_loss)
+
+                if len(es_src) > 0:
+                    metric = self._eval_loss(es_src, loss_fn, eval_snap_batch)
+                    early_curve.append(metric)
+                else:
+                    metric = train_loss
+
+                if metric + 1e-8 < best_metric:
+                    best_metric = metric
+                    best_epoch = epoch
+                    best_state = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        break
+        finally:
+            train_src.free()
+            es_src.free()
+
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+
+        self._fitted = True
+        # 训练段 OLS 标定全局 rescale（§定稿 第 2 条；fit-on-train / apply-on-val，零泄漏）。
+        raw_train = self._predict_raw(train_ds)
+        y_train = train_ds.window_labels()
+        self._rescale_a, self._rescale_b = fit_linear_rescale_numpy(raw_train, y_train)
+
+        return TrainRecord(
+            train_curve=train_curve,
+            earlystop_curve=early_curve,
+            best_epoch=best_epoch,
+            n_epochs=len(train_curve),
+            fit_seconds=time.time() - t0,
+            extra={
+                "kind": "xsection",
+                "device": self._device,
+                "hidden_size": int(cfg["hidden_size"]),
+                "num_layers": int(cfg["num_layers"]),
+                "n_heads": int(n_heads),
+                "lambda_corr": lambda_corr,
+                "rescale_a": float(self._rescale_a),
+                "rescale_b": float(self._rescale_b),
+            },
+        )
+
+    def _predict_raw(self, ds) -> np.ndarray:
+        """
+        模型原始逐票输出（未套 rescale），**对齐到 ds（SequenceDataset）的 label_rows 升序**。
+
+        内部按截面快照前向，逐快照收集在场票预测（snapshot-flatten 序），再用
+        ``argsort(flat_label_rows)`` 映射回升序——因截面快照末行集合与 ds.label_rows
+        完全相同，升序后即 ds.label_frame() 行序，指标对齐无损。
+        """
+        if len(ds) == 0:
+            return np.zeros(0, dtype=np.float32)
+        if not self._fitted or self._model is None:
+            return np.full(len(ds), self._fallback_bias, dtype=np.float32)
+
+        torch = self._torch
+        xs = self._wrap(ds)
+        flat_lr = xs.flat_label_rows()
+        if flat_lr.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        src = _GpuCrossSectionSource(xs, torch, self._device)
+        chunks: List[np.ndarray] = []
+        self._model.eval()
+        try:
+            with torch.no_grad():
+                # shuffle=False：快照按 (date,interval) 升序，逐行取有效位 → 与 flat_lr 同序。
+                for xb, _yb, mb in src.iter_batches(self._snap_batch, shuffle=False):
+                    out = self._model(xb, mb).detach().cpu().numpy().astype(np.float32)
+                    m = mb.detach().cpu().numpy()
+                    for bi in range(out.shape[0]):
+                        chunks.append(out[bi][m[bi]])
+        finally:
+            src.free()
+        flat_pred = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        # 升序映射：argsort(flat_lr) 把 snapshot-flatten 序排成升序行号序（= ds.label_rows）。
+        order = np.argsort(flat_lr, kind="mergesort")
+        return flat_pred[order].astype(np.float32)
+
+    def predict(self, ds) -> np.ndarray:
+        """对外预测：原始输出套全局线性 rescale（§定稿 第 2 条，永远开启）→ R²=corr²≥0。"""
+        raw = self._predict_raw(ds)
+        if raw.size == 0:
+            return raw
+        return (self._rescale_a * raw + self._rescale_b).astype(np.float32)

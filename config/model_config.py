@@ -26,6 +26,7 @@ class ModelKind(Enum):
     REFERENCE_POOL = "reference_pool"   # numpy 参考模型：窗口均值池化 + 线性；声明 STRUCTURE_SEARCH_SPACE，当 HPO/TCN 的 torch-free 模板
     TCN = "tcn"                         # 【否决·2026-06-01】TCN-on-raw 截面盲区（详见规格 §8.0 / NOTE.md）；保留为历史词位
     GRU = "gru"                         # 时序基线 + 保底主跑（433 工程特征，绑 FEATURE_433）；编码每票日内路径，也是截面模型(规格 §8.2)的时序腿
+    XSECTION = "xsection"               # 【主攻】截面模型：共享 GRU 时序腿 + set-attention 截面腿 + 零初门控残差 + per-票头（规格 §8.2，绑 FEATURE_433）
     LSTM = "lstm"                       # 占位，待定（GRU 已覆盖 D1 角色，此槽保留供未来对照）
     DEEPLOB = "deeplob"                 # 【退役】数据无连续 LOB（规格 §8.0），保留为历史词位，不实现
 

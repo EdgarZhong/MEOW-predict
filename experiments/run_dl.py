@@ -705,9 +705,9 @@ def main(argv=None):
     ap.add_argument("--stage", default="search", choices=["search", "validation", "sweep"],
                     help="sweep=一命令两档（主路径，§十一·11.6）；search/validation 为旧两段调试用")
     ap.add_argument("--model", default="reference_pool",
-                    help="reference_pool（torch-free smoke）/ gru（433 特征，需 torch+GPU）/ reference_zero|last")
+                    help="reference_pool（torch-free smoke）/ gru（433 时序基线）/ xsection（截面主攻）/ reference_zero|last")
     ap.add_argument("--adapter", default="raw_channels",
-                    help="raw_channels / feature_433（gru 必须）/ identity")
+                    help="raw_channels / feature_433（gru/xsection 必须）/ identity")
     ap.add_argument("--columns", default="", help="identity adapter 的列（逗号分隔）")
     ap.add_argument("--start", type=int, default=20230601)
     ap.add_argument("--end", type=int, default=20230731)
@@ -719,7 +719,7 @@ def main(argv=None):
     ap.add_argument("--fold-select", default="first", choices=["first", "recent"],
                     help="recent=最近若干折倒贴 rolling_end（新协议主路径）；first=最早若干折（调试）")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
-                    help="gru 卡带训练设备；整晚 GPU 跑传 cuda")
+                    help="PyTorch 卡带训练设备；整晚 GPU 跑传 cuda")
     ap.add_argument("--max-folds", type=int, default=3, help="validation / sweep 折数（新协议 5）")
     ap.add_argument("--trials", type=int, default=4, help="仅 search 用")
     ap.add_argument("--seeds", default="42")
