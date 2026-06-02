@@ -8,9 +8,9 @@
 
 ### ⏭️ 下一会话直接从这里开始
 
-1. **第一刀 = P1 修传统 ridge NaN**（task #7）：真因已查清 = X1 ridge 成员（`src/experiment_runner.py:614–618` 的 `StandardScaler→Ridge`）输入 float32，1e15 量级列居中时灾难性抵消 → 缩放后垃圾 → cholesky 失败回退 30GB svd → 内存紧则 NaN。**修法 = 线性成员输入转 float64**（细则见下「🚩 交付隐患 · P1 修法」）。改完重验 Dec ≥0.0803 + 内存紧/idle 两态非 NaN + 合并 master。
-2. **再 P2**（task #8，依赖 P1）：造对齐 DL 折的无泄漏传统滚动预测。
-3. **再 P3①**（task #6，依赖 P2）：三档消融 + 每档 ρ/集成读数。
+1. **✅ P1 已完成（2026-06-02 本会话）= 传统 ridge NaN 已修 + 合并并 push master**：根因 = X1 ridge 成员（`StandardScaler→Ridge`）输入 float32，~1e15 量级列在 StandardScaler 居中 / X^TX 累加时数值抵消 → 病态/近常数列 → ridge cholesky 失败回退 30GB svd → 内存紧则分配失败成 NaN。**修法（已落 `src/experiment_runner.py`）= 对 StandardScaler→model 的线性 Pipeline 成员(ridge/elasticnet/huber/mlp) 在 fit/predict 前转 float64**（fit 端 `_fit_model_core` line 731、predict 端 line 762；树/提升族尺度无关保持 float32）。全窗 Dec sanity（空闲 ~20GB 紧张态实跑）：**非 NaN，Pearson=0.0775 / R²=0.00585 / MSE~2.4e-5 / 峰值 23GB（cholesky，已绕开 30GB svd）**。已 cherry-pick 到 master（`962a970`）并 push origin（master/feat 均已推）。**判读**：0.0775 是 float64 干净解（旧 0.0803 是 float32 退化 SVD 解），单 20 天窗内属噪声范围持平、R² 反升、且彻底消除内存依赖型 NaN——对交付划算；不在 Dec 单窗调参，真正传统腿判据看 P2 的 3 个选型折。
+2. **⏭️ 第一刀 = P2（task #8，P1 已解锁）**：造对齐 DL 折的无泄漏传统滚动预测——对 3 个选型折 + 交付折逐折 train→predict、落 OOS 预测、按 (date,symbol,interval) 对齐 DL。这是后续集成评估 / 残差训练的地基。
+3. **再 P3**（task #6，依赖 P2）：① 三档消融 + 每档 ρ/集成读数；② **残差训练（DL 目标改 y−ŷ_trad）= 压 ρ 主手段，冲 0.10 的核心**。
 4. 全景 + 依赖 + 判决点 = 见本文件「### 冲 0.10 路线图」。分工：本路线（集成）本侧做；用户另开更强 DL-only。
 5. **本会话产物（gitignored，本机可见）**：DL Dec 预测 `results/dl/20260602_corr_probe_dl_v1/preds/preds_validation_fold0_seed42.csv`（0.0588）；传统 lgbm Dec 预测 `results/dl/_corr_probe/trad_preds_20231201_20231229.csv`（健康 0.0803）；ridge Dec 预测 `…/trad_preds_ridge_20231201_20231229.csv`（NaN，实证用）；相关性报告 `results/dl/_corr_probe/corr_report.json`。新脚本：`experiments/dump_trad_preds_members.py`（逐成员落盘）、`experiments/analyze_dl_trad_corr.py`、`experiments/dump_trad_preds.py`、`experiments/_probe_trad_features.py`（特征量级探针，一次性）。
 
@@ -68,7 +68,7 @@ DL Dec 预测（`20260602_corr_probe_dl_v1`，cross_z 关）× 传统 Dec 预测
 
 | Phase | 任务 | 依赖 | 资源 | 产出 / GO-NO-GO |
 |---|---|---|---|---|
-| **P1 修传统腿** | ① ridge NaN 修复（特征标准化，改共用 `src/` 交付代码）② 重验 Dec sanity ≥0.0803 + 内存紧/idle 两态非 NaN ③ 合并 master | — | CPU/内存 | 可靠传统预测（两态不 NaN）。**阻塞 P2 及所有用传统预测的下游** |
+| **P1 修传统腿** ✅ 完成 | ① ridge NaN 修复 = 线性 Pipeline 成员 fit/predict 转 float64（已落 `experiment_runner.py`）② 重验 Dec sanity：空闲 ~20GB 紧张态非 NaN、Pearson 0.0775 / R² 0.00585 / 峰值 23GB（绕开 30GB svd）③ 已 cherry-pick master `962a970` + push origin | — | CPU/内存 | ✅ 可靠传统预测（不再内存依赖型 NaN）。**P2 及下游已解锁** |
 | **P2 传统滚动预测** | harness：对 3 个选型折 + 交付折，逐折 traditional train→predict、落逐票预测、按 (date,symbol,interval) 对齐 DL | P1 | CPU | 无泄漏传统 OOS 预测，供残差训练 / 去相关惩罚 / 折级集成评估 |
 | **P3 DL 去正交（核心，最不确定）** | ① 三档消融（纯GRU/截面off/截面cross-z）：测每档 DL IC，join P2 出每档 ρ 与集成增益 ② **残差训练**：DL 目标改 y−ŷ_trad（用 P2 无泄漏传统预测）= 压 ρ 主手段 ③（可选）loss 加去相关项 | P2（②③）；①可先跑 DL 侧 | GPU 串行 | 候选 DL 配置（各带 IC + 对传统 ρ）。**冲 0.10 成败在这** |
 | **P4 集成 + 验收** | ① 定融合器（等权零自由参数首选 + 量纲处理保 MSE/R²）② 3 个选型折评估集成 vs 传统单独（看最坏折）= **主裁** ③ 交付折 Dec 读数 | P2+P3 | CPU 分析 | **GO-NO-GO**：等权集成跨 3 折是否稳赢传统（最坏折正）。赢→进 P5；平→守 ~0.085 |
@@ -160,7 +160,9 @@ python experiments/run_dl.py --stage sweep --model gru --adapter feature_433 --d
 
 剩余尾巴（见待办队列）：① 全量内存峰上 ≥32GB 机器实测；② 提交版减注释；③ `fit/predict` 签名对照 docx 核验（另会话）。
 
-### 🚩 交付隐患（2026-06-02 发现，下一步必修）：X1 ridge 成员**仅因当时空闲内存差异**就会 NaN
+### 🚩 交付隐患（2026-06-02 发现）：X1 ridge 成员**仅因当时空闲内存差异**就会 NaN —— ✅ 已修复（2026-06-02 本会话）
+
+> **✅ 已修复并合并 master**：按下方「P1 修法 (a)」落地——`_fit_model_core` 对线性 Pipeline 成员 fit 前转 float64、`predict` 端对齐取 float64（`src/experiment_runner.py` line 731 / 762）。全窗 Dec sanity（空闲 ~20GB 紧张态）非 NaN、Pearson 0.0775 / R² 0.00585 / 峰值 23GB（cholesky，绕开 30GB svd）。已 cherry-pick master `962a970` + push origin。下文根因链保留备查。
 
 **现象**：本会话在本机（34GB Win）跑传统 Dec dump，融合预测**整列 1462884 行全 NaN**；而用户此前在 **master、同一台机器**上交付演练 `fit(Jun–Nov)+eval(Dec)` 跑通、得 Pearson 0.0803 / R²=0.00465。
 
@@ -315,7 +317,7 @@ python experiments/run_dl.py --stage sweep --model xsection --adapter feature_43
 | **Pivot 2 · cross-z 喂回截面输入 + 三档消融** | 代码已落：`_build_xsection_module(cross_z=)` forward 第一层 masked 截面 z + `cross_z` hparam（默认关）+ 4 新单测（全 DL 套件 85 passed）。规格 §8.2.1 已更新。**消融 `纯GRU/截面off/截面+cross-z` 待跑**（Pivot 1 出数后定是否优先）。 | 🔜 代码就绪待跑 |
 | **DL infra 吞吐画像与折间 barrier 拆解** | 来自正式 run `20260602_sweep_xsection_v1` 的现象：GPU 已上卡但常态 util 偏低（常见 `25%~40%`），fold 间仍有 `load / norm / build_ds` 空窗。**当前只记现象与方向，不预设结论**：后续在 GPU 空闲时做单折 profiling（batch / `snap_batch` / AMP / `torch.compile` / predict 批大小）+ 函数级计时，判断瓶颈落在 kernel 粒度、host 同步、读盘、normalizer 还是截面重组。 | 🔬 观察中（下个 infra 小回合） |
 | **正式结果同步目录（双机追踪）** | 根目录新增 `tracked_results/`，专门提交“小体量、正式、可复盘”的结果文件；首批纳入 TCN search / TCN expanding / 传统 Dec 全窗口 sanity 指标，供双机同步与后续深挖分析 | ✅ 已建立 |
-| 🚩 **交付接线 — X1 ridge 仅因空闲内存就 NaN（必修）** | 本会话实证：同机同码同数据，传统 Dec 融合预测**全 NaN**（vs master idle 时跑通 0.0803）。根因=433 特征含 ~1e15 未归一化列 + `meow.py` float32 窗口 → ridge cholesky 必失败 → 回退 svd 需 ~30GB → 内存紧（本会话空闲仅 ~23GB）则分配失败成 NaN，idle（~30GB 空闲）才装得下。**行为差异仅由当时空闲内存决定**，交付脆弱（老师机器内存紧→提交可能静默 NaN）。详见上「🚩 交付隐患」。修向：(a) 推荐 ridge 输入标准化/转 float64→cholesky 毫秒级、绕开 30GB svd；(b) 显式 cholesky solver；(c) 缩窗。修后内存紧/idle 两态各验一次非 NaN。 | 🔜 **下一步必修** |
+| 🚩 **交付接线 — X1 ridge 仅因空闲内存就 NaN** | 根因=433 特征含 ~1e15 未归一化列 + `meow.py` float32 窗口 → ridge cholesky 失败 → 回退 svd 需 ~30GB → 内存紧则分配失败成 NaN。**已按 (a) 修复**：线性 Pipeline 成员 fit/predict 转 float64（`experiment_runner.py` line 731/762），X^TX 在 float64 累加保持正定、cholesky 毫秒成功、绕开 30GB svd。验收：空闲 ~20GB 紧张态全窗 Dec sanity 非 NaN、Pearson 0.0775 / R² 0.00585 / 峰值 23GB。已 cherry-pick master `962a970` + push origin（master/feat）。 | ✅ 完成（2026-06-02） |
 | 交付接线 — 全量内存峰实测 | 中档精简已落地（持续峰 ~20GB），全量峰待实测（**本机已核实 ~34GB**，非旧记 16GB；满足 ≥32GB，可本机试） | 🔜 待实测 |
 | 交付接线 — Dec 全窗口演练 | 用户已在另一侧完成全窗口 `fit(Jun–Nov)+eval(Dec)`：**Pearson=0.0803 / R²=0.00465 / MSE=2.3645e-05**。结论：提交链量纲健康、端到端可跑；**Dec 只当 sanity、不回灌选型** | ✅ 完成 |
 | 交付接线 — 提交版减注释 | 老师鼓励零注释/仅必要处 + 查重；给 `meow/`+`src/` 提交路径单独出精简注释版（提交前专门处理） | 🔜 下一步 |
