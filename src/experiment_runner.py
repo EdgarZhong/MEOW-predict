@@ -722,6 +722,14 @@ class ExperimentRunner(object):
             ])
         else:
             raise ValueError(f"Unknown model: {model_name}")
+        # 线性成员（ridge/elasticnet/huber/mlp，均为 StandardScaler→model 的 Pipeline）统一上转 float64。
+        # 根因：433 提交特征里有 ~1e15 量级未归一化列；StandardScaler.fit 在 float32 下计算
+        # 均值/方差时，对百万行的巨值求和会发生灾难性抵消 → 均值是数值垃圾 → 居中/缩放后是
+        # 近常数/乱列 → X^TX 近奇异 → ridge cholesky 失败回退 30GB 经济 SVD（内存紧则分配失败
+        # → 系数 NaN → 等权融合整列 NaN）。上转 float64 后求和在 float64 累加、均值精确、缩放正常，
+        # cholesky 毫秒级成功、内存小，彻底绕开 SVD。树/提升族尺度无关，保持 float32 省内存。
+        if isinstance(model, Pipeline):
+            x = np.asarray(x, dtype=np.float64)
         try:
             if sample_weight is None:
                 model.fit(x, y)
@@ -748,7 +756,11 @@ class ExperimentRunner(object):
         return model, feature_cols, baseline
 
     def predict(self, model, xdf, feature_cols):
-        x = xdf[feature_cols].to_numpy(dtype=np.float32)
+        # 与 _fit_model_core 的 float64 口径对齐：线性 Pipeline 成员（StandardScaler→model）
+        # 取数为 float64，保证预测时 StandardScaler 居中对 ~1e15 量级列同样不丢精度；
+        # 树/提升族尺度无关，仍取 float32 省内存。
+        dtype = np.float64 if isinstance(model, Pipeline) else np.float32
+        x = xdf[feature_cols].to_numpy(dtype=dtype)
         return model.predict(x)
 
     def _predict_with_baseline(self, model, xdf, feature_cols, ydf=None, baseline=None, target_mode="raw"):
