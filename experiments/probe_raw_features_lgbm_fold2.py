@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import sys
 import time
@@ -155,28 +156,97 @@ def build_new_features(raw: pd.DataFrame) -> pd.DataFrame:
     out["rx2_cxl_x_rvol"] = out["rx_cxl_rate_cnt"].to_numpy(np.float64) * out["rx2_rvol12"].to_numpy(np.float64)
     out = out.drop(columns=["_mid_tmp", "_logret_tmp"])
 
+    # ============================================================ #
+    # 第三批（rx3_）：补传统 433+rx+rx2 漏掉的 18 列原始字段
+    #   OHLC(lastpx/open/high/low) + 分档成交额比率(btr/atr) + 挂撤单价格区间(add/cxl High/Low)
+    #   全部相对 mid 归一化 / 比率，跨票跨时间可比；无成交无挂撤导致的 NaN 填 0。
+    # ============================================================ #
+    def _rel(col):
+        return _safe_div(df[col].to_numpy(np.float64) - mid, safe_mid)
+
+    # OHLC（日内多稀疏，相对 mid 偏离 / 振幅 / 累计收益）
+    out["rx3_lastpx_dev"] = _rel("lastpx")
+    out["rx3_hl_range"] = _safe_div(df["high"].to_numpy(np.float64) - df["low"].to_numpy(np.float64), safe_mid)
+    op = df["open"].to_numpy(np.float64)
+    out["rx3_oc_ret"] = _safe_div(mid - op, np.where(np.abs(op) < EPS, np.nan, op))
+    # 分档成交额比率（btr/atr 各档）→ 买卖不平衡 + 近远档比
+    btr04 = df["btr0_4"].to_numpy(np.float64); atr04 = df["atr0_4"].to_numpy(np.float64)
+    btr59 = df["btr5_9"].to_numpy(np.float64); atr59 = df["atr5_9"].to_numpy(np.float64)
+    btr1019 = df["btr10_19"].to_numpy(np.float64); atr1019 = df["atr10_19"].to_numpy(np.float64)
+    out["rx3_to_imb_04"] = _safe_div(btr04 - atr04, btr04 + atr04)
+    out["rx3_to_imb_59"] = _safe_div(btr59 - atr59, btr59 + atr59)
+    out["rx3_to_imb_1019"] = _safe_div(btr1019 - atr1019, btr1019 + atr1019)
+    out["rx3_to_imb_all"] = _safe_div((btr04 + btr59 + btr1019) - (atr04 + atr59 + atr1019),
+                                      btr04 + btr59 + btr1019 + atr04 + atr59 + atr1019)
+    out["rx3_to_nf_b"] = np.log1p(_safe_div(btr04, btr1019))
+    out["rx3_to_nf_a"] = np.log1p(_safe_div(atr04, atr1019))
+    # 挂撤单价格区间/价位（相对 mid）：挂买单挂多高、撤单价位、价格分散度
+    out["rx3_addbuy_range"] = _safe_div(df["addBuyHigh"].to_numpy(np.float64) - df["addBuyLow"].to_numpy(np.float64), safe_mid)
+    out["rx3_addsell_range"] = _safe_div(df["addSellHigh"].to_numpy(np.float64) - df["addSellLow"].to_numpy(np.float64), safe_mid)
+    out["rx3_addbuy_lvl"] = _rel("addBuyHigh")
+    out["rx3_addsell_lvl"] = _rel("addSellLow")
+    out["rx3_cxlbuy_lvl"] = _rel("cxlBuyHigh")
+    out["rx3_cxlsell_lvl"] = _rel("cxlSellLow")
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in [c for c in out.columns if c.startswith("rx3_")]:
+        out[c] = out[c].fillna(0.0)
+
     return out.astype({c: np.float32 for c in out.columns if c not in META})
 
 
-def _build_window(loader, pipeline, dates, symbols=None):
-    """逐日 loadDate 拼 raw → 算 433 + 新特征 → merge on (date,symbol,interval)。
+def _build_X(loader, pipeline, dates, with_new):
+    """预分配 + 逐日填充 → (X[float32], y[float64], feat_names, meta_df)。
 
-    symbols 非 None 时只保留这组票（控内存：全 309 票全窗 433 帧 concat 峰值 ~22GB OOM，
-    抽样后压到一半内）。train/score 用同一组票，A/B 用同一组 → delta 仍有效。
+    绕开 build_feature_frames 整窗 concat 的内存尖峰（全票 708万行×433 concat 峰值 ~22GB OOM），
+    改为预读每日行数、预分配单份总矩阵、逐日 build_feature_frames(单日) 填入 → 峰值≈单份(~12-14GB)，
+    支持**全票**。with_new=False 只 433；True 拼上 rx/rx2/rx3 新特征。
+    A、B 各自独立调用（不在内存里同时持有两份大矩阵），峰值可控。
     """
-    raw = pd.concat([loader.loadDate(int(d)) for d in dates], ignore_index=True)
-    if symbols is not None:
-        raw = raw[raw["symbol"].isin(symbols)].reset_index(drop=True)
-    x433, y = pipeline.build_feature_frames(raw)
-    xnew = build_new_features(raw)
-    del raw
+    dates = [int(d) for d in dates]
+    per_day = [int(loader.countDate(d)) for d in dates]
+    total = int(sum(per_day))
+    # 首日定列名/列序（保证全窗一致）
+    raw0 = loader.loadDate(dates[0])
+    x0, _ = pipeline.build_feature_frames(raw0)
+    feat = [c for c in x0.columns if c not in META]
+    if with_new:
+        xn0 = build_new_features(raw0)
+        feat = feat + [c for c in xn0.columns if c not in META]
+        del xn0
+    del raw0, x0
     gc.collect()
-    feat433 = [c for c in x433.columns if c not in META]
-    newcols = [c for c in xnew.columns if c not in META]
-    x = x433.merge(xnew, on=META, how="left")
-    del x433, xnew
+    X = np.empty((total, len(feat)), dtype=np.float32)
+    y = np.empty(total, dtype=np.float64)
+    md = np.empty(total, np.int64); ms = np.empty(total, np.int64); mi = np.empty(total, np.int64)
+    r = 0
+    for d, n in zip(dates, per_day):
+        raw_d = loader.loadDate(d)
+        x_d, y_d = pipeline.build_feature_frames(raw_d)
+        if with_new:
+            xn_d = build_new_features(raw_d)
+            m = x_d.merge(xn_d, on=META).merge(y_d, on=META)
+            del xn_d
+        else:
+            m = x_d.merge(y_d, on=META)
+        if len(m) != n:
+            raise RuntimeError(f"行数不一致 @ {d}: merge {len(m)} vs countDate {n}")
+        X[r:r + n, :] = m[feat].to_numpy(np.float32)
+        y[r:r + n] = m["fret12"].to_numpy(np.float64)
+        md[r:r + n] = m["date"].to_numpy(); ms[r:r + n] = m["symbol"].to_numpy(); mi[r:r + n] = m["interval"].to_numpy()
+        r += n
+        del raw_d, x_d, y_d, m
     gc.collect()
-    return x, y, feat433, newcols
+    meta_df = pd.DataFrame({"date": md, "symbol": ms, "interval": mi})
+    return X, y, feat, meta_df
+
+
+def _fit_lgbm(runner, X, feat, meta_df, y, lgbm_params):
+    """走 _fit_model_core("lgbm")，口径 = 提交链 M_lgbm_d4（同 target/winsorize）。"""
+    ytr = meta_df.copy()
+    ytr["fret12"] = y.astype(np.float32)
+    model, _, _ = runner._fit_model_core("lgbm", X, feat, ytr, target_mode="raw", model_params=lgbm_params)
+    return model
 
 
 def _pooled_pearson(pred, y):
@@ -187,73 +257,85 @@ def _pooled_pearson(pred, y):
 
 def main():
     h5dir = os.environ.get("MEOW_DATA_DIR", os.path.join(REPO, "data"))
+    out_dir = os.path.join(REPO, "results", "dl", "_p3_trad_newfeat")
+    os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
 
-    # ---- fold2：与 DL/P2 同边界（recent 单折）----
+    # ---- 与 DL/P2 完全同协议：三折全票 ----
     folds = build_dl_folds(20230601, 20231130, mode="expanding", val_window=20, step=20,
-                           embargo=1, min_train_days=40, max_folds=1, fold_select="recent")
-    fold = folds[0]
-    print(f"[probe] fold2 训练 {fold.train_start}-{fold.train_end}（{len(fold.train_dates)}日）"
-          f" → 打分 {fold.val_start}-{fold.val_end}（{len(fold.scoring_dates)}日）", flush=True)
+                           embargo=1, min_train_days=40, max_folds=3, fold_select="recent")
+    print(f"[p3] 三折全票完整验证（与 DL/P2 同 build_dl_folds 边界）：{len(folds)} 折", flush=True)
 
     loader = MeowDataLoader(h5dir=h5dir)
     pipeline = SubmissionFeaturePipeline(groups=DEFAULT_SUBMISSION_GROUPS)
     runner = ExperimentRunner(h5dir=h5dir)
     lgbm_params = {"max_depth": 4, "num_leaves": 15, "n_jobs": 8}   # = M_lgbm_d4
 
-    # ---- 控内存：抽样固定一组票（train/score 同组，A/B 同组 → delta 有效）----
-    max_symbols = int(os.environ.get("PROBE_MAX_SYMBOLS", "180"))
-    raw0 = loader.loadDate(int(fold.train_dates[0]))
-    all_syms = np.sort(raw0["symbol"].unique()); del raw0; gc.collect()
-    if max_symbols and max_symbols < len(all_syms):
-        symbols = set(np.random.default_rng(42).choice(all_syms, size=max_symbols, replace=False).tolist())
-        print(f"[probe] 抽样 {len(symbols)}/{len(all_syms)} 票（固定 seed42，控内存；A 因此不是全票 0.0904，看 delta）", flush=True)
-    else:
-        symbols = None
-        print(f"[probe] 全 {len(all_syms)} 票", flush=True)
+    results = []
+    last_new_imp = []
+    for fi, fold in enumerate(folds):
+        tf = time.time()
+        print(f"\n[p3] === fold{fold.fold_id} 训练 {fold.train_start}-{fold.train_end}"
+              f"（{len(fold.train_dates)}日）→ 打分 {fold.val_start}-{fold.val_end}"
+              f"（{len(fold.scoring_dates)}日）全票 ===", flush=True)
 
-    # ---- 训练窗：build → fit A(433) / B(433+new) ----
-    print("[probe] 构造训练窗特征 ...", flush=True)
-    xtr, ytr, feat433, newcols = _build_window(loader, pipeline, fold.train_dates, symbols=symbols)
-    print(f"[probe] 训练 {len(xtr)} 行 | 433 列={len(feat433)} | 新列={len(newcols)}：{newcols}", flush=True)
+        # A: 纯 433（独立 build，峰值≈单份）
+        print(f"[p3] fold{fold.fold_id} build+fit A(纯433) ...", flush=True)
+        Xa, ya, feat433, meta_a = _build_X(loader, pipeline, fold.train_dates, with_new=False)
+        print(f"[p3]   训练 {Xa.shape[0]} 行 × {Xa.shape[1]} 列(433)", flush=True)
+        model_a = _fit_lgbm(runner, Xa, feat433, meta_a, ya, lgbm_params)
+        del Xa, ya, meta_a; gc.collect()
 
-    print("[probe] fit A = lgbm(纯433) ...", flush=True)
-    xa = xtr[feat433].to_numpy(dtype=np.float32)
-    model_a, fcols_a, base_a = runner._fit_model_core("lgbm", xa, feat433, ytr, target_mode="raw", model_params=lgbm_params)
-    del xa; gc.collect()
+        # B: 433+新（独立 build）
+        print(f"[p3] fold{fold.fold_id} build+fit B(433+新) ...", flush=True)
+        Xb, yb, feat_all, meta_b = _build_X(loader, pipeline, fold.train_dates, with_new=True)
+        newcols = [c for c in feat_all if c not in feat433]
+        print(f"[p3]   训练 {Xb.shape[0]} 行 × {Xb.shape[1]} 列(433+{len(newcols)}新)", flush=True)
+        model_b = _fit_lgbm(runner, Xb, feat_all, meta_b, yb, lgbm_params)
+        del Xb, yb, meta_b; gc.collect()
 
-    print("[probe] fit B = lgbm(433+新) ...", flush=True)
-    feat_all = feat433 + newcols
-    xb = xtr[feat_all].to_numpy(dtype=np.float32)
-    model_b, fcols_b, base_b = runner._fit_model_core("lgbm", xb, feat_all, ytr, target_mode="raw", model_params=lgbm_params)
-    del xb, xtr, ytr; gc.collect()
+        # 打分窗（build all 一次，A 切前 433 列）
+        print(f"[p3] fold{fold.fold_id} build 打分窗 + predict ...", flush=True)
+        Xsc, ysc, feat_all_s, _ = _build_X(loader, pipeline, fold.scoring_dates, with_new=True)
+        k = len(feat433)
+        pa = _pooled_pearson(model_a.predict(Xsc[:, :k]), ysc)
+        pb = _pooled_pearson(model_b.predict(Xsc), ysc)
+        del Xsc, ysc; gc.collect()
 
-    # ---- 打分窗：build → predict A/B ----
-    print("[probe] 构造打分窗特征 + predict ...", flush=True)
-    xsc, ysc, _, _ = _build_window(loader, pipeline, fold.scoring_dates, symbols=symbols)
-    yv = ysc["fret12"].to_numpy(dtype=np.float64)
-    pred_a = runner._predict_with_baseline(model_a, xsc, fcols_a, ydf=None, baseline=base_a, target_mode="raw")
-    pred_b = runner._predict_with_baseline(model_b, xsc, fcols_b, ydf=None, baseline=base_b, target_mode="raw")
-    pa, pb = _pooled_pearson(pred_a, yv), _pooled_pearson(pred_b, yv)
+        imp = np.asarray(model_b.feature_importances_, dtype=np.float64)
+        imp = imp / (imp.sum() + EPS)
+        new_imp = sorted([(feat_all[i], imp[i]) for i in range(len(feat_all)) if feat_all[i] in newcols],
+                         key=lambda kv: -kv[1])
+        last_new_imp = new_imp
+        results.append({"fold_id": int(fold.fold_id), "val_start": int(fold.val_start),
+                        "val_end": int(fold.val_end), "A_433": pa, "B_433plus": pb,
+                        "delta": pb - pa, "new_imp_sum": float(sum(w for _, w in new_imp))})
+        print(f"[p3] fold{fold.fold_id}: A(纯433)={pa:.4f}  B(433+新)={pb:.4f}  Δ={pb-pa:+.4f}"
+              f"  新特征重要性={sum(w for _, w in new_imp)*100:.1f}%  耗时{time.time()-tf:.0f}s", flush=True)
+        del model_a, model_b; gc.collect()
 
-    # ---- 新特征在 B 里的重要性（看 lgbm 到底用没用）----
-    imp = np.asarray(model_b.feature_importances_, dtype=np.float64)
-    imp = imp / (imp.sum() + EPS)
-    new_imp = sorted([(feat_all[i], imp[i]) for i in range(len(feat_all)) if feat_all[i] in newcols],
-                     key=lambda kv: -kv[1])
+    # ---- 三折汇总 ----
+    dels = [r["delta"] for r in results]
+    a_mean = float(np.mean([r["A_433"] for r in results]))
+    b_mean = float(np.mean([r["B_433plus"] for r in results]))
+    summary = {"folds": results, "A_mean": a_mean, "B_mean": b_mean,
+               "delta_mean": float(np.mean(dels)), "delta_min": float(np.min(dels)),
+               "delta_max": float(np.max(dels)), "n_new_feats": len(last_new_imp),
+               "total_sec": time.time() - t0}
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("\n" + "=" * 60, flush=True)
-    print(f"fold2 打分窗 {fold.val_start}-{fold.val_end}  行={len(xsc)}", flush=True)
-    print(f"  A  lgbm(纯433)      pooled Pearson = {pa:.4f}", flush=True)
-    print(f"  B  lgbm(433+新)     pooled Pearson = {pb:.4f}", flush=True)
-    print(f"  Δ (B - A)          = {pb - pa:+.4f}", flush=True)
-    print(f"  (传统融合代表在本折 = 0.0904，仅背景参考)", flush=True)
-    print(f"  新特征重要性占比 top（B 是否真用了新特征）：", flush=True)
-    for name, w in new_imp[:10]:
+    print("\n" + "=" * 64, flush=True)
+    print("传统 lgbm 三折全票完整验证（433 vs 433+新特征，新协议）", flush=True)
+    for r in results:
+        print(f"  fold{r['fold_id']} {r['val_start']}-{r['val_end']}: "
+              f"A={r['A_433']:.4f}  B={r['B_433plus']:.4f}  Δ={r['delta']:+.4f}", flush=True)
+    print(f"  ── 均值: A={a_mean:.4f}  B={b_mean:.4f}  Δ均值={np.mean(dels):+.4f}  Δ最坏={np.min(dels):+.4f}", flush=True)
+    print(f"  新特征(fold{results[-1]['fold_id']})重要性 top:", flush=True)
+    for name, w in last_new_imp[:10]:
         print(f"     {name:22s} {w*100:5.2f}%", flush=True)
-    print(f"  新特征重要性合计 = {sum(w for _, w in new_imp)*100:.1f}%", flush=True)
-    print(f"  总耗时 {time.time()-t0:.0f}s", flush=True)
-    print("=" * 60, flush=True)
+    print(f"  汇总落: {os.path.join(out_dir, 'summary.json')}   总耗时 {time.time()-t0:.0f}s", flush=True)
+    print("=" * 64, flush=True)
 
 
 if __name__ == "__main__":
