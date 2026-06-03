@@ -111,6 +111,50 @@ def build_new_features(raw: pd.DataFrame) -> pd.DataFrame:
     out["rx_add_imb_chg"] = g["_add_imb_tmp"].transform(lambda s: s.diff()).fillna(0.0)
     out = out.drop(columns=["_add_imb_tmp"])
 
+    # ============================================================ #
+    # 第二批（rx2_）：盘口微观结构深挖 + 多时间尺度 + 波动率 + 交互
+    # ============================================================ #
+    # 微观价格偏离：对侧量加权 microprice 减 mid —— 经典短期方向信号（卖压大→micro 偏 bid）
+    micro = _safe_div(df["bid0"].to_numpy(np.float64) * asz + df["ask0"].to_numpy(np.float64) * bsz, asz + bsz)
+    out["rx2_microprice_dev"] = _safe_div(micro - mid, safe_mid)
+    # 全档量不平衡 + 流动性集中度（最优档量占总深度的比）
+    tot_b = bsz + bsz04 + bsz59 + bsz1019
+    tot_a = asz + asz04 + asz59 + asz1019
+    out["rx2_depth_imb_all"] = _safe_div(tot_b - tot_a, tot_b + tot_a)
+    out["rx2_conc_bid"] = _safe_div(bsz, tot_b)
+    out["rx2_conc_ask"] = _safe_div(asz, tot_a)
+    out["rx2_obi_term"] = obi19 - obi0                                   # 盘口不平衡的深浅期限结构
+    out["rx2_spread_rel"] = _safe_div(df["ask0"].to_numpy(np.float64) - df["bid0"].to_numpy(np.float64), safe_mid)
+    # 成交不平衡（中间量）→ 与净挂撤压力的交互（订单流一致性）
+    trade_imb = _safe_div(df["tradeBuyQty"].to_numpy(np.float64) - df["tradeSellQty"].to_numpy(np.float64),
+                          df["tradeBuyQty"].to_numpy(np.float64) + df["tradeSellQty"].to_numpy(np.float64))
+    out["rx2_press_x_tradeimb"] = out["rx_net_order_press"].to_numpy(np.float64) * trade_imb
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in [c for c in out.columns if c.startswith("rx2_")]:
+        out[c] = out[c].fillna(0.0)
+
+    # 多时间尺度时序（z-score = 当前值相对近窗的标准化异常；长窗 EMA；已实现波动）
+    out["_mid_tmp"] = mid
+    g = out.groupby(["date", "symbol"], sort=False)
+
+    def _z(col, w):
+        return g[col].transform(
+            lambda s: (s - s.rolling(w, min_periods=2).mean()) / (s.rolling(w, min_periods=2).std(ddof=0) + EPS)
+        ).fillna(0.0)
+
+    out["rx2_net_press_z12"] = _z("rx_net_order_press", 12)
+    out["rx2_obi_w_z12"] = _z("rx_obi_weighted", 12)
+    out["rx2_cxl_rate_z12"] = _z("rx_cxl_rate_cnt", 12)
+    out["rx2_micro_dev_z12"] = _z("rx2_microprice_dev", 12)
+    out["rx2_net_press_ema12"] = g["rx_net_order_press"].transform(lambda s: s.ewm(halflife=12, adjust=False).mean()).fillna(0.0)
+    # 已实现波动（mid 日内对数收益的 rolling std）+ 与撤单率交互
+    out["_logret_tmp"] = g["_mid_tmp"].transform(lambda s: np.log(s.clip(lower=EPS)).diff()).fillna(0.0)
+    g2 = out.groupby(["date", "symbol"], sort=False)
+    out["rx2_rvol12"] = g2["_logret_tmp"].transform(lambda s: s.rolling(12, min_periods=2).std(ddof=0)).fillna(0.0)
+    out["rx2_cxl_x_rvol"] = out["rx_cxl_rate_cnt"].to_numpy(np.float64) * out["rx2_rvol12"].to_numpy(np.float64)
+    out = out.drop(columns=["_mid_tmp", "_logret_tmp"])
+
     return out.astype({c: np.float32 for c in out.columns if c not in META})
 
 
