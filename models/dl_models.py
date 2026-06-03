@@ -1818,3 +1818,29 @@ class CrossSectionCartridge(ModelCartridge):
         if raw.size == 0:
             return raw
         return (self._rescale_a * raw + self._rescale_b).astype(np.float32)
+
+
+# ================================================================== #
+# 截面架构 + raw 通道（2026-06-03：补上"好架构 + 好输入"那一格）
+# ================================================================== #
+@register_model(ModelKind.XSECTION_RAW)
+class CrossSectionRawCartridge(CrossSectionCartridge):
+    """
+    截面模型架构 + RawChannelAdapter 原始微结构通道输入。
+
+    动机（2026-06-03 诊断）：前三轮从没把"好架构"和"好输入"合在一起——
+    - TCN-on-raw：吃 raw 59 通道（好输入），但 [B,L,C] 一次一票、无截面（坏架构）→ 0.009；
+    - XSECTION / GRU：带截面（好架构），但只喂 433 手工摘要（被压缩的输入）→ 0.062。
+
+    本卡带 = ``CrossSectionCartridge`` 的完整架构（共享 GRU 时序腿 + set-attention 截面腿 +
+    零初门控残差 + per-票头 + masked 截面 Pearson 损失 + 训练段 OLS rescale）**原样复用**，
+    唯一区别 = 输入绑定从 ``FEATURE_433`` 换成 ``RAW_CHANNELS``——即喂 59 个原始微结构通道
+    （含挂撤单、深档盘口、成交明细，规格 §8.0 的 ``RawChannelAdapter``），让网络自学通道交互，
+    而不是吃 433 个人工摘要。
+
+    实现零架构改动：父类 ``fit`` 里 module 的输入维度是 ``input_channels=train_xs.n_channels``
+    （数据驱动），喂 RAW_CHANNELS 时自动按 59 通道建网；故这里**只需覆盖 required_adapter**
+    （组装期强制喂 raw_channels、喂错即拦）。search_space / 超参 / fit / predict 全继承父类。
+    """
+
+    required_adapter = AdapterKind.RAW_CHANNELS
