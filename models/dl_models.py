@@ -1570,6 +1570,101 @@ def _build_xsection_module(
     return XSectionModel()
 
 
+def _build_xsection_deeplob_module(
+    input_channels: int, hidden_size: int, num_layers: int,
+    dropout: float, n_heads: int, attn_dropout: float,
+    conv_channels: int, conv_kernel: int,
+    cross_z: bool = False,
+):
+    """
+    DeepLOB 风格 raw 前端 + 现有截面层。
+
+    设计目标非常克制：**不改**现有 XSECTION 的截面交互、loss、rescale、评测协议，
+    只在“单票时序腿最前面”加一个轻量卷积前端，让 raw 59 通道先做局部时序/通道混合，
+    再交给 GRU + 截面注意力。
+
+    这里不追求完整复刻 DeepLOB 原论文的整套卷积塔，而是保留它最值钱的思想：
+    - 用卷积前端先从原始盘口/成交通道里抽局部模式；
+    - 再把抽好的时序表示交给后续时序/截面模块。
+
+    之所以这样做，是为了把实验变量压到最少：
+    - 旧基线 `XSECTION_RAW` = raw -> GRU -> 截面层
+    - 新变体 `XSECTION_RAW_DEEPLOB` = raw -> Conv 前端 -> GRU -> 截面层
+    这样结果变化基本可以归因到“raw 前端是否更会抽局部模式”。
+    """
+    torch, nn, _F = _require_torch()
+
+    class XSectionDeepLOBModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cross_z = bool(cross_z)
+            self._cz_eps = 1e-5
+            conv_drop = float(dropout)
+            gru_drop = float(dropout) if int(num_layers) > 1 else 0.0
+            # DeepLOB 风格卷积前端：两层 1D 卷积在时间轴滑动，先做局部模式抽取，
+            # 再把通道数投到 conv_channels。输入视作 [B*N, C, L]。
+            self.frontend = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=int(input_channels),
+                    out_channels=int(conv_channels),
+                    kernel_size=int(conv_kernel),
+                    padding=int(conv_kernel) // 2,
+                    bias=False,
+                ),
+                nn.BatchNorm1d(int(conv_channels)),
+                nn.LeakyReLU(negative_slope=0.01, inplace=True),
+                nn.Dropout(float(conv_drop)),
+                nn.Conv1d(
+                    in_channels=int(conv_channels),
+                    out_channels=int(conv_channels),
+                    kernel_size=int(conv_kernel),
+                    padding=int(conv_kernel) // 2,
+                    bias=False,
+                ),
+                nn.BatchNorm1d(int(conv_channels)),
+                nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            )
+            # 卷积后仍保留 GRU 时序腿：卷积负责局部模式抽取，GRU 负责跨多个 lag 的路径编码。
+            self.gru = nn.GRU(
+                input_size=int(conv_channels),
+                hidden_size=int(hidden_size),
+                num_layers=int(num_layers),
+                batch_first=True,
+                dropout=gru_drop,
+            )
+            self.attn = nn.MultiheadAttention(
+                embed_dim=int(hidden_size),
+                num_heads=int(n_heads),
+                dropout=float(attn_dropout),
+                batch_first=True,
+            )
+            self.attn_drop = nn.Dropout(float(dropout))
+            self.gamma = nn.Parameter(torch.zeros(1))
+            self.head = nn.Linear(int(hidden_size), 1)
+
+        def forward(self, x, mask):
+            # x: [B, N, L, C]；mask: [B, N]
+            B, N, L, C = x.shape
+            if self.cross_z:
+                m = mask[:, :, None, None].to(x.dtype)
+                cnt = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+                mean = (x * m).sum(dim=1, keepdim=True) / cnt
+                var = ((x - mean) ** 2 * m).sum(dim=1, keepdim=True) / cnt
+                x = (x - mean) / var.clamp_min(self._cz_eps).sqrt()
+                x = x * m
+            # DeepLOB 风格前端：把每票的 [L,C] 变成 [L,conv_channels]。
+            seq = x.reshape(B * N, L, C).transpose(1, 2)          # [B*N, C, L]
+            seq = self.frontend(seq).transpose(1, 2)              # [B*N, L, conv_channels]
+            out, _ = self.gru(seq)
+            h = out[:, -1, :].reshape(B, N, -1)
+            key_padding = ~mask
+            delta, _ = self.attn(h, h, h, key_padding_mask=key_padding, need_weights=False)
+            z = h + self.gamma * self.attn_drop(delta)
+            return self.head(z).squeeze(-1)
+
+    return XSectionDeepLOBModel()
+
+
 @register_model(ModelKind.XSECTION)
 class CrossSectionCartridge(ModelCartridge):
     """
@@ -1631,6 +1726,31 @@ class CrossSectionCartridge(ModelCartridge):
         from sequence_dataset import CrossSectionDataset
         return CrossSectionDataset.from_whitened(ds.feature_matrix(), ds.arrays, ds.seq_len)
 
+    def _build_model_module(self, train_xs, cfg):
+        """
+        统一的 module 构造入口。
+
+        之所以单独抽成方法，是为了让并行变体（如 raw + DeepLOB 前端）只覆写“前端长什么样”，
+        而不复制整段 fit 逻辑。这样可以保证：
+        - 训练循环
+        - loss / rescale
+        - 早停 / 评测
+        都与基线完全同口径。
+        """
+        n_heads = _safe_n_heads(int(cfg["hidden_size"]), int(cfg["n_heads"]))
+        cross_z = bool(int(cfg.get("cross_z", 0)))
+        module = _build_xsection_module(
+            input_channels=train_xs.n_channels,
+            hidden_size=int(cfg["hidden_size"]),
+            num_layers=int(cfg["num_layers"]),
+            dropout=float(cfg["dropout"]),
+            n_heads=int(n_heads),
+            attn_dropout=float(cfg["attn_dropout"]),
+            cross_z=cross_z,
+        ).to(self._device)
+        extra = {"n_heads": int(n_heads), "cross_z": cross_z}
+        return module, extra
+
     def _eval_loss(self, src, loss_fn, snap_batch: int) -> float:
         """在截面源上算平均组合损失（device 上累加，按有效票数加权），早停用。"""
         torch = self._torch
@@ -1675,17 +1795,7 @@ class CrossSectionCartridge(ModelCartridge):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
 
-        n_heads = _safe_n_heads(int(cfg["hidden_size"]), int(cfg["n_heads"]))
-        cross_z = bool(int(cfg.get("cross_z", 0)))
-        self._model = _build_xsection_module(
-            input_channels=train_xs.n_channels,
-            hidden_size=int(cfg["hidden_size"]),
-            num_layers=int(cfg["num_layers"]),
-            dropout=float(cfg["dropout"]),
-            n_heads=n_heads,
-            attn_dropout=float(cfg["attn_dropout"]),
-            cross_z=cross_z,
-        ).to(self._device)
+        self._model, model_extra = self._build_model_module(train_xs, cfg)
 
         optimizer = torch.optim.AdamW(
             self._model.parameters(),
@@ -1757,23 +1867,24 @@ class CrossSectionCartridge(ModelCartridge):
         y_train = train_ds.window_labels()
         self._rescale_a, self._rescale_b = fit_linear_rescale_numpy(raw_train, y_train)
 
+        extra = {
+            "kind": "xsection",
+            "device": self._device,
+            "hidden_size": int(cfg["hidden_size"]),
+            "num_layers": int(cfg["num_layers"]),
+            "lambda_corr": lambda_corr,
+            "rescale_a": float(self._rescale_a),
+            "rescale_b": float(self._rescale_b),
+        }
+        extra.update(model_extra)
+
         return TrainRecord(
             train_curve=train_curve,
             earlystop_curve=early_curve,
             best_epoch=best_epoch,
             n_epochs=len(train_curve),
             fit_seconds=time.time() - t0,
-            extra={
-                "kind": "xsection",
-                "device": self._device,
-                "hidden_size": int(cfg["hidden_size"]),
-                "num_layers": int(cfg["num_layers"]),
-                "n_heads": int(n_heads),
-                "lambda_corr": lambda_corr,
-                "cross_z": cross_z,
-                "rescale_a": float(self._rescale_a),
-                "rescale_b": float(self._rescale_b),
-            },
+            extra=extra,
         )
 
     def _predict_raw(self, ds) -> np.ndarray:
@@ -1844,3 +1955,61 @@ class CrossSectionRawCartridge(CrossSectionCartridge):
     """
 
     required_adapter = AdapterKind.RAW_CHANNELS
+
+
+@register_model(ModelKind.XSECTION_RAW_DEEPLOB)
+class CrossSectionRawDeepLOBCartridge(CrossSectionCartridge):
+    """
+    并行模型：DeepLOB 风格 raw 前端 + 现有 XSECTION 截面层。
+
+    红线是**绝不覆盖**当前 `XSECTION_RAW`。因此这里新增独立词位和独立卡带：
+    - `XSECTION_RAW` 继续充当当前 raw+截面基线；
+    - `XSECTION_RAW_DEEPLOB` 专门测试“卷积 raw 前端”这一刀是否有增益。
+
+    结构保持可解释：
+    raw 59 通道
+      -> DeepLOB 风格卷积前端（局部模式抽取）
+      -> 共享 GRU 时序腿（跨 lag 路径编码）
+      -> 现有截面注意力层（同一时刻跨票交互）
+      -> 共享线性头
+    """
+
+    search_space: ClassVar[Dict] = XSECTION_SEARCH_SPACE
+    required_adapter = AdapterKind.RAW_CHANNELS
+
+    @staticmethod
+    def _default_hparams(hparams: Dict) -> Dict:
+        """
+        继承 XSECTION 的绝大多数默认值，只新增卷积前端的两个旋钮。
+
+        这里故意不把卷积网格放大，原因是用户当前要的是“同口径 2 折 × 2 seed 快速试一刀”，
+        不是全面 HPO。默认卷积容量保持小而稳，避免把变量数一下拉爆。
+        """
+        merged = CrossSectionCartridge._default_hparams(hparams)
+        merged.setdefault("conv_channels", 32)
+        merged.setdefault("conv_kernel", 3)
+        return merged
+
+    def _build_model_module(self, train_xs, cfg):
+        n_heads = _safe_n_heads(int(cfg["hidden_size"]), int(cfg["n_heads"]))
+        cross_z = bool(int(cfg.get("cross_z", 0)))
+        conv_channels = int(cfg.get("conv_channels", 32))
+        conv_kernel = int(cfg.get("conv_kernel", 3))
+        module = _build_xsection_deeplob_module(
+            input_channels=train_xs.n_channels,
+            hidden_size=int(cfg["hidden_size"]),
+            num_layers=int(cfg["num_layers"]),
+            dropout=float(cfg["dropout"]),
+            n_heads=int(n_heads),
+            attn_dropout=float(cfg["attn_dropout"]),
+            conv_channels=conv_channels,
+            conv_kernel=conv_kernel,
+            cross_z=cross_z,
+        ).to(self._device)
+        extra = {
+            "n_heads": int(n_heads),
+            "cross_z": cross_z,
+            "conv_channels": int(conv_channels),
+            "conv_kernel": int(conv_kernel),
+        }
+        return module, extra

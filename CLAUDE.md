@@ -20,6 +20,59 @@
 
 `20260602_sweep_xsection_v1`（截面模型 = 上一轮特化主攻）已**手动停于 6/9 折**（画像足够，详见 `results/dl/.../STOPPED_MANUALLY.md`，该目录 gitignore 不入库）。`val_corr.mean=0.0624`（6 折全正，min 0.0546，**R² 已被 rescale 兜回 ~0**），**仍在传统保底 0.0776 之下**、且只比纯 GRU-on-433（0.0585）高 6.7%。**每折 `best_epoch=1–2`** → 1–2 个 epoch 即过拟合、可学增量极少。
 
+### 本会话新增收口（2026-06-02 夜，`feat/paper-method-trials` 分支）
+
+- **新分支已切出**：`feat/paper-method-trials`
+  - 目的：把“新论文 / 新方法尝试”和当前 `feat/dl-foundation` 主施工线隔离；后续凡“新协议下的横向重评、传统/DL 交叉验证、方法试验脚本”优先落此分支。
+- **传统正式代表已按 DL 新协议重评并真正落盘**：
+  - run_id：`20260602_trad_dl_protocol_v2`
+  - 口径：严格复用 `AGENTS.md §十一` / `src/dl_protocol.py`
+    - Nov 末倒贴 **3 折 × 20 交易日**：`20230831–20230927`、`20230928–20231102`、`20231103–20231130`
+    - delivery 折：`train(Jun–Nov) / embargo(Dec1) / eval(Dec4–Dec29)`
+  - 模型：传统已锁正式代表 **`raw_mean([X1 ridge + M_lgbm_d4])`**
+  - 结果：
+    - cert `val_corr.mean=0.07628 / min=0.06879 / max=0.09044`
+    - cert `val_r2.mean=0.00498`（3/3 为正）
+    - delivery `val_corr=0.07701 / val_r2=0.00589 / val_mse=2.3591e-05`
+  - 落盘路径：
+    - 汇总：`results/trad_dl_protocol/20260602_trad_dl_protocol_v2/summary.json`
+    - 折表：`results/trad_dl_protocol/20260602_trad_dl_protocol_v2/fold_metrics.csv`
+    - 模型：`results/trad_dl_protocol/20260602_trad_dl_protocol_v2/models/{fold0,fold1,fold2,delivery}/*.pkl`
+    - 逐票预测：`results/trad_dl_protocol/20260602_trad_dl_protocol_v2/preds/*/*.csv`
+- **实现备注（重要，避免未来重踩）**：
+  - 新脚本：`experiments/run_trad_dl_protocol.py`
+  - 首版 `20260602_trad_dl_protocol_v1` 因“一次性抱 union 特征表”在长窗上抬高峰值、delivery 前失败；已保留现场，不覆盖。
+  - v2 改为**成员串行独立读盘 + 直接 numpy 拟合/预测**，显著降峰后跑通。
+  - ridge 在该脚本内显式钉 `solver=lsqr`（仅为避免长窗 dense SVD 内存峰；目标函数仍是同一个 ridge），该差异只存在于本脚本，不回写正式提交主链。
+
+### 本会话再更新（2026-06-03 凌晨，融合优先）
+
+- **传统侧暂时冻结**：
+  - 用户确认：传统模型代码口径还要先改，因此**暂停继续产出新的传统融合基线结果**。
+  - 现有 `results/trad_dl_protocol/...` 先保留作参考，不再作为当前“正式融合输入源”继续扩写。
+- **DL 结果持久化已补成“可直接做多方法融合”的结构**：
+  - 代码：`experiments/run_dl.py`
+  - 新增 run 级结果视图：
+    - `all_preds_long.csv`：统一长表，列为 `run_id/model_id/model_family/profile_name/fold_id/random_seed/train_start/train_end/val_start/val_end/date/symbol/interval/label/pred`
+    - `all_model_metrics.csv`：把 `fold_metrics.csv` 收口成带 `run_id/model_id/profile_name/fold_id/random_seed` 的折级指标索引表
+  - 设计目的：让 DL、传统、论文方法都能收敛成同一张长表键，不必再依赖各自脚本散落的列名或文件命名习惯。
+- **当前可直接拿来和论文方法融合的 DL 基线 run**：
+  - run_id：`20260602_dl_fusion_xsection_v1`
+  - 模型：`xsection`（`seq_len=32 / hidden=32 / layers=1 / dropout=0.2 / weight_decay=1e-3 / lambda_corr=0.3 / max_epochs=15 / patience=5`）
+  - 协议：**DL 新协议 recent 3×20 + delivery 折**，但为尽快产出融合基线，当前先跑 **单 seed=42**
+  - 结果：
+    - cert `val_corr.mean=0.05849 / min=0.05328 / max=0.06261`
+    - cert `val_r2.mean=0.00145 / min=0.00076`
+    - delivery `val_corr=0.05609 / val_r2=0.00169`
+  - 路径：
+    - 汇总：`results/dl/20260602_dl_fusion_xsection_v1/summary.json`
+    - 统一预测长表：`results/dl/20260602_dl_fusion_xsection_v1/all_preds_long.csv`
+    - 统一指标表：`results/dl/20260602_dl_fusion_xsection_v1/all_model_metrics.csv`
+    - 原始逐票散表：`results/dl/20260602_dl_fusion_xsection_v1/preds/*.csv`
+  - 口径提醒：
+    - 当前这版是**融合输入优先**，不是“最终最稳健 DL 认证画像”；稳健画像仍以多 seed 认证为上位标准。
+    - 之所以先收单 seed，是为了让论文方法一接入就能按同一键做结果融合，不被长跑阻塞。
+
 ### 为什么三轮（TCN-raw → GRU-433 → XSECTION 特化）一直没破传统：四层根因
 
 1. **表象**：0.0091 → 0.0585 → 0.0624 一路涨，但都没摸到 0.0776。
@@ -335,3 +388,7 @@ python experiments/run_dl.py --stage sweep --model xsection --adapter feature_43
 - **P0 评测体系**：三层协议 + 4 profiles + baseline delta + make_decision（传统口径，规则见 AGENTS §四）。
 - **Trainer 层**：`src/trainer.py` 的 `BaseTrainer` ABC + `TabularTrainer`，DL 的 `SequenceTrainer` 即接此扩展点。
 - **交付链**：`src/submission_pipeline.py` + `meow/meow.py` + `experiments/run_submission_full_window.py`（跨平台内存采样演练）。
+## 2026-06-03 当前阶段新增收敛
+
+- **`XSECTION_RAW` 两折两 seed 快评已完成**：run `20260603_xsection_raw_2fold_2seed_zscore`，结果路径 `results/dl/20260603_xsection_raw_2fold_2seed_zscore/`；`val_corr.mean=0.0860 / min=0.08185 / max=0.08989 / val_r2_mean=0.00564 / delivery_corr=0.07917`。结论：`raw 59 通道 + GRU 时序腿 + 截面交互层` 这条 DL 路线成立，显著强于旧 DL 0.05x~0.06x，但仍未稳定压过传统 `0.0904`。
+- **口径收敛**：用户明确要求后续尝试**绝不覆盖**当前 `XSECTION_RAW`，必须新增并行模型；当前最想试的是 **`DeepLOB 风格 raw 前端 + 现有 XSECTION 截面层`**，且先跑**同口径 `2 折 × 2 seed`** 快评，不先做大网格、不覆盖旧基线。

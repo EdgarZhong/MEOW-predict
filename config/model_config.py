@@ -28,6 +28,7 @@ class ModelKind(Enum):
     GRU = "gru"                         # 时序基线 + 保底主跑（433 工程特征，绑 FEATURE_433）；编码每票日内路径，也是截面模型(规格 §8.2)的时序腿
     XSECTION = "xsection"               # 【主攻】截面模型：共享 GRU 时序腿 + set-attention 截面腿 + 零初门控残差 + per-票头（规格 §8.2，绑 FEATURE_433）
     XSECTION_RAW = "xsection_raw"       # 【2026-06-03 新】截面模型架构 + RAW_CHANNELS 输入：把 XSECTION 的输入从 433 摘要换成 RawChannelAdapter 的 59 原始微结构通道（含挂撤单/深档盘口/成交明细）；架构完全复用、input_channels 数据驱动自适应。验证"好架构(截面)+好输入(raw)"这一格（前三轮从没合过：TCN 用 raw 但无截面、截面/GRU 有截面但只喂 433）
+    XSECTION_RAW_DEEPLOB = "xsection_raw_deeplob"  # 【2026-06-03 新】并行模型：RAW_CHANNELS 输入 + DeepLOB 风格卷积前端 + 现有 XSECTION 截面层；专门验证“更强 raw 前端”能否把 xsection_raw 从 0.08x 再往上推，且绝不覆盖原 XSECTION_RAW 基线
     LSTM = "lstm"                       # 占位，待定（GRU 已覆盖 D1 角色，此槽保留供未来对照）
     DEEPLOB = "deeplob"                 # 【退役】数据无连续 LOB（规格 §8.0），保留为历史词位，不实现
 
