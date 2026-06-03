@@ -1,0 +1,46 @@
+{
+  "cert_progress": {
+    "done": 4,
+    "total": 4
+  },
+  "cert_seeds": [
+    42,
+    43
+  ],
+  "champion": {
+    "hparams": {
+      "device": "cuda",
+      "dropout": 0.2,
+      "hidden_size": 32,
+      "lambda_corr": 0.3,
+      "max_epochs": 15,
+      "num_layers": 1,
+      "patience": 5,
+      "weight_decay": 0.001
+    },
+    "screen_corr_mean": 0.08601215677188233,
+    "screen_corr_min": 0.08184722313044382,
+    "seq_len": 32,
+    "trial_id": 0
+  },
+  "grid_size": 1,
+  "n_folds": 2,
+  "n_screen_folds": 2,
+  "run_id": "20260603_xsection_raw_2fold_2seed_zscore",
+  "screen_seeds": [
+    42,
+    43
+  ],
+  "stage": "sweep",
+  "status": "certifying",
+  "val_corr": {
+    "max": 0.08989239347600281,
+    "mean": 0.08601215677188233,
+    "min": 0.08184722313044382,
+    "n_folds": 4,
+    "positive_rate": 1.0,
+    "std": 0.002882722720407215
+  },
+  "val_r2_mean": 0.005639646063256648,
+  "val_r2_min": 0.004205807924907656
+}

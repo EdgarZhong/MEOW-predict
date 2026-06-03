@@ -1,0 +1,71 @@
+{
+  "adapter": {
+    "columns": [],
+    "groups": [],
+    "kind": "raw_channels"
+  },
+  "config_fingerprint": "554e5938499ad387",
+  "exec": {
+    "device": "cuda",
+    "n_workers": 1,
+    "out_dir": "results/dl",
+    "resume": false,
+    "reuse_checkpoint": false,
+    "seeds": [
+      42,
+      43
+    ]
+  },
+  "model": {
+    "hparams": {
+      "dropout": 0.2,
+      "lambda_corr": 0.3,
+      "max_epochs": 15,
+      "patience": 5,
+      "weight_decay": 0.001
+    },
+    "kind": "xsection_raw"
+  },
+  "protocol": {
+    "delivery_eval_end": 20231229,
+    "earlystop_frac": 0.15,
+    "embargo": 1,
+    "fold_select": "recent",
+    "max_folds": 2,
+    "min_train_days": 40,
+    "profile": "expanding",
+    "rolling_end": 20231130,
+    "rolling_start": 20230601,
+    "stage": "sweep",
+    "step": 20,
+    "train_window": null,
+    "val_window": 20
+  },
+  "run_id": "20260603_xsection_raw_2fold_2seed_zscore",
+  "search": {
+    "early_kill": false,
+    "early_kill_warmup_epochs": 3,
+    "n_trials": 4,
+    "search_overrides": {
+      "hidden_size": {
+        "type": "choice",
+        "values": [
+          32
+        ]
+      },
+      "num_layers": {
+        "type": "choice",
+        "values": [
+          1
+        ]
+      },
+      "seq_len": {
+        "type": "choice",
+        "values": [
+          32
+        ]
+      }
+    },
+    "train_subsample_frac": 1.0
+  }
+}

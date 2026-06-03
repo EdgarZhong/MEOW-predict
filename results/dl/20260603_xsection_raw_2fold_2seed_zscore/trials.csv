@@ -1,0 +1,2 @@
+trial_id,seq_len,screen_corr_mean,screen_corr_min,screen_corr_std,n_evals,best_epoch_mean,status,error_msg,hp_dropout,hp_weight_decay,hp_max_epochs,hp_patience,hp_lambda_corr,hp_hidden_size,hp_num_layers
+0,32,0.08601215677188233,0.08184722313044382,0.002882722720407215,4,2.5,ok,,0.2,0.001,15,5,0.3,32,1
