@@ -1,0 +1,12 @@
+{"ts": "2026-06-04T11:11:30", "event": "sweep_start", "grid_size": 1, "n_screen_folds": 2, "screen_seeds": [42, 43], "cert_seeds": [42, 43], "resume": false}
+{"ts": "2026-06-04T11:38:52", "event": "trial_done", "trial_id": 0, "seq_len": 32, "screen_corr_mean": 0.08601215677188233, "screen_corr_min": 0.08184722313044382, "n_evals": 4, "status": "ok", "elapsed_sec": 1642.1}
+{"ts": "2026-06-04T11:38:52", "event": "champion", "trial_id": 0, "seq_len": 32, "screen_corr_min": 0.08184722313044382, "screen_corr_mean": 0.08601215677188233}
+{"ts": "2026-06-04T11:38:52", "event": "cert_start", "n_folds": 3, "cert_seeds": [42, 43], "total": 6, "resume": false, "n_resumed_folds": 0}
+{"ts": "2026-06-04T11:42:35", "event": "fold_done", "seed": 42, "fold_id": 0, "val_corr": 0.08949848135726525, "val_r2": 0.006835479311060322, "status": "ok", "elapsed_sec": 223.7, "done": 1, "total": 6}
+{"ts": "2026-06-04T11:47:28", "event": "fold_done", "seed": 42, "fold_id": 1, "val_corr": 0.08552326604643233, "val_r2": 0.0061244059753209346, "status": "ok", "elapsed_sec": 292.3, "done": 2, "total": 6}
+{"ts": "2026-06-04T11:54:05", "event": "fold_done", "seed": 42, "fold_id": 2, "val_corr": 0.08184722313044382, "val_r2": 0.004205807924907656, "status": "ok", "elapsed_sec": 397.1, "done": 3, "total": 6}
+{"ts": "2026-06-04T11:58:14", "event": "fold_done", "seed": 43, "fold_id": 0, "val_corr": 0.08644319214080858, "val_r2": 0.002619873336316192, "status": "ok", "elapsed_sec": 249.1, "done": 4, "total": 6}
+{"ts": "2026-06-04T12:03:37", "event": "fold_done", "seed": 43, "fold_id": 1, "val_corr": 0.08678574443465034, "val_r2": 0.005308799354888816, "status": "ok", "elapsed_sec": 323.5, "done": 5, "total": 6}
+{"ts": "2026-06-04T12:09:36", "event": "fold_done", "seed": 43, "fold_id": 2, "val_corr": 0.08989239347600281, "val_r2": 0.006919570997909186, "status": "ok", "elapsed_sec": 358.3, "done": 6, "total": 6}
+{"ts": "2026-06-04T12:17:26", "event": "delivery_done", "seed": 42, "fold_id": 3, "val_corr": 0.07916861094488724, "val_r2": 0.004797347643581751, "status": "ok", "elapsed_sec": 469.9}
+{"ts": "2026-06-04T12:17:26", "event": "sweep_done", "status": "ok", "val_corr_mean": 0.0866650500976005, "val_corr_min": 0.08184722313044382, "val_r2_mean": 0.005335656150067185, "delivery_val_corr": 0.07916861094488724}
