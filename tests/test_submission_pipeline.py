@@ -110,6 +110,37 @@ class TestSubmissionModelPipeline(unittest.TestCase):
             pred_win = p_win.predict(xdf)
         np.testing.assert_allclose(pred_fit, pred_win, rtol=1e-5, atol=1e-5)
 
+    def test_per_member_fit_matches_window_fit(self):
+        """
+        逐成员现算+fit（交付链压内存路径）必须与整窗 fit_window 训出等价模型。
+
+        两成员都接 rx_micro 后 X1 ridge 子集涨到 157 列，并集整窗（482 列）held + ridge
+        上转 float64 + StandardScaler 内部 nan_mask 临时叠加，在 ~32GB 机全窗 fit 会 OOM。
+        交付链据此改为「每成员单独现算自己 groups 的整窗特征 → fit → 释放」，把峰值压到
+        单成员级。这条路只改**特征现算批次粒度 + fit 编排**、不改训练数学，因此对同一份
+        raw，必须与「一次现算并集 → 整窗 fit_window」给出逐元素一致的预测——本测即其安全网。
+        """
+        raw = _make_schema_probe_raw()
+        spec = SubmissionSpec()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 参照路径：一次现算并集 → 整窗 fit_window。
+            union_pipe = SubmissionFeaturePipeline(groups=DEFAULT_SUBMISSION_GROUPS)
+            xdf_u, ydf_u = union_pipe.build_feature_frames(raw)
+            p_win = SubmissionModelPipeline(h5dir=tmpdir, spec=spec)
+            p_win.fit_window({"xdf": xdf_u.copy(), "ydf": ydf_u.copy()})
+            pred_win = p_win.predict(xdf_u)
+
+            # 被测路径：逐成员各自现算自己 groups 的特征 → fit_one_member。
+            p_pm = SubmissionModelPipeline(h5dir=tmpdir, spec=spec)
+            p_pm.begin_fit()
+            for member in p_pm.member_specs():
+                member_pipe = SubmissionFeaturePipeline(groups=member.groups)
+                xdf_m, ydf_m = member_pipe.build_feature_frames(raw)
+                p_pm.fit_one_member(member, {"xdf": xdf_m, "ydf": ydf_m})
+            # predict 路径不变：仍用并集表逐成员切子集推理。
+            pred_pm = p_pm.predict(xdf_u)
+        np.testing.assert_allclose(pred_win, pred_pm, rtol=1e-5, atol=1e-5)
+
     def test_predict_blends_per_day_zscore(self):
         """
         保证 per_day_zscore_mean 模式是“按天截面标准化后再平均”，而非全局 pooled zscore。

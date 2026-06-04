@@ -332,6 +332,31 @@ RAW_SCHEMA_COLUMNS = [
     "cxlSellQty",
     "buyVwad",
     "sellVwad",
+    # ↓ rx_micro stage（2026-06-03 接入）额外用到的原始列；列名推断 probe 必须覆盖，否则 KeyError。
+    "addBuyTurnover",
+    "addSellTurnover",
+    "cxlBuyTurnover",
+    "cxlSellTurnover",
+    "tradeBuyHigh",
+    "tradeBuyLow",
+    "tradeSellHigh",
+    "tradeSellLow",
+    "lastpx",
+    "high",
+    "low",
+    "open",
+    "btr0_4",
+    "atr0_4",
+    "btr5_9",
+    "atr5_9",
+    "btr10_19",
+    "atr10_19",
+    "addBuyHigh",
+    "addBuyLow",
+    "addSellHigh",
+    "addSellLow",
+    "cxlBuyHigh",
+    "cxlSellLow",
 ]
 
 
@@ -395,6 +420,31 @@ def _make_schema_probe_raw() -> pd.DataFrame:
                     "cxlSellQty": np.float32(qty_base + 1.0),
                     "buyVwad": np.float32(base + 0.03),
                     "sellVwad": np.float32(base - 0.03),
+                    # ↓ rx_micro stage 所需的额外原始列假数据（仅用于列名推断，数值取合理正数即可）。
+                    "addBuyTurnover": np.float32((qty_base + 4.0) * (base + 0.01)),
+                    "addSellTurnover": np.float32((qty_base + 3.0) * (base - 0.01)),
+                    "cxlBuyTurnover": np.float32((qty_base + 2.0) * (base + 0.01)),
+                    "cxlSellTurnover": np.float32((qty_base + 1.0) * (base - 0.01)),
+                    "tradeBuyHigh": np.float32(base + 0.05),
+                    "tradeBuyLow": np.float32(base - 0.04),
+                    "tradeSellHigh": np.float32(base + 0.04),
+                    "tradeSellLow": np.float32(base - 0.05),
+                    "lastpx": np.float32(base + 0.005),
+                    "high": np.float32(base + 0.06),
+                    "low": np.float32(base - 0.06),
+                    "open": np.float32(base - 0.01),
+                    "btr0_4": np.float32(0.50 + symbol_idx * 0.05),
+                    "atr0_4": np.float32(0.45 + symbol_idx * 0.05),
+                    "btr5_9": np.float32(0.30 + interval_idx * 0.001),
+                    "atr5_9": np.float32(0.28 + interval_idx * 0.001),
+                    "btr10_19": np.float32(0.20 + interval_idx * 0.001),
+                    "atr10_19": np.float32(0.18 + interval_idx * 0.001),
+                    "addBuyHigh": np.float32(base + 0.02),
+                    "addBuyLow": np.float32(base - 0.03),
+                    "addSellHigh": np.float32(base + 0.03),
+                    "addSellLow": np.float32(base - 0.02),
+                    "cxlBuyHigh": np.float32(base + 0.025),
+                    "cxlSellLow": np.float32(base - 0.025),
                 }
                 rows.append(row)
     return pd.DataFrame(rows, columns=RAW_SCHEMA_COLUMNS)
@@ -955,6 +1005,173 @@ def build_regime(raw: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     return _sanitize_feature_frame(out)
 
 
+def build_rx_micro(raw: pd.DataFrame) -> pd.DataFrame:
+    """rx_micro stage：摘取被 433 严重欠用的原始盘口 / 订单流信号（共 49 列）。
+
+    背景（2026-06-03 接入交付链）：
+      诊断发现 raw 其实是富 LOB + 订单流数据，但 433 特征严重欠用——挂撤单 20 列只压成
+      4 个静态比率、盘口只做了不平衡摘要没建形状、成交明细（VWAD / High / Low / OHLC）
+      几乎没用。本 stage 把这些欠用信号摘成 **归一化 / 比率 / 不平衡 / 相对量** 特征
+      （跨票、跨时间可比、平稳，泛化优先，绝不喂原始量纲值）。
+      三折全票完整验证（与 DL / P2 同 build_dl_folds 协议）：lgbm 加这批新特征，
+      pooled Pearson 三折全正、均值 +0.0034（0.0765 → 0.0799）。
+
+    口径要点（务必与探针 experiments/probe_raw_features_lgbm_fold2.py 的 build_new_features
+    逐字节一致，以保证交付链复现探针验证过的数值）：
+      - 列名统一加 rx_ / rx2_ / rx3_ 前缀，避免与 433 既有列（add_imb / cxl_imb /
+        buy_vwad_gap 等）重名；
+      - **安全除法分母直接 +EPS、不取 abs，EPS=1e-9**（与本文件顶部 _safe_div 的
+        “取 abs + 1e-8” 语义不同，故此处局部定义 _sdiv，绝不复用模块级 _safe_div）；
+      - 所有时序项（EMA / rolling / diff / z-score）按 (date, symbol) 组内、日内因果、
+        不跨日不跨票；registry 逐日调用 builder，分组键含 date → 与探针整窗 / 逐日两种
+        调用方式数值等价；
+      - builder 只输出特征列、不含 meta；行序由 _sort_raw_frame 统一，meta 由
+        submission_pipeline 侧另行拼接对齐。
+    """
+    # 探针口径的安全除法：分母直接 +EPS、不取 abs；EPS 固定 1e-9。
+    _eps = 1e-9
+
+    def _sdiv(a, b):
+        return np.asarray(a, dtype=np.float64) / (np.asarray(b, dtype=np.float64) + _eps)
+
+    df = _sort_raw_frame(raw)
+    out = pd.DataFrame(index=df.index)
+    mid = df["midpx"].to_numpy(dtype=np.float64)
+    # mid≈0 视为无效价、置 NaN，避免相对量除零；后续统一 fillna(0)。
+    safe_mid = np.where(np.abs(mid) < _eps, np.nan, mid)
+
+    # add_imb / cxl_imb 已在 433（build_base）里，这里只作中间量计算“新”信号，不重复输出。
+    add_imb = _sdiv(df["nAddBuy"] - df["nAddSell"], df["nAddBuy"] + df["nAddSell"])
+    cxl_imb = _sdiv(df["nCxlBuy"] - df["nCxlSell"], df["nCxlBuy"] + df["nCxlSell"])
+
+    # ===== ① 挂撤单（最欠用：原始 20 列此前只做过 4 个静态比率）=====
+    out["rx_cxl_rate_cnt"] = _sdiv(df["nCxlBuy"] + df["nCxlSell"], df["nAddBuy"] + df["nAddSell"])  # 撤单率（毒性）
+    out["rx_cxl_rate_qty"] = _sdiv(df["cxlBuyQty"] + df["cxlSellQty"], df["addBuyQty"] + df["addSellQty"])
+    out["rx_add_imb_to"] = _sdiv(df["addBuyTurnover"] - df["addSellTurnover"], df["addBuyTurnover"] + df["addSellTurnover"])
+    out["rx_cxl_imb_to"] = _sdiv(df["cxlBuyTurnover"] - df["cxlSellTurnover"], df["cxlBuyTurnover"] + df["cxlSellTurnover"])
+    out["rx_net_order_press"] = add_imb - cxl_imb   # 挂买多 + 撤买少 = 真实买压
+    trd = df["nTradeBuy"].to_numpy(dtype=np.float64) + df["nTradeSell"].to_numpy(dtype=np.float64)
+    out["rx_add_vs_trade"] = np.log1p(_sdiv(df["nAddBuy"] + df["nAddSell"], trd))
+    out["rx_cxl_vs_trade"] = np.log1p(_sdiv(df["nCxlBuy"] + df["nCxlSell"], trd))
+
+    # ===== ② 盘口形状（433 只做了不平衡摘要 obi / ofi，没建形状）=====
+    asz = df["asize0"].to_numpy(np.float64); bsz = df["bsize0"].to_numpy(np.float64)
+    asz04 = df["asize0_4"].to_numpy(np.float64); bsz04 = df["bsize0_4"].to_numpy(np.float64)
+    asz59 = df["asize5_9"].to_numpy(np.float64); bsz59 = df["bsize5_9"].to_numpy(np.float64)
+    asz1019 = df["asize10_19"].to_numpy(np.float64); bsz1019 = df["bsize10_19"].to_numpy(np.float64)
+    obi0 = _sdiv(asz - bsz, asz + bsz)
+    obi4 = _sdiv(asz04 - bsz04, asz04 + bsz04)
+    obi9 = _sdiv(asz59 - bsz59, asz59 + bsz59)
+    obi19 = _sdiv(asz1019 - bsz1019, asz1019 + bsz1019)   # 最深档（433 的 obi 没到这一档）
+    out["rx_obi19"] = obi19
+    out["rx_obi_weighted"] = 0.4 * obi0 + 0.3 * obi4 + 0.2 * obi9 + 0.1 * obi19
+    out["rx_depth_nf_bid"] = np.log1p(_sdiv(bsz04, bsz1019))   # 近 / 远档深度比
+    out["rx_depth_nf_ask"] = np.log1p(_sdiv(asz04, asz1019))
+    spr0 = df["ask0"].to_numpy(np.float64) - df["bid0"].to_numpy(np.float64)
+    spr4 = df["ask4"].to_numpy(np.float64) - df["bid4"].to_numpy(np.float64)
+    out["rx_spread_deep_rel"] = _sdiv(spr4 - spr0, safe_mid)   # 深档价差相对收紧
+
+    # ===== ③ 成交明细（buyVwad / sellVwad / High / Low 此前几乎没用）=====
+    out["rx_vwad_gap_buy"] = _sdiv(df["buyVwad"].to_numpy(np.float64) - mid, safe_mid)
+    out["rx_vwad_gap_sell"] = _sdiv(df["sellVwad"].to_numpy(np.float64) - mid, safe_mid)
+    out["rx_trade_range_buy"] = _sdiv(df["tradeBuyHigh"].to_numpy(np.float64) - df["tradeBuyLow"].to_numpy(np.float64), safe_mid)
+    out["rx_trade_range_sell"] = _sdiv(df["tradeSellHigh"].to_numpy(np.float64) - df["tradeSellLow"].to_numpy(np.float64), safe_mid)
+
+    # 静态项先清 NaN / inf（无成交导致），再做时序项。
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in out.columns:
+        out[c] = out[c].fillna(0.0)
+
+    # ===== ④ 时序项（日内因果，按 (date, symbol) 组内）=====
+    # out 不含 meta 列，故用 df 的 date / symbol 作为外部分组键（与 build_base 同手法）。
+    out["_add_imb_tmp"] = add_imb   # 临时列供组内 diff，算完即丢
+    g = out.groupby([df["date"], df["symbol"]], sort=False)
+    out["rx_net_press_ema5"] = g["rx_net_order_press"].transform(lambda s: s.ewm(halflife=5, adjust=False).mean()).fillna(0.0)
+    out["rx_cxl_rate_ema5"] = g["rx_cxl_rate_cnt"].transform(lambda s: s.ewm(halflife=5, adjust=False).mean()).fillna(0.0)
+    out["rx_obi_w_ema5"] = g["rx_obi_weighted"].transform(lambda s: s.ewm(halflife=5, adjust=False).mean()).fillna(0.0)
+    out["rx_add_imb_chg"] = g["_add_imb_tmp"].transform(lambda s: s.diff()).fillna(0.0)
+    out = out.drop(columns=["_add_imb_tmp"])
+
+    # ===== rx2_：盘口微观结构深挖 + 多时间尺度 + 波动率 + 交互 =====
+    # 微观价格偏离：对侧量加权 microprice 减 mid —— 经典短期方向信号（卖压大 → micro 偏 bid）
+    micro = _sdiv(df["bid0"].to_numpy(np.float64) * asz + df["ask0"].to_numpy(np.float64) * bsz, asz + bsz)
+    out["rx2_microprice_dev"] = _sdiv(micro - mid, safe_mid)
+    # 全档量不平衡 + 流动性集中度（最优档量占总深度的比）
+    tot_b = bsz + bsz04 + bsz59 + bsz1019
+    tot_a = asz + asz04 + asz59 + asz1019
+    out["rx2_depth_imb_all"] = _sdiv(tot_b - tot_a, tot_b + tot_a)
+    out["rx2_conc_bid"] = _sdiv(bsz, tot_b)
+    out["rx2_conc_ask"] = _sdiv(asz, tot_a)
+    out["rx2_obi_term"] = obi19 - obi0                                   # 盘口不平衡的深浅期限结构
+    out["rx2_spread_rel"] = _sdiv(df["ask0"].to_numpy(np.float64) - df["bid0"].to_numpy(np.float64), safe_mid)
+    # 成交不平衡（中间量）→ 与净挂撤压力的交互（订单流一致性）
+    trade_imb = _sdiv(df["tradeBuyQty"].to_numpy(np.float64) - df["tradeSellQty"].to_numpy(np.float64),
+                      df["tradeBuyQty"].to_numpy(np.float64) + df["tradeSellQty"].to_numpy(np.float64))
+    out["rx2_press_x_tradeimb"] = out["rx_net_order_press"].to_numpy(np.float64) * trade_imb
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in [c for c in out.columns if c.startswith("rx2_")]:
+        out[c] = out[c].fillna(0.0)
+
+    # 多时间尺度时序（z-score = 当前值相对近窗的标准化异常；长窗 EMA；已实现波动）
+    out["_mid_tmp"] = mid
+    g = out.groupby([df["date"], df["symbol"]], sort=False)
+
+    def _z(col, w):
+        return g[col].transform(
+            lambda s: (s - s.rolling(w, min_periods=2).mean()) / (s.rolling(w, min_periods=2).std(ddof=0) + _eps)
+        ).fillna(0.0)
+
+    out["rx2_net_press_z12"] = _z("rx_net_order_press", 12)
+    out["rx2_obi_w_z12"] = _z("rx_obi_weighted", 12)
+    out["rx2_cxl_rate_z12"] = _z("rx_cxl_rate_cnt", 12)
+    out["rx2_micro_dev_z12"] = _z("rx2_microprice_dev", 12)
+    out["rx2_net_press_ema12"] = g["rx_net_order_press"].transform(lambda s: s.ewm(halflife=12, adjust=False).mean()).fillna(0.0)
+    # 已实现波动（mid 日内对数收益的 rolling std）+ 与撤单率交互
+    out["_logret_tmp"] = g["_mid_tmp"].transform(lambda s: np.log(s.clip(lower=_eps)).diff()).fillna(0.0)
+    g2 = out.groupby([df["date"], df["symbol"]], sort=False)
+    out["rx2_rvol12"] = g2["_logret_tmp"].transform(lambda s: s.rolling(12, min_periods=2).std(ddof=0)).fillna(0.0)
+    out["rx2_cxl_x_rvol"] = out["rx_cxl_rate_cnt"].to_numpy(np.float64) * out["rx2_rvol12"].to_numpy(np.float64)
+    out = out.drop(columns=["_mid_tmp", "_logret_tmp"])
+
+    # ===== rx3_：补 433 + rx + rx2 漏掉的 18 列原始字段 =====
+    #   OHLC（lastpx / open / high / low）+ 分档成交额比率（btr / atr）+ 挂撤单价格区间（add / cxl High / Low）
+    #   全部相对 mid 归一化 / 比率，跨票跨时间可比；无成交无挂撤导致的 NaN 填 0。
+    def _rel(col):
+        return _sdiv(df[col].to_numpy(np.float64) - mid, safe_mid)
+
+    # OHLC（日内多稀疏，相对 mid 偏离 / 振幅 / 累计收益）
+    out["rx3_lastpx_dev"] = _rel("lastpx")
+    out["rx3_hl_range"] = _sdiv(df["high"].to_numpy(np.float64) - df["low"].to_numpy(np.float64), safe_mid)
+    op = df["open"].to_numpy(np.float64)
+    out["rx3_oc_ret"] = _sdiv(mid - op, np.where(np.abs(op) < _eps, np.nan, op))
+    # 分档成交额比率（btr / atr 各档）→ 买卖不平衡 + 近远档比
+    btr04 = df["btr0_4"].to_numpy(np.float64); atr04 = df["atr0_4"].to_numpy(np.float64)
+    btr59 = df["btr5_9"].to_numpy(np.float64); atr59 = df["atr5_9"].to_numpy(np.float64)
+    btr1019 = df["btr10_19"].to_numpy(np.float64); atr1019 = df["atr10_19"].to_numpy(np.float64)
+    out["rx3_to_imb_04"] = _sdiv(btr04 - atr04, btr04 + atr04)
+    out["rx3_to_imb_59"] = _sdiv(btr59 - atr59, btr59 + atr59)
+    out["rx3_to_imb_1019"] = _sdiv(btr1019 - atr1019, btr1019 + atr1019)
+    out["rx3_to_imb_all"] = _sdiv((btr04 + btr59 + btr1019) - (atr04 + atr59 + atr1019),
+                                  btr04 + btr59 + btr1019 + atr04 + atr59 + atr1019)
+    out["rx3_to_nf_b"] = np.log1p(_sdiv(btr04, btr1019))
+    out["rx3_to_nf_a"] = np.log1p(_sdiv(atr04, atr1019))
+    # 挂撤单价格区间 / 价位（相对 mid）：挂买单挂多高、撤单价位、价格分散度
+    out["rx3_addbuy_range"] = _sdiv(df["addBuyHigh"].to_numpy(np.float64) - df["addBuyLow"].to_numpy(np.float64), safe_mid)
+    out["rx3_addsell_range"] = _sdiv(df["addSellHigh"].to_numpy(np.float64) - df["addSellLow"].to_numpy(np.float64), safe_mid)
+    out["rx3_addbuy_lvl"] = _rel("addBuyHigh")
+    out["rx3_addsell_lvl"] = _rel("addSellLow")
+    out["rx3_cxlbuy_lvl"] = _rel("cxlBuyHigh")
+    out["rx3_cxlsell_lvl"] = _rel("cxlSellLow")
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in [c for c in out.columns if c.startswith("rx3_")]:
+        out[c] = out[c].fillna(0.0)
+
+    # 统一清洗 + float32（与其它 stage 口径一致；out 此时不含 meta 列）。
+    return _sanitize_feature_frame(out)
+
+
 registry = FeatureRegistry()
 
 registry.stage(
@@ -1151,6 +1368,17 @@ registry.stage(
     },
 )(build_regime)
 
+# rx_micro：2026-06-03 接入的“被欠用 raw 信号”新 stage。
+# - deps=[]：只依赖原始 raw，不依赖任何上游 stage（与 base / ofi 同为根 stage）；
+# - 只声明单一 group "rx_micro"、不细分子列 → resolve_groups 默认取该 stage 全部 49 列；
+# - 仅挂到提交链 M_lgbm_d4 成员（见 submission_pipeline），X1 ridge 及既有 433 口径完全不受影响。
+registry.stage(
+    name="rx_micro",
+    deps=[],
+    groups=["rx_micro"],
+    status="promoted",
+)(build_rx_micro)
+
 
 __all__ = [
     "EPS",
@@ -1168,5 +1396,6 @@ __all__ = [
     "build_cross",
     "build_conditional_momentum",
     "build_regime",
+    "build_rx_micro",
     "_make_schema_probe_raw",
 ]

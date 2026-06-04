@@ -52,14 +52,22 @@ class SubmissionMemberSpec:
 DEFAULT_SUBMISSION_MEMBERS: Tuple[SubmissionMemberSpec, ...] = (
     SubmissionMemberSpec(
         experiment_id="X1_R02_plus_ofi_safe_condmom_interaction",
-        groups=("legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction"),
+        # 2026-06-03：X1 ridge 末尾也追加 "rx_micro"（49 列被欠用 raw 信号新特征）。
+        # 两折融合验证（fold1 Sep28–Nov02 / fold2 Nov03–Nov30）：ridge 单腿 pooled Pearson
+        # 各 +0.0030 / +0.0047；两腿都加新特征的等权融合 blend_both 比 blend_base（都旧）
+        # 各 +0.0026 / +0.0030，且优于"只给 lgbm 加"（再 +0.00065 / +0.00156）——故两成员都吃。
+        # rx_micro 已过 _sanitize_feature_frame（inf→nan→0→float32），量级正常、不加剧 ridge 数值病态。
+        groups=("legacy", "norm_core", "ofi_safe", "conditional_momentum_interaction", "rx_micro"),
         model_name="ridge",
         target_mode="raw",
         model_params={"alpha": 2.0},
     ),
     SubmissionMemberSpec(
         experiment_id="M_lgbm_d4",
-        groups=("legacy", "norm_core", "ofi_safe", "trade_impact", "lag", "roll", "patch_summary", "cross_rank", "regime_tree"),
+        # 2026-06-03：末尾追加 "rx_micro"（被欠用 raw 信号的 49 列新特征）。
+        # 三折全票（全窗 lgbm-only）验证：lgbm 加这批特征 pooled Pearson 三折全正、+0.0034。
+        # 两折融合验证后 X1 ridge 成员也已接入同批特征（见上）——两成员都吃，融合再抬升。
+        groups=("legacy", "norm_core", "ofi_safe", "trade_impact", "lag", "roll", "patch_summary", "cross_rank", "regime_tree", "rx_micro"),
         model_name="lgbm",
         target_mode="raw",
         model_params={"max_depth": 4, "num_leaves": 15, "n_jobs": 8},
@@ -494,6 +502,70 @@ class SubmissionModelPipeline:
             self.member_baselines[member.experiment_id] = baseline
             del member_x
             gc.collect()
+
+    # ------------------------------------------------------------------
+    # 逐成员流式训练（交付链压内存专用，2026-06-03）
+    #
+    # 背景：两成员都接 rx_micro 后，X1 ridge 子集涨到 157 列。整窗一次现算并集
+    # （482 列 ≈16.5GB）再切子集时，ridge 上转 float64（~10.7GB）+ StandardScaler
+    # 内部 nan_mask 临时（~10GB）叠加 held 着的整窗 → 全窗 fit 峰值超 32GB（本机
+    # 31.6GB 实测 _ArrayMemoryError；老师 ~32GB 机跑 meow.py 同样会 OOM）。
+    #
+    # 修法：不再一次现算并集整窗。改为「每个成员单独现算自己 groups 的整窗特征
+    # → fit → 释放，再进下一个」。这样全窗 fit 峰值由**列数最多的单个成员**决定
+    # （ridge 157 列 fit ~26GB / lgbm 462 列 fit ~22GB，均 <31.6GB），而非两成员并集。
+    # 代价：成员间共享的特征组（legacy/norm_core/ofi_safe/rx_micro）被现算两次（交付
+    # 链略慢，可接受）。**只改特征现算批次粒度 + fit 编排，训练数学与整窗 fit_window 一致。**
+    # predict 路径不动（评测窗 Dec 仅 ~1.46M 行、并集整窗才 ~2.8GB，无 OOM 之虞）。
+    # ------------------------------------------------------------------
+    def member_specs(self) -> Tuple[SubmissionMemberSpec, ...]:
+        """返回当前 spec 的成员列表，供交付链编排「逐成员现算+fit」。"""
+        return tuple(self.spec.members)
+
+    def begin_fit(self) -> None:
+        """逐成员流式训练起始：重置成员训练态（models / 列 / baseline）。"""
+        self.models = {}
+        self.member_feature_cols = {}
+        self.member_baselines = {}
+
+    def fit_one_member(self, member: SubmissionMemberSpec, frames: Dict[str, pd.DataFrame]) -> None:
+        """
+        训练单个成员（消费式：frames 所有权已移交，fit 前释放单成员整窗源帧）。
+
+        约定：
+        - `frames["xdf"]` 只含该成员 `groups` 的特征列 + meta（由调用方按 member.groups 现算）；
+        - `frames["ydf"]` 含 meta + 训练目标列；
+        - 调用方已交出 frames 所有权（自己不再持有引用）。
+
+        内存：抽出该成员特征 numpy 后立即把单成员整窗源帧释放 → fit 时内存 ≈ 单成员训练矩阵。
+        调用前须先 `begin_fit()`，按 `member_specs()` 顺序逐个调本方法即完成全部成员训练。
+        """
+
+        xtrain = self._normalize_meow_frame(frames["xdf"], require_target=False, copy=False)
+        ytrain = self._normalize_meow_frame(frames["ydf"], require_target=True, copy=False)
+        frames["xdf"] = None
+        frames["ydf"] = None
+        gc.collect()
+
+        input_cols = self._resolve_member_input_cols(member)
+        # 只抽该成员特征列为 float32 numpy（不含 meta；raw 口径训练不需要 meta）。
+        member_x = xtrain[input_cols].to_numpy(dtype=np.float32)
+        # 单成员整窗源帧此后无用（后续成员各自现算）→ fit 前立即释放，把峰值压到单成员级。
+        xtrain = None
+        gc.collect()
+        model, feature_cols, baseline = self.runner._fit_model_core(
+            member.model_name,
+            member_x,
+            list(input_cols),
+            ytrain,
+            target_mode=member.target_mode,
+            model_params=member.model_params,
+        )
+        self.models[member.experiment_id] = model
+        self.member_feature_cols[member.experiment_id] = list(feature_cols)
+        self.member_baselines[member.experiment_id] = baseline
+        del member_x
+        gc.collect()
 
     def predict(self, xdf: pd.DataFrame) -> np.ndarray:
         """

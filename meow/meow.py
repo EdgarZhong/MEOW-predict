@@ -35,9 +35,14 @@ class MeowEngine(object):
         self.model = MeowModel(cacheDir=cacheDir, h5dir=h5dir)
         self.evaluator = MeowEvaluator(cacheDir=cacheDir)
 
-    def _build_window_frames(self, dates):
+    def _build_window_frames(self, dates, groups=None):
         """
         逐日现算特征，并以「预分配 + 流式填充」拼成整窗 `xdf/ydf`。
+
+        `groups`：
+        - None（默认）= 现算全部成员的并集特征（predict/eval 路径用，行为不变）；
+        - 传入某成员的 groups = 只现算该成员的特征，供 fit 走「逐成员现算+fit」把全窗
+          fit 内存峰值压到单成员级（避免一次现算 482 列并集整窗 + ridge float64 叠加 OOM）。
 
         为什么不用 `pd.concat(list_of_day_frames)`：
         - concat 需要同时持有「全部日碎片」和「拼接结果」两份 → 整窗下约 2× 内存尖峰。
@@ -51,7 +56,7 @@ class MeowEngine(object):
         交付训练链（`fit_window`）据此在末位成员训练前释放整窗源帧、进一步压低峰值。
         """
 
-        feat_cols = self.featGenerator.featureNames()
+        feat_cols = self.featGenerator.featureNames(groups)
         n_feat = len(feat_cols)
         ycol = self.featGenerator.ycol
         # 预读每日行数（只读 h5 轴元信息），据此预分配整窗缓冲。
@@ -71,7 +76,7 @@ class MeowEngine(object):
         r = 0
         for date, expected in zip(dates, per_day_rows):
             rawData = self.dloader.loadDate(date)
-            xday, yday = self.featGenerator.genFeatures(rawData)
+            xday, yday = self.featGenerator.genFeatures(rawData, groups)
             # genFeatures 返回 (date,symbol,interval) MultiIndex 形态，这里还原成普通列再取数。
             xday = xday.reset_index()
             yday = yday.reset_index()
@@ -109,11 +114,32 @@ class MeowEngine(object):
         return {"xdf": xdf, "ydf": ydf}
 
     def fit(self, startDate, endDate):
+        """
+        全窗训练：逐成员现算特征 + fit，把内存峰值压到「单成员级」。
+
+        为什么不再一次现算并集整窗（旧 `_build_window_frames(dates)` + `fit_window`）：
+        - 两成员都接 rx_micro 后，X1 ridge 子集涨到 157 列；并集整窗（482 列 ≈16.5GB）
+          held 着、再叠加 ridge 上转 float64（~10.7GB）+ StandardScaler 内部 nan_mask 临时
+          （~10GB）→ 全窗 fit 峰值超 32GB（本机 31.6GB 实测 OOM；老师 ~32GB 机同样会爆）。
+        改为「每个成员单独现算自己 groups 的整窗特征 → fit → 释放，再进下一个」：
+        - 全窗 fit 峰值由列数最多的单个成员决定（ridge 157 列 ~26GB / lgbm 462 列 ~22GB），
+          均 <31.6GB；代价仅是共享特征组被现算两次（交付链略慢、可接受）。
+        - 只改特征现算批次粒度 + fit 编排，训练数学与整窗 `fit_window` 逐成员等价（有单测护网）。
+        """
+
         dates = self.calendar.range(startDate, endDate)
-        log.inf("Running model fitting...")
-        frames = self._build_window_frames(dates)
-        # 交出整窗源帧所有权：消费式训练会在末位成员 fit 前释放它，压低内存峰值。
-        self.model.fit_window(frames)
+        log.inf("Running model fitting (逐成员现算+fit，压内存峰值到单成员级)...")
+        self.model.begin_fit()
+        for member in self.model.member_specs():
+            log.inf(
+                "  逐成员现算并训练成员: {} (groups={})".format(
+                    member.experiment_id, list(member.groups)
+                )
+            )
+            # 只现算该成员 groups 的整窗特征；交出 holder 所有权，fit 前即释放、压低峰值。
+            member_frames = self._build_window_frames(dates, groups=member.groups)
+            self.model.fit_one_member(member, member_frames)
+        self.model.end_fit()
 
     def predict(self, xdf):
         return self.model.predict(xdf)

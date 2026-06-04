@@ -730,6 +730,21 @@ class ExperimentRunner(object):
         # cholesky 毫秒级成功、内存小，彻底绕开 SVD。树/提升族尺度无关，保持 float32 省内存。
         if isinstance(model, Pipeline):
             x = np.asarray(x, dtype=np.float64)
+            # 内存优化（2026-06-03）：此处 x 是本函数私有的临时 float64 数组——由上一行 asarray
+            # 从调用方的 float32 子集**新建**，原地改它不会影响调用方的 float32 子集、更不会动到
+            # 整窗 float32 矩阵。因此让管线内部尽量原地、不再额外复制等大 float64：
+            #   - StandardScaler(copy=False)：fit_transform 原地标准化，省一份副本；
+            #   - 线性末端若支持 copy_X（如 Ridge/ElasticNet）则 copy_X=False：fit 内部不再复制 X。
+            # 单份全窗 ridge 子集（~850 万行 × 108 列 float64）就 ~6.9GB；省掉 1~2 份副本可把全窗
+            # fit 峰值从内存临界压回安全区，根治“内存紧时 ridge 大分配失败”的既有脆弱性（见
+            # CLAUDE.md 🚩：此前表现为 NaN，P1 转 float64 后在 31.6GB 机上转为 OOM）。纯内存优化、
+            # 不改任何训练数值。
+            _scaler = model.named_steps.get("scaler")
+            if _scaler is not None and hasattr(_scaler, "set_params"):
+                _scaler.set_params(copy=False)
+            _final = model.named_steps.get("model")
+            if _final is not None and "copy_X" in _final.get_params():
+                _final.set_params(copy_X=False)
         try:
             if sample_weight is None:
                 model.fit(x, y)

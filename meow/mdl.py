@@ -55,6 +55,27 @@ class MeowModel(object):
         self.runtime.fit_window(frames)
         log.inf("Done fitting formal submission model")
 
+    def member_specs(self):
+        """返回正式提交成员列表，供 meow 入口编排「逐成员现算+fit」压内存。"""
+        return self.runtime.member_specs()
+
+    def begin_fit(self):
+        """逐成员流式训练起始：重置成员训练态。"""
+        self.runtime.begin_fit()
+
+    def fit_one_member(self, member, frames):
+        """
+        训练单个成员（消费式）：frames 只含该成员 groups 的特征 + 目标、所有权已移交。
+
+        交付链全窗 fit 改走这条「逐成员现算 → fit → 释放」路径，把内存峰值压到单成员级，
+        根治两成员都接 rx_micro 后 ridge 157 列 fit 在 ~32GB 机上 OOM 的交付隐患。
+        """
+        self.runtime.fit_one_member(member, frames)
+
+    def end_fit(self):
+        """逐成员流式训练收尾：打印完成日志，与整窗路径日志口径一致。"""
+        log.inf("Done fitting formal submission model")
+
     def predict(self, xdf):
         """
         用正式提交模型推理，并强制输出 float32 数组。
