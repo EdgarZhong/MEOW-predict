@@ -12,14 +12,7 @@ class Calendar(object):
             self.tradingDaySet = set(self.tradingDays)
 
     def mergeDataDirDays(self, h5dir):
-        """把数据目录里实际存在的 .h5 交易日并入交易日集合（取并集、重排序）。
-
-        背景：老师评测时只更换数据文件路径、不改入口日期。若其评测数据是另一个
-        时间段，其日期不在本仓库自带的静态交易日清单（resources/calendar，仅 2023）里，
-        会被 isTradingDay 判否、loadDate/countDate 直接抛错而崩。这里把数据目录中
-        真实存在的交易日补进日历，使任意时间段的同格式数据都能被正确识别。
-        对原始 2023 数据为 no-op：其日期已在清单内，取并集后集合不变、行为逐字一致。
-        """
+        """把数据目录实际存在的 .h5 交易日并入交易日集合，使老师换成别的时段数据也能被识别（对 2023 数据为 no-op）。"""
         if not os.path.isdir(h5dir):
             return
         found = []

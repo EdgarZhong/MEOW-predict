@@ -1,34 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-DL-on-raw serve 腿 —— 把"截面模型直接吃 raw 盘口"焊进正式提交链 `meow.py`。
+"""DL-on-raw serve 腿：把截面模型（直吃 raw 59 通道）接进 `meow.py` 的 fit/predict。
 
-为什么要它
-----------
-老师 `python meow.py` 用他自己的数据 `fit()` 再 `eval()` 评分（数据与我们格式一致）。
-离线判决已证 DL-on-raw（XSECTION_RAW 截面卡带，直吃 raw 59 通道）与传统去相关（ρ≈0.45–0.55），
-三折 + 交付窗等权融合稳赢传统、交付窗破 0.09、cert 折 seed 平均破 0.10。但那是**离线纸面数**——
-serve 链里没有 DL，老师跑出来只有传统 0.0812。本模块把 DL 真正接进 fit/predict，让融合分落地。
-
-老师约束（全部满足，见 docx）
------------------------------
-- 不许带模型缓存文件 → DL 在 `fit()` **现训**、不落任何权重文件；
-- 评测数据零重合、严禁 overfit → 训练段切 15% 做 early-stop、卡带内置训练段 OLS rescale、
-  归一化只用训练区统计（零泄漏）；
-- 环境只保证 Python≥3.8（未承诺 torch/GPU）→ **防御式降级**：torch/CUDA/任一 DL 环节出错，
-  `available=False`，`MeowEngine` 自动回落纯传统（最坏=0.0812，绝不崩、绝不 NaN）。
-
-fit/predict 为何要拆开
-----------------------
-实验链的 `run_on_dl_fold` 是"训练+评测一次做完"（训练时就知道评测窗）。但 serve 端老师分两次调：
-`fit(train)` 训练并把模型留在内存、`predict(eval)` 用留下的模型评后来的窗。所以这里把底层积木
-（`build_sequence_arrays` / `Normalizer` / `SequenceDataset` / 卡带 `fit`/`predict`）按 fit/predict
-两阶段重新编排，训练期 fit 的 `Normalizer` 存下来给 predict 复用（零泄漏）。
-
-交付形态
---------
-`fit()` 现训 **K=3 个 seed** 的 DL（seed 集成是免费杠杆、降单 seed 方差），`predict()` 取 K seed
-**平均**再交给 `MeowEngine` 与传统等权融合。K / seq_len / 超参均可经环境变量覆盖（默认照搬机器2
-proven 冠军 `20260604_xsection_raw_3fold_2seed`）。
+fit() 现训 K=3 seed（不落权重文件），predict() 取 seed 平均交给 MeowEngine 与传统等权融合。
+防御式降级：torch/CUDA/任一 DL 环节出错则 available=False、自动回落纯传统（绝不崩、绝不 NaN）。
+训练段切 15% early-stop、归一化只用训练区统计、predict 复用训练期 Normalizer（零泄漏，防 overfit）。
 """
 
 from __future__ import annotations
@@ -118,11 +93,7 @@ class DLServe:
     """
 
     def __init__(self, raw_loader, seeds=None, seq_len=_DEFAULT_SEQ_LEN, hparams=None):
-        """
-        - `raw_loader`: `dates -> raw DataFrame`（含 META + raw 列 + fret12）；
-          serve 直接传 `MeowEngine.dloader.loadDates`，格式与机器2 训练用的 src/dl.py 一致。
-        - `seeds` / `seq_len` / `hparams`: 默认照搬 proven 冠军；可显式覆盖。
-        """
+        # raw_loader: dates -> raw DataFrame（含 META + raw 列 + fret12），serve 直接传 MeowEngine.dloader.loadDates。
         self.raw_loader = raw_loader
         self.seeds = tuple(seeds) if seeds else _read_seeds_env()
         self.seq_len = int(seq_len)
@@ -199,12 +170,9 @@ class DLServe:
 
     # ---- 推理阶段：K seed 平均 ---- #
     def predict(self, eval_dates):
-        """
-        返回 DataFrame(date, symbol, interval, pred_dl)（K seed 平均），供 MeowEngine 对齐融合。
+        """返回 DataFrame(date,symbol,interval,pred_dl)（K seed 平均）；不可用/空/失败返回 None。
 
-        不可用 / 空 / 失败一律返回 None（调用方据此用纯传统）。
-        因序列 warmup，每个 (date,symbol) 的前 seq_len-1 个 interval 没有 DL 预测（属正常），
-        这些行不在返回结果里，MeowEngine 对这些行用纯传统填。
+        因序列 warmup，每票每日前 seq_len-1 个 interval 无 DL 预测、不在结果里，MeowEngine 对这些行用纯传统填。
         """
         if not self.available or not self._cartridges:
             return None
@@ -237,14 +205,9 @@ class DLServe:
 
 
 def fuse_traditional_with_dl(xdf, trad_pred, dl_df, weight_dl: float = _FUSION_WEIGHT_DL):
-    """
-    把传统预测与 DL 预测按 (date,symbol,interval) 等权融合，输出对齐 `xdf` 行序的一维数组。
+    """按 (date,symbol,interval) 等权融合 `(1-w)*trad + w*dl`（默认 w=0.5），输出对齐 xdf 行序的一维数组。
 
-    - `xdf`: 含 date/symbol/interval 列的特征帧（行序即最终预测要返回的顺序）。
-    - `trad_pred`: 传统预测，长度/顺序与 `xdf` 一致。
-    - `dl_df`: DLServe.predict 的输出 DataFrame(date,symbol,interval,pred_dl)，可能为 None 或只覆盖部分行。
-    - 融合口径 = `(1-w)*trad + w*dl`（默认 w=0.5 等权，量纲留在 fret12 保 MSE/R²）。
-    - DL warmup 缺的行（dl 无预测）→ 用纯传统填，绝不引入 NaN。
+    dl_df 为 None / 只覆盖部分行时，缺的行（DL warmup）用纯传统填，绝不引入 NaN。量纲留在 fret12 保 MSE/R²。
     """
     trad = np.asarray(trad_pred, dtype=np.float64).reshape(-1)
     if dl_df is None or len(dl_df) == 0:

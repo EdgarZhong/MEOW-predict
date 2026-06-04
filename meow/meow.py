@@ -45,24 +45,10 @@ class MeowEngine(object):
         self.dl_serve = DLServe(raw_loader=self.dloader.loadDates) if self.dl_enabled else None
 
     def _build_window_frames(self, dates, groups=None):
-        """
-        逐日现算特征，并以「预分配 + 流式填充」拼成整窗 `xdf/ydf`。
+        """逐日现算特征 +「预分配整窗 float32 矩阵 + 流式填充」拼成 xdf/ydf（避开 concat 的 2× 内存尖峰）。
 
-        `groups`：
-        - None（默认）= 现算全部成员的并集特征（predict/eval 路径用，行为不变）；
-        - 传入某成员的 groups = 只现算该成员的特征，供 fit 走「逐成员现算+fit」把全窗
-          fit 内存峰值压到单成员级（避免一次现算 482 列并集整窗 + ridge float64 叠加 OOM）。
-
-        为什么不用 `pd.concat(list_of_day_frames)`：
-        - concat 需要同时持有「全部日碎片」和「拼接结果」两份 → 整窗下约 2× 内存尖峰。
-        这里改为：
-        1. 先用 h5 轴元信息廉价拿到每日行数（不加载数据块）、得到整窗总行数；
-        2. 预分配一块整窗 float32 特征矩阵 + meta/标签数组；
-        3. 逐日把当日特征写进对应行段、当日帧用完即释放。
-        峰值因此≈单份整窗矩阵，而非碎片+结果两份。
-
-        返回一个 holder 字典（而非直接返回两张表），是为了让调用方能立刻交出源帧所有权，
-        交付训练链（`fit_window`）据此在末位成员训练前释放整窗源帧、进一步压低峰值。
+        groups=None 现算全部成员并集（predict/eval）；传入某成员 groups 则只算该成员，供 fit 逐成员把峰值压到单成员级。
+        返回 holder 字典让调用方可交出源帧所有权、在末位成员训练前释放整窗源帧。
         """
 
         feat_cols = self.featGenerator.featureNames(groups)
@@ -123,18 +109,7 @@ class MeowEngine(object):
         return {"xdf": xdf, "ydf": ydf}
 
     def fit(self, startDate, endDate):
-        """
-        全窗训练：逐成员现算特征 + fit，把内存峰值压到「单成员级」。
-
-        为什么不再一次现算并集整窗（旧 `_build_window_frames(dates)` + `fit_window`）：
-        - 两成员都接 rx_micro 后，X1 ridge 子集涨到 157 列；并集整窗（482 列 ≈16.5GB）
-          held 着、再叠加 ridge 上转 float64（~10.7GB）+ StandardScaler 内部 nan_mask 临时
-          （~10GB）→ 全窗 fit 峰值超 32GB（本机 31.6GB 实测 OOM；老师 ~32GB 机同样会爆）。
-        改为「每个成员单独现算自己 groups 的整窗特征 → fit → 释放，再进下一个」：
-        - 全窗 fit 峰值由列数最多的单个成员决定（ridge 157 列 ~26GB / lgbm 462 列 ~22GB），
-          均 <31.6GB；代价仅是共享特征组被现算两次（交付链略慢、可接受）。
-        - 只改特征现算批次粒度 + fit 编排，训练数学与整窗 `fit_window` 逐成员等价（有单测护网）。
-        """
+        """全窗训练：逐成员现算各自 groups 特征 → fit → 释放，把内存峰值压到单成员级（避免并集整窗 + ridge float64 叠加 OOM；与整窗 fit 数学等价、有单测护网）。"""
 
         dates = self.calendar.range(startDate, endDate)
         log.inf("Running model fitting (逐成员现算+fit，压内存峰值到单成员级)...")
