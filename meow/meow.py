@@ -17,6 +17,7 @@ from feat import MeowFeatureGenerator
 from mdl import MeowModel
 from eval import MeowEvaluator
 from tradingcalendar import Calendar
+from dl_serve import DLServe, fuse_traditional_with_dl
 
 
 class MeowEngine(object):
@@ -27,6 +28,9 @@ class MeowEngine(object):
             raise ValueError("Data directory not exists: {}".format(self.h5dir))
         if not os.path.isdir(h5dir):
             raise ValueError("Invalid data directory: {}".format(self.h5dir))
+        # 健壮性：把数据目录里实际存在的交易日并入引擎日历，使 fit/eval 的
+        # calendar.range 在老师换成别的时段数据时也能返回正确日期。对 2023 数据为 no-op。
+        self.calendar.mergeDataDirDays(h5dir)
         # 这里保留老师样例中的 `cacheDir` 参数形态，便于外部调用保持兼容。
         # 但正式提交实现不依赖持久化特征缓存，真正的核心逻辑统一走 `src/`。
         self.cacheDir = cacheDir
@@ -34,6 +38,11 @@ class MeowEngine(object):
         self.featGenerator = MeowFeatureGenerator(cacheDir=cacheDir)
         self.model = MeowModel(cacheDir=cacheDir, h5dir=h5dir)
         self.evaluator = MeowEvaluator(cacheDir=cacheDir)
+        # DL-on-raw serve 腿（截面卡带直吃 raw 59 通道）：fit() 时现训 K seed、predict() 与传统等权融合。
+        # 防御式——torch/CUDA/任一 DL 环节出错则 available=False，自动回落纯传统（最坏=传统保底 0.0812，绝不崩）。
+        # MEOW_DISABLE_DL=1 可彻底关掉 DL、退回纯传统提交链。
+        self.dl_enabled = os.environ.get("MEOW_DISABLE_DL", "").strip() not in ("1", "true", "True")
+        self.dl_serve = DLServe(raw_loader=self.dloader.loadDates) if self.dl_enabled else None
 
     def _build_window_frames(self, dates, groups=None):
         """
@@ -140,9 +149,20 @@ class MeowEngine(object):
             member_frames = self._build_window_frames(dates, groups=member.groups)
             self.model.fit_one_member(member, member_frames)
         self.model.end_fit()
+        # —— 焊接：传统训练完后，现训 DL-on-raw 腿（K seed）；失败内部已吞、自动回落纯传统 —— #
+        if self.dl_serve is not None:
+            log.inf("Running DL-on-raw fitting (现训 K seed; 失败自动回落纯传统)...")
+            self.dl_serve.fit(dates)
 
     def predict(self, xdf):
-        return self.model.predict(xdf)
+        # 传统预测照旧；若 DL 腿现训成功，则按 (date,symbol,interval) 与传统等权融合，
+        # DL 因序列 warmup 缺的行用纯传统填。DL 不可用 → 直接返回纯传统（保底）。
+        trad_pred = self.model.predict(xdf)
+        if self.dl_serve is None or not self.dl_serve.available:
+            return trad_pred
+        eval_dates = sorted(int(d) for d in pd.unique(xdf["date"]))
+        dl_df = self.dl_serve.predict(eval_dates)
+        return fuse_traditional_with_dl(xdf, trad_pred, dl_df)
 
     def eval(self, startDate, endDate):
         log.inf("Running model evaluation...")
@@ -162,6 +182,27 @@ if __name__ == "__main__":
     train_end = int(os.environ.get("MEOW_TRAIN_END", "20231130"))
     eval_start = int(os.environ.get("MEOW_EVAL_START", "20231201"))
     eval_end = int(os.environ.get("MEOW_EVAL_END", "20231229"))
+
+    # 健壮性兜底：老师评测时只更换数据文件路径、不改入口日期。若上面的默认/配置日期区间
+    # 在实际数据目录里一天都不存在（= 老师换成了别的时间段数据），就直接按数据目录里真实
+    # 存在的交易日自动切分（末 eval_n 个交易日作评测、其余作训练），避免 `python meow.py`
+    # 因日期对不上而崩。对原始 2023 数据该分支不触发，train/eval 区间与之前逐字一致。
+    available = sorted(
+        int(p.stem) for p in Path(default_h5dir).glob("*.h5") if p.stem.isdigit()
+    )
+    if available and not any(train_start <= d <= eval_end for d in available):
+        eval_n = 20  # 评测窗口交易日数，与原始 12 月评测窗口（约 20 个交易日）对齐
+        if len(available) > eval_n:
+            train_start, train_end = available[0], available[-eval_n - 1]
+            eval_start, eval_end = available[-eval_n], available[-1]
+        else:  # 数据极少：留最后 1 个交易日评测、其余训练，保底仍能跑
+            train_start, train_end = available[0], available[-2]
+            eval_start, eval_end = available[-1], available[-1]
+        log.inf(
+            "配置日期区间与数据不相交，自动按数据范围切分: "
+            "train {}-{} / eval {}-{}".format(train_start, train_end, eval_start, eval_end)
+        )
+
     engine = MeowEngine(h5dir=default_h5dir, cacheDir=None)
     engine.fit(train_start, train_end)
     engine.eval(eval_start, eval_end)

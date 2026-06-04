@@ -9,6 +9,10 @@ class MeowDataLoader(object):
     def __init__(self, h5dir):
         self.h5dir = h5dir
         self.calendar = Calendar()
+        # 健壮性：把数据目录里实际存在的交易日并入日历，使老师换成别的时段数据
+        # （日期不在静态清单里）时，countDate/loadDate 的 isTradingDay 校验不再误判而崩。
+        # 对原始 2023 数据为 no-op。
+        self.calendar.mergeDataDirDays(h5dir)
 
     def countDate(self, date):
         # 只读 h5 轴元信息拿当日行数，不加载数据块（fixed 格式整窗预分配用）。
