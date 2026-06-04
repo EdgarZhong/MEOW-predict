@@ -173,16 +173,23 @@ class TraditionalResidualProvider:
     # ------------------------------------------------------------------
     def _build_score_index(self) -> Dict[Tuple[int, int], Path]:
         """
-        扫描 ``preds/*.csv``，按 ``(min_date, max_date)`` 建索引。
+        扫描 ``preds/*_wide.csv``，按 ``(min_date, max_date)`` 建索引。
 
         之所以不用 fold_id 建索引，是因为 recent 2 折与 recent 3 折的 fold 编号会变化；
         真正稳定的是评分窗口本身。
+
+        这里只认 ``*_wide.csv``，不读 ``*_long.csv``，原因有两个：
+
+        1. residual 训练只需要「每个 (date,symbol,interval) 一行」的 blend 预测，
+           ``wide`` 表正好就是这个形态；
+        2. ``long`` 表是一成员一行，体量通常是 ``wide`` 的数倍，且与 ``wide`` 混读会把
+           同一批日期重复放大，既浪费内存，也会在后续 merge 时制造重复键。
         """
         preds_dir = self.trad_preds_root / "preds"
         if not preds_dir.exists():
             raise FileNotFoundError(f"传统预测目录不存在：{preds_dir}")
         index: Dict[Tuple[int, int], Path] = {}
-        for path in preds_dir.rglob("*.csv"):
+        for path in preds_dir.rglob("*_wide.csv"):
             frame = pd.read_csv(path, usecols=["date"])
             if frame.empty:
                 continue
@@ -193,16 +200,36 @@ class TraditionalResidualProvider:
         return index
 
     def _load_scoring_preds(self, fold: DLFold) -> pd.DataFrame:
-        key = (int(fold.val_start), int(fold.val_end))
-        path = self._score_index.get(key)
-        if path is None:
+        """
+        评分区传统预测读取策略。
+
+        旧版假设“评分窗口必须与某个已落盘传统预测文件的起止日完全一致”，这只适用于
+        20×20 大块 cert / delivery。现在要支持更密的 OOF 小块库（如 5×5），因此改成：
+
+        - 取所有与 ``fold.scoring_dates`` 有交集的传统预测文件；
+        - 按日期精确过滤到评分日期集合；
+        - 拼接后校验键唯一 / 覆盖完整。
+
+        这样 residual 评测既能吃原来的 20 日 cert 大块，也能吃后续更密的 OOF 小块库。
+        """
+        score_dates = set(int(d) for d in fold.scoring_dates)
+        frames = []
+        for (win_start, win_end), path in sorted(self._score_index.items()):
+            if win_end < min(score_dates) or win_start > max(score_dates):
+                continue
+            frame = pd.read_csv(path, usecols=_META_COLS + ["label", self.trad_pred_col])
+            self._validate_pred_frame(frame, path)
+            part = frame[frame["date"].isin(score_dates)].copy()
+            if not part.empty:
+                frames.append(part.loc[:, _META_COLS + ["label", self.trad_pred_col]])
+        if not frames:
             raise FileNotFoundError(
-                "未找到与当前评分窗口对齐的传统预测："
-                f"window={key}, 可用窗口={sorted(self._score_index.keys())}"
+                "未找到与当前评分日期有交集的传统预测："
+                f"score_dates=({min(score_dates)}, {max(score_dates)})"
             )
-        frame = pd.read_csv(path)
-        self._validate_pred_frame(frame, path)
-        return frame.loc[:, _META_COLS + ["label", self.trad_pred_col]].copy()
+        out = pd.concat(frames, axis=0, ignore_index=True)
+        self._validate_pred_frame(out, "<concat_scoring_preds>")
+        return out
 
     # ------------------------------------------------------------------
     # 训练区：按折训练窗口重训一次传统代表，落缓存
@@ -234,7 +261,7 @@ class TraditionalResidualProvider:
             # 任一评分窗口只要与训练日期有交集，就读入并按日期精确过滤。
             if win_end < min(train_dates) or win_start > max(train_dates):
                 continue
-            frame = pd.read_csv(path)
+            frame = pd.read_csv(path, usecols=_META_COLS + ["label", self.trad_pred_col])
             self._validate_pred_frame(frame, path)
             part = frame[frame["date"].isin(train_dates)].copy()
             if not part.empty:
