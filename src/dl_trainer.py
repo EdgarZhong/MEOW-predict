@@ -42,6 +42,11 @@ from sequence_dataset import (
     subset_by_dates,
 )
 from dl_protocol import DLFold, corr_gap, evaluate_prediction_bundle, split_train_earlystop
+from trad_residuals import (
+    TraditionalResidualProvider,
+    build_label_frame_from_arrays,
+    gather_trad_window,
+)
 
 
 class SequenceTrainer(BaseTrainer):
@@ -82,6 +87,7 @@ class SequenceTrainer(BaseTrainer):
         self.hparams = dict(hparams or {})
         self.seed = int(seed)
         self.earlystop_frac = float(earlystop_frac)
+        self._trad_provider: Optional[TraditionalResidualProvider] = None
 
     # ---- 数据 ---- #
     def _build_arrays(self, dates: Sequence[int]) -> SequenceArrays:
@@ -112,6 +118,28 @@ class SequenceTrainer(BaseTrainer):
         raw = self.raw_loader(list(dates))
         return build_sequence_arrays(raw, self.adapter)
 
+    def _target_mode(self) -> str:
+        """读取当前 trainer 的目标模式；默认 raw。"""
+        return str(self.spec.get("target_mode", "raw"))
+
+    def _ensure_trad_provider(self) -> TraditionalResidualProvider:
+        """
+        惰性构造传统残差提供器。
+
+        只有 ``target_mode=residual_trad`` 才会真正用到；provider 内部会：
+        - 读取现成 scoring OOS 传统预测；
+        - 按训练窗口缓存训练区传统预测；
+        - 按 (date,symbol,interval) 对齐回 SequenceArrays。
+        """
+        if self._trad_provider is None:
+            self._trad_provider = TraditionalResidualProvider(
+                trad_preds_root=str(self.spec.get("trad_preds_root", "")),
+                trad_pred_col=str(self.spec.get("trad_pred_col", "pred_blend")),
+                trad_cache_dir=str(self.spec.get("trad_cache_dir", "results/dl/_trad_residual_cache")),
+                data_dir=str(self.spec.get("trad_data_dir", "data")),
+            )
+        return self._trad_provider
+
     # ---- DL 主入口 ---- #
     def run_on_dl_fold(self, fold: DLFold, profile_name: str = "dl") -> FoldResult:
         start_ts = time.time()
@@ -124,12 +152,40 @@ class SequenceTrainer(BaseTrainer):
             # 1) 直接按 core / earlystop / scoring 三段**分别**现算，避免"先建整训练帧再 subset"
             #    造成的 14GB + 12GB 双份共存（119 天全票折会因此 OOM）。三段日期互斥，
             #    core+es 并集 = 原训练区，统计口径不变、无泄漏。
-            core_arrays = self._build_arrays(fold.train_core_dates)
+            core_arrays_raw = self._build_arrays(fold.train_core_dates)
             # earlystop 可能为空：用空切分得到形状对的空 arrays（_build_arrays 不接受空日期）。
-            es_arrays = (self._build_arrays(fold.earlystop_dates)
-                         if fold.earlystop_dates else subset_by_dates(core_arrays, ()))
-            score_arrays = self._build_arrays(fold.scoring_dates)
+            es_arrays_raw = (self._build_arrays(fold.earlystop_dates)
+                             if fold.earlystop_dates else subset_by_dates(core_arrays_raw, ()))
+            score_arrays_raw = self._build_arrays(fold.scoring_dates)
             _t["load"] = time.time() - _m; _m = time.time()
+
+            # 残差训练模式：训练标签换成 y - y_trad，评分时再把 pred_trad 加回恢复最终预测。
+            # 结构不变、卡带不变，只改目标构造。
+            train_trad_rows = None
+            score_trad_rows = None
+            if self._target_mode() == "residual_trad":
+                provider = self._ensure_trad_provider()
+                payload = provider.load_fold_payload(fold)
+                # 只保留“确实已有传统预测”的日期。对最近 2 折实验，这会优先使用现成 OOS
+                # 传统预测；若最早训练段完全没有 OOS 传统预测，provider 会自动退回慢路径。
+                core_dates = tuple(int(d) for d in sorted(payload["train_core"]["date"].unique()))
+                es_dates = tuple(int(d) for d in sorted(payload["earlystop"]["date"].unique()))
+                core_arrays_raw = subset_by_dates(core_arrays_raw, core_dates)
+                es_arrays_raw = subset_by_dates(es_arrays_raw, es_dates)
+                if core_arrays_raw.n_rows == 0:
+                    raise ValueError("残差训练可用的 train_core 日期为空，无法训练")
+                core_bundle = provider.build_residual_bundle(core_arrays_raw, payload["train_core"])
+                es_bundle = provider.build_residual_bundle(es_arrays_raw, payload["earlystop"])
+                score_bundle = provider.build_residual_bundle(score_arrays_raw, payload["scoring"])
+                core_arrays = core_bundle.arrays_residual
+                es_arrays = es_bundle.arrays_residual
+                score_arrays = score_bundle.arrays_residual
+                train_trad_rows = core_bundle.trad_window
+                score_trad_rows = score_bundle.trad_window
+            else:
+                core_arrays = core_arrays_raw
+                es_arrays = es_arrays_raw
+                score_arrays = score_arrays_raw
             # 2) Normalizer 只用训练区(core+es)统计，**分块 fit、不 concatenate、不物化整张
             #    副本**；scoring 不参与统计，无泄漏。
             normalizer = Normalizer(self.normalizer_mode).fit_chunked(
@@ -151,10 +207,18 @@ class SequenceTrainer(BaseTrainer):
             pred_train = cartridge.predict(train_core_ds)
             _t["predict"] = time.time() - _m; _m = time.time()
 
-            # 4) 4 指标（脊柱在 predict 之后算一次；scoring 在此前一次不碰）。
-            val_lf = scoring_ds.label_frame()        # date/symbol/interval/label，行序与 pred_val 对齐
+            # 4) 指标：raw 模式直接拿 dataset 标签评；残差模式先把传统预测加回，改回原始
+            #    fret12 标签再评。这样 cert / delivery 指标与基线同口径、可直接比。
+            if self._target_mode() == "residual_trad":
+                val_lf = build_label_frame_from_arrays(score_arrays_raw, scoring_ds.label_rows)
+                train_lf = build_label_frame_from_arrays(core_arrays_raw, train_core_ds.label_rows)
+                pred_val = pred_val + gather_trad_window(score_trad_rows, scoring_ds.label_rows)
+                pred_train = pred_train + gather_trad_window(train_trad_rows, train_core_ds.label_rows)
+            else:
+                val_lf = scoring_ds.label_frame()
+                train_lf = train_core_ds.label_frame()
             vm = evaluate_prediction_bundle(val_lf, pred_val)
-            tm = evaluate_prediction_bundle(train_core_ds.label_frame(), pred_train)
+            tm = evaluate_prediction_bundle(train_lf, pred_train)
             _t["metrics"] = time.time() - _m
 
             # 4b) 逐票预测落盘（仅当 spec 带 dump_preds_dir；默认不落，零开销）。供「DL↔传统
@@ -187,7 +251,7 @@ class SequenceTrainer(BaseTrainer):
                 experiment_id=self.spec.get("experiment_id", "dl_run"),
                 feature_set=self.spec.get("feature_set", "dl_channels"),
                 model_type=self.spec.get("model_type", "sequence"),
-                target_type=self.spec.get("target_type", "raw"),
+                target_type=self.spec.get("target_mode", self.spec.get("target_type", "raw")),
                 postprocess_type=self.spec.get("postprocess_type", "none"),
                 train_corr=float(tm["corr"]), val_corr=float(vm["corr"]),
                 train_mse=float(tm["mse"]), val_mse=float(vm["mse"]),
@@ -214,7 +278,7 @@ class SequenceTrainer(BaseTrainer):
                 experiment_id=self.spec.get("experiment_id", "dl_run"),
                 feature_set=self.spec.get("feature_set", "dl_channels"),
                 model_type=self.spec.get("model_type", "sequence"),
-                target_type=self.spec.get("target_type", "raw"),
+                target_type=self.spec.get("target_mode", self.spec.get("target_type", "raw")),
                 postprocess_type=self.spec.get("postprocess_type", "none"),
                 train_corr=nan, val_corr=nan, train_mse=nan, val_mse=nan,
                 train_r2=nan, val_r2=nan, daily_corr_mean=nan, daily_corr_std=nan,

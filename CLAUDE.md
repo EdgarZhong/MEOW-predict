@@ -300,6 +300,40 @@ python experiments/run_dl.py --stage sweep --model xsection --adapter feature_43
 
 **loss / rescale / cross-z 定稿**：见上「并行编码分工 §WT-B 🔑」+ 各 worktree `AGENT_TASK.md`（已与两 agent 同步）。
 
+## 2026-06-04 当前阶段新增收敛（残差训练快评）
+
+- **残差训练最小实现已落地（分支 `feat/xsection-raw-residual`）**：
+  - 不是新模型词位，而是新目标模式：`target_mode=residual_trad`
+  - 训练目标：`label_res = fret12 - pred_trad`
+  - 评测 / 落盘：`pred_final = pred_trad + pred_dl_res`
+  - 代码入口：
+    - `config/exec_config.py`：新增 `target_mode / trad_preds_root / trad_pred_col / trad_cache_dir`
+    - `experiments/run_dl.py`：新增 `--target-mode residual_trad --trad-preds-root ...`
+    - `src/trad_residuals.py`：传统 OOS 预测窗口索引 + 残差标签对齐
+    - `src/dl_trainer.py`：训练前残差化、评测时恢复 `pred_trad + pred_dl_res`
+- **实现口径（当前最小版）**：
+  - scoring 区严格使用 `results/trad_dl_protocol/20260602_trad_dl_protocol_v2/` 已落盘的传统 OOS 预测（`pred_blend`）
+  - 训练区**优先只使用现成 OOS 传统预测覆盖到的日期**构造残差标签；只有未来补最早折时训练区完全没有 OOS 传统预测，才考虑慢路径 fallback
+  - 这意味着对 `recent 2 folds`：
+    - cert fold0（`20230928–20231102`）有效残差训练历史只剩训练尾段里已拥有 OOS 传统预测的日期（本质上是 `Aug31–Sep26` 这段）
+    - cert fold1（`20231103–20231130`）则能用到 `Aug31–Nov01` 内已有 OOS 传统预测覆盖的更长尾段
+- **残差训练 smoke 已通过**：
+  - run：`20260604_xsection_raw_residual_smoke_v4`
+  - 结论：残差链已完整打通，能走到 `summary.json`
+- **残差训练正式快评（2折×2seed）已完成**：
+  - run：`20260604_xsection_raw_residual_2fold_2seed`
+  - 路径：`results/dl/20260604_xsection_raw_residual_2fold_2seed/`
+  - cert 结果：`val_corr.mean=0.07602 / min=0.07122 / max=0.08238 / val_r2_mean=0.00033 / val_r2_min=-0.00334`
+  - delivery：`val_corr=0.08129 / val_r2=0.00483`
+  - 对照：
+    - 基线 `XSECTION_RAW 2折×2seed`：`0.08601 / 0.08185 / delivery 0.07917`
+    - 传统同两折（`trad_dl_protocol_v2` 的 fold1/fold2）：`0.06962 / 0.09044 / delivery 0.07701`
+  - **判决：当前最小实现先 reject，不推进到 3 折**
+    - cert 主判官显著低于当前 `XSECTION_RAW` 基线
+    - 唯一正信号是 delivery 从 `0.07917` 抬到 `0.08129`
+    - 关键洞察：当前实现的主要硬伤不是“残差思想必错”，而是**现成 OOS 传统预测只能覆盖训练尾段，导致最近第一折的有效残差训练历史被压得过短**，使 cert 判官明显吃亏
+    - 若要严肃继续这条线，下一步不是立刻补 3 折，而是先解决“全训练区 OOF 传统预测地基”问题，再重评
+
 ## 待办队列
 
 | # | 任务 | 状态 |

@@ -24,12 +24,22 @@ class ExecConfig:
     reuse_checkpoint: bool = False   # (b) 复用 checkpoint 跳过已训 (config,fold,seed)
     out_dir: str = "results/dl"      # 输出根目录（run 产物落 out_dir/<run_id>/）
     n_workers: int = 1               # 进程级并行度；Mac 16GB 恒为 1（AGENTS §5.1）
+    target_mode: str = "raw"         # 训练目标模式：raw=直接学 fret12；residual_trad=学传统预测残差
+    trad_preds_root: str = ""        # residual_trad 时传统逐票预测根目录（含 preds/fold*/...）
+    trad_pred_col: str = "pred_blend"  # 传统目标列：默认锁定代表融合列 pred_blend
+    trad_cache_dir: str = "results/dl/_trad_residual_cache"  # 训练区传统预测缓存（gitignore）
 
     def __post_init__(self) -> None:
         if len(self.seeds) == 0:
             raise ValueError("seeds 不能为空")
         if self.device not in ("cpu", "cuda"):
             raise ValueError(f"device 必须是 'cpu' / 'cuda'，实际 {self.device}")
+        if self.target_mode not in ("raw", "residual_trad"):
+            raise ValueError(
+                f"target_mode 必须是 'raw' / 'residual_trad'，实际 {self.target_mode}"
+            )
+        if self.target_mode == "residual_trad" and not self.trad_preds_root:
+            raise ValueError("target_mode=residual_trad 时必须提供 trad_preds_root")
 
     def to_dict(self) -> dict:
         return {
@@ -39,4 +49,8 @@ class ExecConfig:
             "reuse_checkpoint": self.reuse_checkpoint,
             "out_dir": self.out_dir,
             "n_workers": self.n_workers,
+            "target_mode": self.target_mode,
+            "trad_preds_root": self.trad_preds_root,
+            "trad_pred_col": self.trad_pred_col,
+            "trad_cache_dir": self.trad_cache_dir,
         }

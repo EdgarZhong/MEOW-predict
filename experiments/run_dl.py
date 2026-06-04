@@ -121,10 +121,19 @@ class Orchestrator:
             "experiment_id": c.run_id,
             "model_type": c.model.kind.value,
             "feature_set": c.adapter.kind.value,
-            "target_type": "raw",
+            "target_type": c.exec_.target_mode,
             "postprocess_type": "none",
             "notes": f"fp={c.config_fingerprint}",
         }
+        # 残差训练模式：不是新模型，而是训练目标构造方式的切换。
+        # 这些字段由 SequenceTrainer 读取，用来：
+        # 1) 把 label 改成 y - y_trad；
+        # 2) 评测时再恢复 pred_trad + pred_dl_res。
+        spec["target_mode"] = c.exec_.target_mode
+        spec["trad_preds_root"] = c.exec_.trad_preds_root
+        spec["trad_pred_col"] = c.exec_.trad_pred_col
+        spec["trad_cache_dir"] = c.exec_.trad_cache_dir
+        spec["trad_data_dir"] = self.h5dir
         if self.dump_preds:
             # 逐票预测落 <out_dir>/<run_id>/preds/（run() 里 out_dir 同构）。
             spec["dump_preds_dir"] = os.path.join(c.exec_.out_dir, c.run_id, "preds")
@@ -751,6 +760,10 @@ def _build_run_config(args):
     exec_ = ExecConfig(
         seeds=tuple(int(s) for s in args.seeds.split(",")),
         device=args.device, out_dir=args.out_dir,
+        target_mode=args.target_mode,
+        trad_preds_root=args.trad_preds_root,
+        trad_pred_col=args.trad_pred_col,
+        trad_cache_dir=args.trad_cache_dir,
     )
     return assemble_run_config(args.run_id, model, adapter, protocol, search, exec_)
 
@@ -838,6 +851,14 @@ def main(argv=None):
     ap.add_argument("--dump-preds", action="store_true",
                     help="把每折 scoring 段逐票预测落 <out_dir>/<run_id>/preds/（date,symbol,interval,label,pred），"
                          "供「DL↔传统预测相关性」等离线分析；默认关、零开销")
+    ap.add_argument("--target-mode", default="raw", choices=["raw", "residual_trad"],
+                    help="训练目标模式：raw=直接学 fret12；residual_trad=学传统代表残差 y-pred_trad")
+    ap.add_argument("--trad-preds-root", default="",
+                    help="target-mode=residual_trad 时必填：传统逐票预测根目录（例如 results/trad_dl_protocol/.../run_id）")
+    ap.add_argument("--trad-pred-col", default="pred_blend",
+                    help="传统预测列名；当前锁定融合代表默认用 pred_blend")
+    ap.add_argument("--trad-cache-dir", default="results/dl/_trad_residual_cache",
+                    help="残差训练时训练区传统预测缓存目录（gitignore，下次同窗复用）")
     args = ap.parse_args(argv)
 
     rc = _build_run_config(args)
