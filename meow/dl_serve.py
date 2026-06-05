@@ -46,6 +46,47 @@ def _logerr(msg):
     print(msg)
 
 
+def _warn_banner(lines):
+    """打印醒目红色横幅，确保老师在大量训练日志里也能一眼看到「降级/缺依赖」提示。
+
+    逐行走 log.red（项目既有 ANSI 约定）；log 不可用则 print 兜底。横幅自身绝不抛异常。
+    """
+    body = ["=" * 60] + list(lines) + ["=" * 60]
+    fn = getattr(log, "red", None)
+    for ln in body:
+        if callable(fn):
+            try:
+                fn(ln)
+                continue
+            except Exception:
+                pass
+        print(ln)
+
+
+def _warn_torch_missing(err=None):
+    """缺 PyTorch（老师最可能遇到）：打醒目提示，明确告诉装什么、不装的后果。"""
+    lines = [
+        "  注意：未检测到 PyTorch，深度学习增强支路【无法启用】。",
+        "  程序不会崩溃、会照常输出传统模型结果（约 0.081），",
+        "  但无法叠加深度学习增强（完整融合约 0.092）。",
+        "  ▶ 若要拿到完整结果，请先安装依赖再运行：  pip install torch",
+        "  这是环境依赖缺失提示，不是程序结束或报错。",
+    ]
+    if err is not None:
+        lines.append("  底层错误：{}".format(repr(err)[:160]))
+    _warn_banner(lines)
+
+
+def _warn_runtime_degraded(err):
+    """torch 在、但 DL 运行中途异常（显存/内存不足等）：打醒目提示，说明已回落、不是程序结束。"""
+    _warn_banner([
+        "  注意：深度学习支路本次运行异常，已自动回落纯传统模型（约 0.081）。",
+        "  程序未崩溃、已照常输出结果；深度学习增强（约 0.092）本次未生效。",
+        "  常见原因：GPU 显存或系统内存不足，可释放资源后重跑。",
+        "  底层错误：{}".format(repr(err)[:160]),
+    ])
+
+
 # —— 默认 DL 配置：照搬机器2 proven 冠军 run（summary.json.champion），不臆造 —— #
 # seq_len 走 SequenceDataset（结构旋钮，独立于卡带 hparams）；其余进卡带 hparams。
 _DEFAULT_SEQ_LEN = 32
@@ -103,11 +144,29 @@ class DLServe:
         self._normalizer = None         # 训练期 fit 的 Normalizer，predict 复用（零泄漏）
         self._adapter = None            # RawChannelAdapter（无状态，fit/predict 共用）
         self._device = "cpu"
+        # 构造即探测 torch：缺失就当场打醒目提示，老师可立刻安装，不必等传统训练 ~50min 后才发现。
+        self._torch_ready = self._probe_dependencies()
+
+    def _probe_dependencies(self) -> bool:
+        """只探测 torch 是否可用、不训练；缺失则立刻打「请装 torch」醒目横幅。返回是否就绪。"""
+        try:
+            _ensure_dl_path()
+            import torch  # noqa: F401
+            return True
+        except Exception as e:
+            _warn_torch_missing(e)
+            return False
 
     # ---- 训练阶段：现训 K seed ---- #
     def fit(self, train_dates) -> None:
         """在训练窗现训 K 个 seed 的 DL-on-raw；任何失败都置 available=False（回落传统）。"""
         train_dates = list(train_dates)
+        if not self._torch_ready:
+            # 启动时已打过醒目「请装 torch」横幅，这里只补一行简短说明、不重复刷屏。
+            self.available = False
+            self._cartridges = []
+            _logerr("[DLServe] 跳过 DL 训练（未检测到 PyTorch，详见启动时提示）→ 本次纯传统。")
+            return
         try:
             _ensure_dl_path()
             import torch  # noqa: F401  —— import 失败即触发降级
@@ -163,10 +222,10 @@ class DLServe:
             self._cartridges = cartridges
             self.available = True
             _loginf("[DLServe] DL 现训完成：{} seed 就绪（device={}）".format(len(cartridges), self._device))
-        except Exception as e:  # 任何环节失败 → 降级，绝不抛给提交链
+        except Exception as e:  # torch 已就绪却失败 = 运行时异常（显存/内存等）→ 降级，绝不抛给提交链
             self.available = False
             self._cartridges = []
-            _logerr("[DLServe] DL 训练失败 → 本次回落纯传统：{}".format(repr(e)[:300]))
+            _warn_runtime_degraded(e)
 
     # ---- 推理阶段：K seed 平均 ---- #
     def predict(self, eval_dates):
@@ -200,7 +259,7 @@ class DLServe:
             out["pred_dl"] = np.asarray(avg, dtype=np.float64)
             return out
         except Exception as e:
-            _logerr("[DLServe] DL 推理失败 → 本次回落纯传统：{}".format(repr(e)[:300]))
+            _warn_runtime_degraded(e)
             return None
 
 
